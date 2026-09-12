@@ -1,0 +1,78 @@
+:root {
+  font-family: "Segoe UI Variable", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: #17282d;
+  background: #e9eef0;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --ink: #17282d;
+  --muted: #687b80;
+  --faint: #8da0a5;
+  --line: #d4dde0;
+  --line-strong: #bcc9cd;
+  --paper: #f8faf9;
+  --paper-2: #f0f4f4;
+  --rail: #102b31;
+  --rail-2: #173a42;
+  --blue: #165dff;
+  --cyan: #038ea3;
+  --green: #13855c;
+  --amber: #b76b05;
+  --red: #c43e3e;
+  --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: #e9eef0;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  color: inherit;
+}
+
+button,
+select {
+  cursor: pointer;
+}
+
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.48;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 3px solid rgba(22, 93, 255, 0.2);
+  outline-offset: 2px;
+}
+
+::selection {
+  color: #fff;
+  background: #165dff;
+}
+
+#root {
+  min-height: 100vh;
+}
+\n

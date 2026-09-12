@@ -1,0 +1,24 @@
+{
+  "host": "0.0.0.0",
+  "port": 9443,
+  "heartbeatMs": 10000,
+  "auth": {
+    "required": true,
+    "tokenEnv": "HUB_TOKEN"
+  },
+  "tls": {
+    "enabled": true,
+    "keyFile": "../secrets/hub-key.pem",
+    "certFile": "../secrets/hub-cert.pem"
+  },
+  "delivery": {
+    "ackTimeoutMs": 5000,
+    "maxAttemptsPerConnection": 5
+  },
+  "logs": {
+    "file": "../var/log/hub-events.jsonl",
+    "includePayloads": false
+  }
+}
+
+\n

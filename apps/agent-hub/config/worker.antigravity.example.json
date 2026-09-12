@@ -1,0 +1,47 @@
+{
+  "agentId": "laptop-03-antigravity",
+  "hubUrl": "wss://hub.example.com:9443/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": true,
+  "heartbeatMs": 5000,
+  "stateFile": "../var/state/laptop-03-antigravity.json",
+  "workspace": "../workspaces/laptop-03-antigravity",
+  "capabilities": ["task.execute", "reasoning", "document_editing", "pause", "resume", "cancel"],
+  "policy": {
+    "requireTaskSpec": false,
+    "defaultDenyUnknownPermissions": true,
+    "allowedPermissions": ["project_workspace", "terminal"],
+    "deniedPermissions": ["browser", "system_settings"]
+  },
+  "checkpoints": {
+    "includeOutput": true,
+    "maxOutputChars": 200000
+  },
+  "artifacts": {
+    "maxFileBytes": 104857600
+  },
+  "capabilityProbe": {
+    "timeoutMs": 5000,
+    "stripProxyEnv": true,
+    "tools": [
+      { "name": "git", "command": "git", "args": ["--version"] }
+    ]
+  },
+  "reconnect": {
+    "baseMs": 1000,
+    "maxMs": 30000
+  },
+  "tls": {
+    "rejectUnauthorized": true
+  },
+  "adapter": {
+    "type": "antigravity",
+    "command": "agy",
+    "args": [],
+    "stripProxyEnv": true,
+    "resumeOnStart": true,
+    "shutdownTimeoutMs": 5000
+  }
+}
+
+\n

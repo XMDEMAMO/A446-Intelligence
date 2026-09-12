@@ -1,0 +1,45 @@
+{
+  "agentId": "laptop-01-codex",
+  "hubUrl": "wss://hub.example.com:9443/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": true,
+  "heartbeatMs": 5000,
+  "stateFile": "../var/state/laptop-01-codex.json",
+  "workspace": "../workspaces/laptop-01-codex",
+  "capabilities": ["task.execute", "coding", "document_editing", "pause", "resume", "cancel"],
+  "policy": {
+    "requireTaskSpec": false,
+    "defaultDenyUnknownPermissions": true,
+    "allowedPermissions": ["project_workspace", "terminal"],
+    "deniedPermissions": ["browser", "system_settings"]
+  },
+  "checkpoints": {
+    "includeOutput": true,
+    "maxOutputChars": 200000
+  },
+  "artifacts": {
+    "maxFileBytes": 104857600
+  },
+  "capabilityProbe": {
+    "timeoutMs": 5000,
+    "tools": [
+      { "name": "git", "command": "git", "args": ["--version"] }
+    ]
+  },
+  "reconnect": {
+    "baseMs": 1000,
+    "maxMs": 30000
+  },
+  "tls": {
+    "rejectUnauthorized": true
+  },
+  "adapter": {
+    "type": "codex",
+    "command": "codex",
+    "globalArgs": [],
+    "execArgs": [],
+    "maxOutputChars": 200000
+  }
+}
+
+\n

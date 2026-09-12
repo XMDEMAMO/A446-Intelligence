@@ -1,0 +1,22 @@
+{
+  "host": "127.0.0.1",
+  "port": 8787,
+  "heartbeatMs": 5000,
+  "auth": {
+    "required": false,
+    "tokenEnv": "HUB_TOKEN"
+  },
+  "tls": {
+    "enabled": false
+  },
+  "delivery": {
+    "ackTimeoutMs": 3000,
+    "maxAttemptsPerConnection": 5
+  },
+  "logs": {
+    "file": "../var/log/hub-events.jsonl",
+    "includePayloads": true
+  }
+}
+
+\n

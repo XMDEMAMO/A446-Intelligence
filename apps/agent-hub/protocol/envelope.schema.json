@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/agent-hub/protocol/v1/envelope.schema.json",
+  "title": "Agent Hub protocol v1 envelope",
+  "type": "object",
+  "required": ["v", "id", "type", "ts", "payload"],
+  "properties": {
+    "v": { "const": 1 },
+    "id": { "type": "string", "format": "uuid" },
+    "type": {
+      "type": "string",
+      "enum": [
+        "worker.hello",
+        "worker.heartbeat",
+        "hub.welcome",
+        "task.assign",
+        "task.started",
+        "task.result",
+        "task.error",
+        "task.rejected",
+        "task.cancel",
+        "approval.request",
+        "agent.pause",
+        "agent.resume",
+        "ack"
+      ]
+    },
+    "ts": { "type": "string", "format": "date-time" },
+    "agentId": { "type": "string", "minLength": 1, "maxLength": 128 },
+    "taskId": { "type": "string", "format": "uuid" },
+    "replyTo": { "type": "string", "format": "uuid" },
+    "payload": { "type": "object" }
+  },
+  "additionalProperties": false
+}
+
+\n

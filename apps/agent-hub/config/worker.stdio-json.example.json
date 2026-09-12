@@ -1,0 +1,20 @@
+{
+  "agentId": "laptop-03-antigravity",
+  "hubUrl": "wss://hub.example.com:9443/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": true,
+  "heartbeatMs": 5000,
+  "stateFile": "../var/state/laptop-03-antigravity.json",
+  "workspace": "../workspaces/laptop-03-antigravity",
+  "reconnect": {
+    "baseMs": 1000,
+    "maxMs": 30000
+  },
+  "adapter": {
+    "type": "stdio-json",
+    "command": "agy",
+    "args": ["REPLACE_WITH_CONFIRMED_CONTINUOUS_JSONL_MODE"]
+  }
+}
+
+\n

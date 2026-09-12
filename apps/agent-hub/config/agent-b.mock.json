@@ -1,0 +1,19 @@
+{
+  "agentId": "agent-b",
+  "hubUrl": "ws://127.0.0.1:8787/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": false,
+  "heartbeatMs": 3000,
+  "stateFile": "../var/state/agent-b.json",
+  "workspace": "../workspaces/agent-b",
+  "reconnect": {
+    "baseMs": 250,
+    "maxMs": 5000
+  },
+  "adapter": {
+    "type": "mock",
+    "delayMs": 50
+  }
+}
+
+\n

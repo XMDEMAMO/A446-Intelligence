@@ -1,0 +1,25 @@
+{
+  "title": "生成本地成果文件",
+  "type": "local_execution",
+  "priority": "P0",
+  "inputs": [
+    "input.txt"
+  ],
+  "expected_outputs": [
+    "artifact.txt"
+  ],
+  "permissions_required": {
+    "project_workspace": true,
+    "terminal": true,
+    "browser": false
+  },
+  "checkpoint_policy": {
+    "interval": "stage"
+  },
+  "acceptance": [
+    "artifact.txt 存在",
+    "服务端收到 SHA-256"
+  ]
+}
+
+\n

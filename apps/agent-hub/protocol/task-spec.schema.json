@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.invalid/agent-hub/protocol/v1/task-spec.schema.json",
+  "title": "Local Worker Task Spec",
+  "type": "object",
+  "properties": {
+    "title": { "type": "string" },
+    "type": { "type": "string" },
+    "priority": { "type": "string" },
+    "inputs": { "$ref": "#/$defs/pathList" },
+    "expected_outputs": { "$ref": "#/$defs/pathList" },
+    "expectedOutputs": { "$ref": "#/$defs/pathList" },
+    "artifacts": { "$ref": "#/$defs/pathList" },
+    "permissions_required": { "$ref": "#/$defs/permissions" },
+    "permissionsRequired": { "$ref": "#/$defs/permissions" },
+    "checkpoint_policy": { "type": "object" },
+    "acceptance": { "type": "array", "items": { "type": "string" } }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "pathList": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string", "minLength": 1 } },
+            "additionalProperties": true
+          }
+        ]
+      }
+    },
+    "permissions": {
+      "type": "object",
+      "additionalProperties": {
+        "oneOf": [
+          { "type": "boolean" },
+          { "type": "string", "enum": ["allow", "deny", "required"] },
+          { "type": "integer", "enum": [0, 1] }
+        ]
+      }
+    }
+  }
+}
+
+\n
