@@ -30,5 +30,3 @@ test("Antigravity adapter keeps one stream-json process and conversation", async
     await rm(workspace, { recursive: true, force: true });
   }
 });
-
-\n

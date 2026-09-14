@@ -1,6 +1,6 @@
 # Local Agent Hub
 
-这是一个可复制到四台笔记本的本地 Agent Hub 模拟器。Hub 负责路由、在线状态、审批和日志；每台笔记本上的 Worker 只建立出站 WebSocket 连接，并在本地保存自己的 Agent session。
+这是一个可部署到多台设备的本地 Agent 协作 Hub。Hub 负责角色流程、动态调度、群聊呈现、审核、用量和日志；每台设备上的 Worker 只建立出站 WebSocket 连接，并在本地保存自己的 Agent session 与账号凭据。
 
 交给编码 AI 继续开发或审查时，先让它完整读取 `AI_IMPLEMENTATION_GUIDE.md`。该文件定义了 AI 的执行顺序、安全硬约束、协议入口和验收条件。
 
@@ -19,7 +19,7 @@
 
 ## 本地 MVP 范围
 
-v0.3.1 的 Worker 已实现：
+v0.4.0 已实现：
 
 - 出站 WebSocket 长连接、指数退避重连、心跳、可靠结果回传和消息去重
 - Codex session 恢复与 Antigravity 单进程持续 conversation
@@ -29,8 +29,29 @@ v0.3.1 的 Worker 已实现：
 - Artifact 清单：只收集 Task Spec 声明的成果，并返回大小与 SHA-256
 - 能力探测：启动时检查 Adapter 和配置的本地工具，随 hello/heartbeat 上报
 - 健康/额度状态：`Healthy / Degraded / Unhealthy` 与 `Healthy / Low / Exhausted / Unknown`
+- 规划、执行、审核三种 Agent 的结构化协作闭环
+- 一个根任务对应一个群聊，Agent 发布简报并把完整成果作为附件
+- 执行 Agent 的上游错误报告先由审核 Agent 裁定，再交规划 Agent 重排
+- 按角色、能力、在线状态、负载和可信额度动态选择 Agent 与模型
+- 单次、Agent 累计和账号累计 Token 统计，以及可选的客户端额度快照采集
 
-额度探测只使用可信结果：执行成功后标记可用，遇到限流或额度耗尽错误时降级；CLI 无可靠信息时保持 `Unknown`，不会伪造 Plus 或 Google AI Pro 的精确百分比。
+额度探测只使用可信结果：遇到限流或额度耗尽错误时记录粗粒度状态；只有客户端或受信任本地读取器给出机器可读数据时才显示具体百分比。CLI 无可靠信息时保持 `Unknown`，不会用 Token 数推算 Plus 或 Google AI Pro 的额度。
+
+## 协作方式
+
+```text
+人工目标 -> 规划 Agent -> 执行 Agent -> 审核 Agent -> 规划 Agent
+                            |              |
+                            | 上游错误报告  | 驳回：退回执行 Agent
+                            +------------> | 确认：交规划 Agent 重排
+```
+
+- 规划 Agent 只计划、指派、接收通过审核的简报，并可请求人工介入。
+- 执行 Agent 只接收明确指令，提交“完整成果 + 任务简报”。
+- 审核 Agent 只审完整成果或上游错误报告。
+- 每个角色只收到必要上下文；规划 Agent 不读取完整成果。
+- 一个成果只有一个执行负责人，不建立共享文件锁或自动合并流程。
+- 群聊主要供人观察和沟通，`@Agent` 是提醒，不直接改变任务状态。
 
 ## 快速验证（不消耗模型额度）
 
@@ -58,6 +79,8 @@ node src/hubctl.mjs send --agent agent-a --input 'hello' --route agent-b --wait
 
 本地模拟默认监听 `127.0.0.1:8787`。如果没有设置 `HUB_TOKEN`，仅限回环地址时允许无认证运行；若启动前已设置 token，Hub、Worker 和控制命令都会使用它。
 
+Web 控制台位于相邻的 `apps/web`。启动 Hub 后在该目录运行 `npm run dev`，即可使用“一项任务一个群聊”的界面创建协作任务、查看成果附件、角色流转、Token 和额度快照。
+
 ## 切换到 Codex
 
 先确认环境：
@@ -70,6 +93,10 @@ node scripts/check-env.mjs --config config/worker.codex.example.json
 复制 `config/worker.codex.example.json`，至少修改：
 
 - `agentId`：全局唯一，例如 `laptop-01-codex-a`
+- `deviceId`：物理设备标识；同机多个 Agent 共用
+- `account`：本地登录账号的非敏感标识、服务商和套餐；不得放账号凭据
+- `roles`：该逻辑 Agent 可承担的角色
+- `models`：该账号当前实际可调用的模型清单及能力，不是独立授权
 - `hubUrl`：同学服务器提供的 `wss://.../worker`
 - `stateFile`：该 Agent 独享的状态文件
 - `workspace`：该 Agent 独享的工作目录
@@ -88,16 +115,16 @@ Worker 长驻，但 Codex 子进程按任务启动。首次任务创建 session�
 
 不要把 token 写入 JSON 或提交到版本库。
 
-## 四台笔记本部署
+## 多设备、多账号、多 Agent 部署
 
-推荐每台机器只改一个 Worker 配置：
+当前目标规模可按 4 台笔记本 + 2 台主机部署。每个本地登录账号是一个账号边界，一个账号下可以启动多个逻辑 Agent：
 
-| 机器 | 示例 Agent ID | 适配器 | 本地状态 |
+| 设备 | 示例 Agent ID | 角色 | 本地状态 |
 | --- | --- | --- | --- |
-| Laptop 1 | `laptop-01-codex-a` | `codex` | 独立 JSON |
-| Laptop 2 | `laptop-02-codex-b` | `codex` | 独立 JSON |
-| Laptop 3 | `laptop-03-codex-c`、`laptop-03-antigravity-a` | `codex`、`antigravity` | 每个 Agent 独立 JSON |
-| Laptop 4 | `laptop-04-codex-d`、`laptop-04-antigravity-b` | `codex`、`antigravity` | 每个 Agent 独立 JSON |
+| Laptop 1 | `laptop-01-planner-01`、`laptop-01-executor-01` | 规划、执行 | 每个 Agent 独立 JSON |
+| Laptop 2 | `laptop-02-reviewer-01` | 审核 | 独立 JSON |
+| Laptop 3/4 | 按本机账号创建唯一 ID | 按能力配置 | 每个 Agent 独立 JSON |
+| Host 1/2 | 按本机账号创建唯一 ID | 按能力配置 | 每个 Agent 独立 JSON |
 
 复制流程：
 
@@ -105,13 +132,13 @@ Worker 长驻，但 Codex 子进程按任务启动。首次任务创建 session�
 2. 安装同一 Node 主版本。
 3. 运行 `npm ci` 和 `npm test`。
 4. 安装并登录本机 Codex。
-5. 为机器设置唯一 `agentId`、独立 workspace 和独立状态文件。
+5. 为每个逻辑 Agent 设置唯一 `agentId`、独立 workspace 和独立状态文件；同一设备可共用 `deviceId` 和账号标签。
 6. 从服务器安全注入 `HUB_TOKEN`。
 7. 运行 Worker；防火墙只需允许到 Hub 的出站 HTTPS/WSS。
 
 Worker 带指数退避重连、心跳、Hub 消息确认、本地 inbox/outbox、消息去重和串行任务队列。网络中断后它会重连并重发未确认结果。
 
-同一台笔记本运行两个 Agent 时，必须使用不同的 `agentId`、`stateFile` 和 `workspace`。
+同一设备或同一账号运行多个 Agent 时，必须使用不同的 `agentId`、`stateFile` 和 `workspace`。Hub 在任务创建时选择角色，执行前再依据能力、负载与可信额度从该账号可用模型中选择模型；不要在流程代码里写死模型。
 
 ## Hub 控制命令
 
@@ -182,6 +209,7 @@ Antigravity 使用专用的 `antigravity` 适配器，直接实现官方持续�
 - 每个任务向 stdin 写入一个 `event: user` JSON 对象。
 - 每轮等待一个 `event: result`，保存其中的 `conversation_id`。
 - CLI 意外退出后，下一个任务会重新启动进程，并使用 `--conversation` 恢复已保存的会话。
+- 调度器改变模型或推理强度时，Worker 使用 `--model` / `--effort` 重启该持续进程，并恢复本 Agent 的 conversation。
 
 先复制 `config/worker.antigravity.example.json`，设置唯一 Agent ID、Hub URL、workspace 和 state 文件。首次使用前在普通终端运行一次 `agy` 完成账号登录。不要加入 `--dangerously-skip-permissions`；需要运行的命令应通过 Antigravity 的细粒度 permission allow 规则预授权。
 
@@ -205,6 +233,8 @@ node scripts/smoke-antigravity.mjs --model gemini-3.8-flash-low
 - `src/local-policy.mjs`：本地权限与工作区白名单
 - `src/checkpoint-store.mjs`：标准阶段检查点
 - `src/capability-probe.mjs`：工具、健康与额度状态
+- `src/quota-probe.mjs`：可选的机器可读客户端额度快照
+- `src/collaboration.mjs`：角色契约、动态调度和 Token 归一化
 - `src/artifact-manifest.mjs`：成果文件 SHA-256 清单
 - `src/hubctl.mjs`：人工控制 CLI
 - `scripts/check-env.mjs`：四台机器统一环境检查
@@ -212,5 +242,3 @@ node scripts/smoke-antigravity.mjs --model gemini-3.8-flash-low
 - `test/local-mvp.test.mjs`：Policy、Checkpoint、能力/额度状态和 Artifact 哈希测试
 
 本项目是协议与 Worker 的本地参考实现；同学的正式服务器可以复用 JSON envelope，而不必复用这里的 Mock Hub 代码。
-
-\n

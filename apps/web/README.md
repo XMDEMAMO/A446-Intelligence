@@ -1,76 +1,31 @@
-# React + TypeScript + Vite
+# A446 Agent 群聊控制台
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+这是 A446 Intelligence 的非技术型协作界面。每个根任务对应一个群聊，规划、执行和审核 Agent 在群内发布任务简报，执行 Agent 的完整成果以可展开附件呈现。
 
-Currently, two official plugins are available:
+## 页面结构
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- 左侧：任务群聊列表；一个任务只创建一个群聊。
+- 中间：角色消息、`@` 提醒、内部步骤状态、完整成果附件和单次 Token 用量。
+- 右侧：参与 Agent，以及按账号汇总的设备数、Agent 数、输入/输出/缓存/总 Token 和可信额度快照。
+- 新建任务：可让 Hub 自动选择规划 Agent、审核 Agent 和模型，也可以设置偏好。
+- 人工介入：规划或审核流程遇到明确阻塞时，在当前群聊直接提交人工决定。
 
-## React Compiler
+群聊用于人类观察和沟通；普通消息和 `@Agent` 不直接改变任务状态。角色切换、审核通过、驳回、重排和人工介入由 Hub 的正式工作流控制。
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
+## 运行
 
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend updating the configuration to enable type-aware lint rules:
-
-```js
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-
-      // Remove tseslint.configs.recommended and replace with this
-      tseslint.configs.recommendedTypeChecked,
-      // Alternatively, use this for stricter rules
-      tseslint.configs.strictTypeChecked,
-      // Optionally, add this for stylistic rules
-      tseslint.configs.stylisticTypeChecked,
-
-      // Other configs...
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```powershell
+npm.cmd ci
+npm.cmd run dev
 ```
 
-You can also install [eslint-plugin-react-x](https://npmx.dev/package/eslint-plugin-react-x) and [eslint-plugin-react-dom](https://npmx.dev/package/eslint-plugin-react-dom) for React-specific lint rules:
+默认通过 Vite 的同源 `/api` 代理连接 `http://127.0.0.1:8787`。Hub 不可用时自动显示演示数据，恢复后每 3 秒同步真实数据。
 
-```js
-// eslint.config.js
-import reactX from 'eslint-plugin-react-x'
-import reactDom from 'eslint-plugin-react-dom'
+## 验证
 
-export default defineConfig([
-  globalIgnores(['dist']),
-  {
-    files: ['**/*.{ts,tsx}'],
-    extends: [
-      // Other configs...
-      // Enable lint rules for React
-      reactX.configs['recommended-typescript'],
-      // Enable lint rules for React DOM
-      reactDom.configs.recommended,
-    ],
-    languageOptions: {
-      parserOptions: {
-        project: ['./tsconfig.node.json', './tsconfig.app.json'],
-        tsconfigRootDir: import.meta.dirname,
-      },
-      // other options...
-    },
-  },
-])
-
+```powershell
+npm.cmd run lint
+npm.cmd run build
 ```
-\n
+
+不要使用 `VITE_` 环境变量保存 Hub Token；这类变量会进入浏览器包。需要认证时，由开发代理或正式后端在服务端附加凭据。

@@ -28,5 +28,3 @@ async function stop(signal) {
 }
 process.on("SIGINT", () => void stop("SIGINT"));
 process.on("SIGTERM", () => void stop("SIGTERM"));
-
-\n

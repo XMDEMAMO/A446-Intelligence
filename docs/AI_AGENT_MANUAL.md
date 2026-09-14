@@ -37,15 +37,17 @@ A446 Intelligence 的目标是通用本地/分布式 Agent 平台。软件项目
 - Codex、Antigravity 和 stdio-json Worker 适配器。
 - 本地权限策略、检查点、产物哈希、健康与额度状态。
 - 任务创建、审批、暂停、恢复、取消和审计事件。
+- 规划/执行/审核闭环、最小上下文和上游错误裁定。
+- 动态 Agent/模型调度、任务群聊、Token 与可信额度快照。
 
 不得声称当前原型已经具备：
 
-- 生产级 DAG 调度。
+- 生产级持久调度和 Lease 重派。
 - 数据库持久化。
 - 多租户身份与 RBAC。
 - 服务器 Lease 和超时重派。
 - 跨 Worker 产物存储。
-- 精确第三方额度百分比。
+- 官方客户端未提供机器可读接口时的精确第三方额度百分比。
 - 黑盒 CLI 单轮内部的细粒度恢复。
 
 apps/agent-hub/src/hub.mjs 是开发模拟器，不是生产控制平面。
@@ -68,6 +70,8 @@ apps/agent-hub/
   src/checkpoint-store.mjs
   src/artifact-manifest.mjs
   src/capability-probe.mjs
+  src/quota-probe.mjs   可选的本地客户端额度 JSON 读取器
+  src/collaboration.mjs 角色契约、调度、输出和 Token 归一化
   src/adapters/          Codex、Antigravity、Mock、stdio-json
   protocol/              envelope 与 Task Spec Schema
   docs/protocol-v1.md    WebSocket 兼容契约
@@ -113,6 +117,11 @@ Local Hub
 | GET | /v1/agents | Worker 状态 |
 | GET | /v1/tasks | 任务列表，可按 rootTaskId 筛选 |
 | GET | /v1/events | 近期事件 |
+| GET | /v1/conversations | 根任务群聊列表 |
+| GET | /v1/messages | 群聊消息，可按 rootTaskId 筛选 |
+| GET | /v1/usage | 总计、Agent 和账号用量 |
+| POST | /v1/workflows | 创建规划/执行/审核工作流 |
+| POST | /v1/messages | 发送人工群聊旁注 |
 | POST | /v1/tasks | 创建任务 |
 | POST | /v1/commands | 审批、取消、暂停、恢复 |
 
@@ -123,6 +132,7 @@ task.approve
 task.cancel
 agent.pause
 agent.resume
+workflow.human_response
 ~~~
 
 状态转换必须严格：
@@ -168,29 +178,21 @@ ack
 
 ## 7. Task Spec
 
-前端创建任务时发送的核心结构：
+前端创建协作任务时发送的核心结构：
 
 ~~~json
 {
-  "targetAgentId": "agent-a",
-  "input": "任务说明",
-  "requiresApproval": false,
-  "taskSpec": {
-    "title": "任务名称",
-    "type": "general",
-    "priority": "P1",
-    "inputs": [],
-    "expected_outputs": ["outputs/result.md"],
-    "permissions_required": {
-      "project_workspace": true,
-      "terminal": false,
-      "browser": false
-    },
-    "checkpoint_policy": { "mode": "stage" },
-    "acceptance": ["可核验的完成标准"]
-  }
+  "title": "任务群聊名称",
+  "objective": "任务目标",
+  "acceptance": ["可核验的完成标准"],
+  "plannerAgentId": null,
+  "reviewerAgentId": null,
+  "modelPreference": null,
+  "maxReviewCycles": 2
 }
 ~~~
+
+Hub 创建的 `task.assign.payload` 包含 `role`、`stage`、最小 `contextBundle` 和动态选择的 `execution.model`。只有审核 Agent 接收完整成果；规划 Agent 回收时只接收通过审核的简报与 Artifact 引用。
 
 路径均相对于 Worker workspace。输入必须存在；新输出路径的最近现存父目录必须位于允许根目录内。远端输出位置不能作为本地 Artifact 路径。
 
@@ -269,7 +271,7 @@ Policy 拒绝必须返回 task.rejected 和 POLICY_DENIED，不得把拒绝原�
 
 ## 10. 持久会话
 
-一个 Agent 只拥有自己的会话和状态文件。
+一个逻辑 Agent 只拥有自己的会话和状态文件。设备、账号、Agent、模型是四个独立层级：同一设备/账号可以运行多个 Agent，一个账号可以提供多个模型，但每个 Agent 仍必须有独立 `agentId`、`stateFile` 和 `workspace`。
 
 Codex：
 
@@ -286,6 +288,7 @@ Antigravity：
 等待 result
 持久化 conversation_id
 进程重启后通过 --conversation 恢复
+模型或推理强度改变时，以 --model / --effort 重启持续进程并恢复本 Agent conversation
 ~~~
 
 不同 Agent 不得共享 sessionId、stateFile 或 workspace。
@@ -311,6 +314,10 @@ Antigravity：
 - types.ts 与 Hub 实际返回字段一致。
 - hub-api.ts 不把 Token 暴露给浏览器。
 - App.tsx 的活动、终态和审批筛选一致。
+- 一个 rootTaskId 只对应一个群聊，所有子步骤都留在该群聊。
+- 完整成果只作为执行消息附件展示，规划回收上下文不能包含 fullResult。
+- 设备、账号、Agent 和模型不得混成同一个概念。
+- Token 与客户端额度分开显示，未知额度不得估算。
 - 已取消任务不显示审批按钮。
 - 离线演示数据不得被描述成真实 Hub 数据。
 - 键盘焦点、移动端布局和 reduced-motion 仍可用。
@@ -326,6 +333,8 @@ Antigravity：
 - Worker 重连和同 Agent 连接替换。
 - 终态任务不会被晚到的结果覆盖。
 - 路由子任务保留 rootTaskId 和 parentTaskId。
+- 角色状态机、审核退回、上游错误裁定和最大重试次数。
+- 动态调度必须同时检查角色、能力、在线/暂停状态、负载、模型与可信额度。
 
 修改行为时更新 test/integration.test.mjs。
 
@@ -371,6 +380,9 @@ Antigravity：
 组合端到端测试覆盖：
 
 - 两个 Worker 上线。
+- 规划、执行、审核、规划回收四步闭环。
+- 一个根任务只生成一个群聊，执行成果以附件呈现。
+- Token 统计可按任务、Agent 和账号读取。
 - 普通任务完成。
 - 人工审批后完成。
 - Worker 暂停时任务排队。
@@ -435,5 +447,3 @@ BLOCKED
 ~~~
 
 不能为了“把作业跑通”而弱化安全断言。
-
-\n

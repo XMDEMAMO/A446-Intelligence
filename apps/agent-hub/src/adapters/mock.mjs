@@ -17,13 +17,18 @@ export class MockAdapter {
 
   async run(input, context) {
     await delay(Number(this.config.delayMs ?? 50), context.signal);
+    const sessionId = context.sessionId ?? `mock-${this.agentId}-${context.sessionKey ?? "legacy"}-${randomUUID()}`;
+    const configured = this.config.roleOutputs?.[`${context.role}:${context.stage}`]
+      ?? this.config.roleOutputs?.[context.role];
+    const output = configured == null
+      ? `[${this.agentId} | ${sessionId}] ${String(input)}`
+      : typeof configured === "string" ? configured : JSON.stringify(configured);
     return {
-      output: `[${this.agentId} | ${context.sessionId}] ${String(input)}`,
-      sessionId: context.sessionId,
+      output,
+      sessionId,
+      usage: this.config.mockUsage ?? { inputTokens: 20, outputTokens: 10, totalTokens: 30 },
     };
   }
 
   async stop() {}
 }
-
-\n

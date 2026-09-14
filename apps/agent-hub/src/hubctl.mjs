@@ -73,5 +73,3 @@ function usage(error) {
   node src/hubctl.mjs approve|cancel --task TASK_ID`);
   process.exit(2);
 }
-
-\n

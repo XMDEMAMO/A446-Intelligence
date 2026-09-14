@@ -41,5 +41,3 @@ function redactPayloads(value) {
   }
   return result;
 }
-
-\n

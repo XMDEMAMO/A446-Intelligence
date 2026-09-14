@@ -36,4 +36,3 @@ try {
     & (Join-Path $HubRoot 'scripts\stop-demo.ps1')
   }
 }
-\n

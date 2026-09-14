@@ -1,6 +1,6 @@
 {
   "name": "local-agent-hub",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "private": true,
   "type": "module",
   "description": "Cross-platform local simulation of an outbound WebSocket Agent Hub with durable workers.",
@@ -12,11 +12,9 @@
     "hub": "node src/mock-hub-cli.mjs --config config/hub.local.json",
     "worker:a": "node src/worker-cli.mjs --config config/agent-a.mock.json",
     "worker:b": "node src/worker-cli.mjs --config config/agent-b.mock.json",
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/antigravity-adapter.test.mjs test/collaboration.test.mjs test/integration.test.mjs test/local-mvp.test.mjs test/quota-probe.test.mjs"
   },
   "dependencies": {
     "ws": "8.21.3"
   }
 }
-
-\n

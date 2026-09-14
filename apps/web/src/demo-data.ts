@@ -1,183 +1,183 @@
-import type { Agent, HubEvent, HubSnapshot, HubTask } from './types'
+import type { Agent, Conversation, HubEvent, HubMessage, HubSnapshot, HubTask, TokenUsage } from './types'
 
 const minute = 60_000
+const usage = (inputTokens: number, outputTokens: number): TokenUsage => ({
+  inputTokens,
+  outputTokens,
+  cachedTokens: 0,
+  reasoningTokens: 0,
+  toolTokens: 0,
+  totalTokens: inputTokens + outputTokens,
+})
 
 function isoAgo(minutes: number) {
   return new Date(Date.now() - minutes * minute).toISOString()
 }
 
 export function createDemoSnapshot(): HubSnapshot {
+  const rootTaskId = 'workflow-release'
   const agents: Agent[] = [
     {
-      agentId: 'studio-codex-01',
+      agentId: 'laptop-01-planner',
+      deviceId: 'laptop-01',
+      account: { id: 'gpt-plus-01', provider: 'openai', plan: 'Plus', label: 'GPT Plus 01' },
+      roles: ['planner'],
+      models: [
+        { id: 'gpt-5.6-sol', label: 'GPT 5.6 Sol', quota: quota('Healthy', 34) },
+        { id: 'gpt-6-astra', label: 'GPT 6 Astra', quota: quota('Low', 82) },
+      ],
       status: 'online',
       busy: true,
-      paused: false,
       adapter: 'codex-exec-resume',
-      capabilities: ['coding', 'document_editing', 'terminal'],
-      currentTaskId: 'task-research-brief',
+      capabilities: ['planning', 'coding', 'document_editing'],
+      currentTaskId: 'task-intake',
       lastSeenAt: isoAgo(0),
-      observedCapabilities: {
-        adapter: { name: 'codex', available: true, version: 'codex-cli' },
-        tools: [
-          { name: 'git', available: true, version: 'git 2.x' },
-          { name: 'node', available: true, version: 'node 24' },
-        ],
-      },
       executors: [{ type: 'codex-exec-resume', health: 'Healthy', quota: 'Healthy' }],
+      usageTotals: usage(14_820, 4_610),
+      quotaSnapshot: quota('Healthy', 34),
     },
     {
-      agentId: 'lab-antigravity-02',
+      agentId: 'laptop-01-executor',
+      deviceId: 'laptop-01',
+      account: { id: 'gpt-plus-01', provider: 'openai', plan: 'Plus', label: 'GPT Plus 01' },
+      roles: ['executor'],
+      models: [{ id: 'gpt-5.6-terra', label: 'GPT 5.6 Terra', quota: quota('Healthy', 34) }],
       status: 'online',
       busy: false,
-      paused: false,
-      adapter: 'antigravity-stream-json',
-      capabilities: ['reasoning', 'document_editing', 'terminal'],
-      lastSeenAt: isoAgo(1),
-      observedCapabilities: {
-        adapter: { name: 'antigravity', available: true, version: 'agy' },
-        tools: [{ name: 'git', available: true, version: 'git 2.x' }],
-      },
-      executors: [{ type: 'antigravity-stream-json', health: 'Degraded', quota: 'Low' }],
+      adapter: 'codex-exec-resume',
+      capabilities: ['coding', 'document_editing', 'terminal'],
+      lastSeenAt: isoAgo(0),
+      executors: [{ type: 'codex-exec-resume', health: 'Healthy', quota: 'Healthy' }],
+      usageTotals: usage(21_440, 8_120),
+      quotaSnapshot: quota('Healthy', 34),
     },
     {
-      agentId: 'archive-local-03',
-      status: 'offline',
+      agentId: 'laptop-02-reviewer',
+      deviceId: 'laptop-02',
+      account: { id: 'gemini-pro-01', provider: 'google', plan: 'AI Pro', label: 'Gemini Pro 01' },
+      roles: ['reviewer'],
+      models: [{ id: 'gemini-2.5-pro', label: 'Gemini 2.5 Pro', quota: quota('Unknown') }],
+      status: 'online',
       busy: false,
-      paused: false,
-      adapter: 'local-tools',
-      capabilities: ['file_processing', 'validation'],
-      disconnectedAt: isoAgo(18),
-      lastSeenAt: isoAgo(18),
-      executors: [{ type: 'local-tools', health: 'Unhealthy', quota: 'Unknown' }],
+      adapter: 'antigravity-stream-json',
+      capabilities: ['reasoning', 'review', 'document_editing'],
+      lastSeenAt: isoAgo(1),
+      executors: [{ type: 'antigravity-stream-json', health: 'Healthy', quota: 'Unknown' }],
+      usageTotals: usage(7_240, 1_860),
+      quotaSnapshot: quota('Unknown'),
     },
   ]
 
   const tasks: HubTask[] = [
-    {
-      taskId: 'task-research-brief',
-      rootTaskId: 'task-research-brief',
-      targetAgentId: 'studio-codex-01',
-      sourceAgentId: 'human',
-      input: '整理访谈记录，提炼高频问题并生成结构化摘要。',
-      taskSpec: {
-        title: '生成客户访谈摘要',
-        type: 'document_analysis',
-        priority: 'P1',
-        expected_outputs: ['outputs/interview-summary.md'],
-        permissions_required: { project_workspace: true, terminal: true, browser: false },
-        acceptance: ['包含主要主题、证据与待确认项'],
-      },
-      status: 'running',
-      createdAt: isoAgo(24),
-      dispatchedAt: isoAgo(23),
-      startedAt: isoAgo(22),
-      checkpoint: {
-        checkpointId: 'cp-task-research-brief-running',
-        stage: 'RUNNING',
-        path: '.agent-hub/checkpoints/task-research-brief',
-      },
-    },
-    {
-      taskId: 'task-release-note',
-      rootTaskId: 'task-release-note',
-      targetAgentId: 'lab-antigravity-02',
-      sourceAgentId: 'human',
-      input: '根据变更清单生成对外发布说明。',
-      taskSpec: {
-        title: '发布说明审批',
-        type: 'content_generation',
-        priority: 'P0',
-        expected_outputs: ['outputs/release-note.md'],
-        permissions_required: { project_workspace: true, browser: false },
-      },
-      requiresApproval: true,
-      status: 'awaiting_approval',
-      createdAt: isoAgo(15),
-    },
-    {
-      taskId: 'task-catalog-check',
-      rootTaskId: 'task-catalog-check',
-      targetAgentId: 'studio-codex-01',
-      sourceAgentId: 'human',
-      input: '检查交付目录中的文件命名与完整性。',
-      taskSpec: {
-        title: '校验交付目录',
-        type: 'validation',
-        priority: 'P1',
-        expected_outputs: ['outputs/catalog-report.json'],
-        permissions_required: { project_workspace: true, terminal: true },
-      },
-      status: 'completed',
-      createdAt: isoAgo(58),
-      dispatchedAt: isoAgo(57),
-      startedAt: isoAgo(56),
-      completedAt: isoAgo(49),
-      output: '目录检查完成，共验证 18 个文件，未发现缺失项。',
-      artifacts: {
-        algorithm: 'sha256',
-        files: [
-          {
-            path: 'outputs/catalog-report.json',
-            size: 1842,
-            sha256: '5f2d8e11a7f24f8f4fb5af44ea92a78bf05dd8eb2f1ad812d35795b3e55d4ca4',
-            status: 'ready',
-          },
-        ],
-        missing: [],
-      },
-      checkpoint: {
-        checkpointId: 'cp-task-catalog-check-completed',
-        stage: 'COMPLETED',
-        path: '.agent-hub/checkpoints/task-catalog-check',
-      },
-    },
-    {
-      taskId: 'task-browser-profile',
-      rootTaskId: 'task-browser-profile',
-      targetAgentId: 'studio-codex-01',
-      sourceAgentId: 'human',
-      input: '读取浏览器个人资料并导出登录状态。',
-      taskSpec: {
-        title: '读取浏览器资料',
-        type: 'restricted_operation',
-        priority: 'P2',
-        permissions_required: { browser_profile: true },
-      },
-      status: 'rejected',
-      createdAt: isoAgo(72),
-      completedAt: isoAgo(72),
-      error: {
-        name: 'PolicyDeniedError',
-        code: 'POLICY_DENIED',
-        reasons: ['browser_profile is never allowed by local policy'],
-      },
-      checkpoint: {
-        checkpointId: 'cp-task-browser-profile-rejected',
-        stage: 'REJECTED',
-        path: '.agent-hub/checkpoints/task-browser-profile',
-      },
-    },
+    task(rootTaskId, rootTaskId, 'laptop-01-planner', 'planner', 'planning', 'completed', 28, '规划发布说明改进任务'),
+    task('task-execute', rootTaskId, 'laptop-01-executor', 'executor', 'execution', 'completed', 22, '完成发布说明与检查清单'),
+    task('task-review', rootTaskId, 'laptop-02-reviewer', 'reviewer', 'result_review', 'completed', 13, '审核完整成果'),
+    task('task-intake', rootTaskId, 'laptop-01-planner', 'planner', 'result_intake', 'running', 5, '接收通过审核的简报'),
   ]
 
-  const events: HubEvent[] = [
-    event(41, 'task.started', 22, { taskId: 'task-research-brief', agentId: 'studio-codex-01' }),
-    event(42, 'worker.heartbeat', 11, { agentId: 'lab-antigravity-02', quota: 'Low' }),
-    event(43, 'task.created', 15, { taskId: 'task-release-note', sourceAgentId: 'human' }),
-    event(44, 'approval.requested', 14, { taskId: 'task-release-note', agentId: 'lab-antigravity-02' }),
-    event(45, 'task.result', 49, { taskId: 'task-catalog-check', agentId: 'studio-codex-01' }),
-    event(46, 'task.rejected', 72, { taskId: 'task-browser-profile', agentId: 'studio-codex-01' }),
-  ].sort((a, b) => b.seq - a.seq)
+  const messages: HubMessage[] = [
+    message(1, rootTaskId, rootTaskId, 'human', 'human', 'task_instruction', '改进发布说明流程，最终交付一份可直接发布的说明。', 28, ['@planner']),
+    message(2, rootTaskId, rootTaskId, 'laptop-01-planner', 'planner', 'task_brief', '已拆成一个独立交付：完成发布说明并按三项标准自检。', 25, ['@executor']),
+    message(3, rootTaskId, 'task-execute', 'laptop-01-executor', 'executor', 'task_brief', '发布说明和核对清单已完成，内容覆盖变更、影响与回退方式。', 16, ['@reviewer'], [{
+      type: 'full_result',
+      label: '完整成果',
+      taskId: 'task-execute',
+      version: 'v1',
+      content: '# 发布说明\n\n本次更新完善了多 Agent 任务协作流程，并加入审核与用量记录。\n\n## 影响\n任务结果必须经过审核后才能交给规划 Agent。',
+    }]),
+    message(4, rootTaskId, 'task-review', 'laptop-02-reviewer', 'reviewer', 'review_decision', '审核通过：内容完整，三项验收标准均满足。', 10, ['laptop-01-executor']),
+    message(5, rootTaskId, 'task-intake', 'laptop-01-planner', 'planner', 'status', '正在接收审核后的任务简报。', 5),
+  ]
+
+  const conversations: Conversation[] = [{
+    rootTaskId,
+    title: '发布说明协作改进',
+    status: 'active',
+    createdAt: isoAgo(28),
+    updatedAt: isoAgo(5),
+    participants: ['human', 'laptop-01-planner', 'laptop-01-executor', 'laptop-02-reviewer'],
+    taskCount: 4,
+    messageCount: messages.length,
+    humanIntervention: null,
+  }]
+
+  const events: HubEvent[] = messages.map((item) => ({
+    seq: item.seq,
+    ts: item.createdAt,
+    type: `message.${item.kind}`,
+    details: { rootTaskId, taskId: item.taskId, senderId: item.senderId },
+  })).reverse()
 
   return {
     health: { ok: true, protocolVersion: 1, now: new Date().toISOString() },
     agents,
     tasks,
+    conversations,
+    messages,
+    usage: {
+      totals: usage(43_500, 14_590),
+      byAgent: agents.map((agent) => ({
+        agentId: agent.agentId,
+        deviceId: agent.deviceId,
+        account: agent.account,
+        usageTotals: agent.usageTotals,
+        quotaSnapshot: agent.quotaSnapshot,
+      })),
+    },
     events,
   }
 }
 
-function event(seq: number, type: string, minutesAgo: number, details: Record<string, unknown>): HubEvent {
-  return { seq, type, ts: isoAgo(minutesAgo), details }
+function quota(state: 'Healthy' | 'Low' | 'Exhausted' | 'Unknown', usedPercent?: number) {
+  return {
+    state,
+    checkedAt: new Date().toISOString(),
+    source: state === 'Unknown' ? 'unavailable' : 'client',
+    windows: usedPercent == null ? [] : [{
+      name: 'rolling-window',
+      usedPercent,
+      remainingPercent: 100 - usedPercent,
+      resetsAt: new Date(Date.now() + 180 * minute).toISOString(),
+    }],
+  }
 }
-\n
+
+function task(
+  taskId: string,
+  rootTaskId: string,
+  targetAgentId: string,
+  role: 'planner' | 'executor' | 'reviewer',
+  stage: string,
+  status: string,
+  minutesAgo: number,
+  title: string,
+): HubTask {
+  return {
+    taskId,
+    rootTaskId,
+    targetAgentId,
+    sourceAgentId: taskId === rootTaskId ? 'human' : 'agent',
+    input: title,
+    role,
+    stage,
+    status,
+    taskSpec: { title, acceptance: ['内容完整', '可直接核验', '无越权操作'] },
+    createdAt: isoAgo(minutesAgo),
+    ...(status === 'running' ? { startedAt: isoAgo(minutesAgo - 1) } : { completedAt: isoAgo(minutesAgo - 3) }),
+  }
+}
+
+function message(
+  seq: number,
+  rootTaskId: string,
+  taskId: string,
+  senderId: string,
+  senderRole: string,
+  kind: string,
+  text: string,
+  minutesAgo: number,
+  mentions: string[] = [],
+  attachments: HubMessage['attachments'] = [],
+): HubMessage {
+  return { messageId: `demo-message-${seq}`, seq, rootTaskId, taskId, senderId, senderRole, kind, text, mentions, attachments, createdAt: isoAgo(minutesAgo) }
+}

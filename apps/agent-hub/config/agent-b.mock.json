@@ -1,5 +1,9 @@
 {
   "agentId": "agent-b",
+  "deviceId": "mock-device-02",
+  "account": { "id": "mock-account-02", "provider": "mock", "plan": "test", "label": "Mock Account 02" },
+  "roles": ["reviewer"],
+  "models": [{ "id": "mock-review", "capabilities": ["review"], "quota": { "state": "Healthy", "source": "mock", "windows": [] } }],
   "hubUrl": "ws://127.0.0.1:8787/worker",
   "authTokenEnv": "HUB_TOKEN",
   "authRequired": false,
@@ -12,8 +16,9 @@
   },
   "adapter": {
     "type": "mock",
-    "delayMs": 50
+    "delayMs": 50,
+    "roleOutputs": {
+      "reviewer": "{\"verdict\":\"approved\",\"brief\":\"成果符合验收标准\",\"issues\":[]}"
+    }
   }
 }
-
-\n

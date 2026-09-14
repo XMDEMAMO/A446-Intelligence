@@ -12,6 +12,7 @@ export class AntigravityAdapter {
     this.pending = null;
     this.startPromise = null;
     this.stopping = false;
+    this.currentProfile = null;
   }
 
   get type() {
@@ -21,13 +22,14 @@ export class AntigravityAdapter {
   async start(state) {
     this.state = state;
     this.stopping = false;
-    await this.ensureProcess(state.sessionId);
   }
 
-  async ensureProcess(sessionId) {
-    if (this.child) return;
+  async ensureProcess(sessionId, model, reasoningEffort, sessionKey = "legacy") {
+    const profile = `${sessionKey}:${model ?? ""}:${reasoningEffort ?? ""}`;
+    if (this.child && this.currentProfile === profile) return;
+    if (this.child) await this.closeProcess();
     if (this.startPromise) return this.startPromise;
-    this.startPromise = this.spawnProcess(sessionId);
+    this.startPromise = this.spawnProcess(sessionId, model, reasoningEffort, sessionKey);
     try {
       await this.startPromise;
     } finally {
@@ -35,7 +37,7 @@ export class AntigravityAdapter {
     }
   }
 
-  async spawnProcess(sessionId) {
+  async spawnProcess(sessionId, model, reasoningEffort, sessionKey) {
     const command = resolveAgyCommand(this.config.command ?? "agy");
     const args = [
       ...(Array.isArray(this.config.args) ? this.config.args : []),
@@ -43,6 +45,8 @@ export class AntigravityAdapter {
       "--output-format", "stream-json",
     ];
     if (sessionId && this.config.resumeOnStart !== false) args.push("--conversation", sessionId);
+    if (model) args.push("--model", String(model));
+    if (reasoningEffort) args.push("--effort", String(reasoningEffort));
 
     const env = { ...process.env };
     if (this.config.stripProxyEnv) {
@@ -57,6 +61,7 @@ export class AntigravityAdapter {
       stdio: ["pipe", "pipe", "pipe"],
     });
     this.child = child;
+    this.currentProfile = `${sessionKey}:${model ?? ""}:${reasoningEffort ?? ""}`;
     const lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     lines.on("line", (line) => this.handleLine(child, line));
     child.stderr.setEncoding("utf8");
@@ -78,7 +83,7 @@ export class AntigravityAdapter {
 
   async run(input, context) {
     if (this.pending) throw new Error("Antigravity adapter accepts only one in-flight turn");
-    await this.ensureProcess(context.sessionId);
+    await this.ensureProcess(context.sessionId, context.model ?? this.config.model, context.reasoningEffort ?? this.config.reasoningEffort, context.sessionKey);
     const child = this.child;
     if (!child?.stdin?.writable) throw new Error("Antigravity CLI stdin is not writable");
 
@@ -132,8 +137,13 @@ export class AntigravityAdapter {
 
   async stop() {
     this.stopping = true;
+    await this.closeProcess();
+  }
+
+  async closeProcess() {
     const child = this.child;
     this.child = null;
+    this.currentProfile = null;
     if (!child) return;
     if (child.stdin.writable) child.stdin.end();
     await Promise.race([
@@ -143,7 +153,6 @@ export class AntigravityAdapter {
     if (child.exitCode === null && child.signalCode === null) child.kill();
   }
 }
-
 function resolveAgyCommand(command) {
   if (process.platform !== "win32" || command.toLowerCase() !== "agy") return command;
   const localAppData = process.env.LOCALAPPDATA;
@@ -151,5 +160,3 @@ function resolveAgyCommand(command) {
   const candidate = path.join(localAppData, "agy", "bin", "agy.exe");
   return existsSync(candidate) ? candidate : command;
 }
-
-\n

@@ -37,6 +37,10 @@ The following behavior is implemented and must remain working:
 - Startup capability probes for the selected Adapter and configured local tools.
 - Runtime executor health and coarse quota states reported in hello, heartbeat, result, and error messages.
 - Local task pause, resume, and cancellation.
+- Planner, executor, and reviewer role contracts with minimal per-role context.
+- One-root-task/one-conversation messages, reviewed-result handoff, upstream-error adjudication, and bounded revision loops.
+- Dynamic Agent/model selection using role, capabilities, online state, load, and trusted quota state.
+- Per-turn and cumulative token counts plus an optional machine-readable official-client quota probe.
 
 ## 3 Security invariants
 
@@ -113,6 +117,8 @@ src/local-policy.mjs           permission and path enforcement
 src/checkpoint-store.mjs       durable stage checkpoints
 src/artifact-manifest.mjs      Artifact discovery and SHA-256
 src/capability-probe.mjs       Adapter/tool readiness and quota state classification
+src/quota-probe.mjs            optional machine-readable official-client quota snapshots
+src/collaboration.mjs          role contracts, output parsing, usage normalization, scheduling
 src/adapters/codex.mjs         Codex session continuation
 src/adapters/antigravity.mjs   Antigravity persistent stream-json conversation
 src/adapters/stdio-json.mjs    generic persistent JSONL Adapter
@@ -128,7 +134,7 @@ test/                          regression and integration tests
 
 Start from `config/worker.codex.example.json` or `config/worker.antigravity.example.json`.
 
-Fields that must be unique per Agent:
+Fields that must be unique per logical Agent:
 
 ```text
 agentId
@@ -161,6 +167,22 @@ Important local fields:
   }
 }
 ```
+
+Device/account/model identity is separate from the logical Agent:
+
+```json
+{
+  "agentId": "laptop-01-executor-01",
+  "deviceId": "laptop-01",
+  "account": { "id": "gpt-plus-01", "provider": "openai", "plan": "Plus" },
+  "roles": ["executor"],
+  "models": [
+    { "id": "model-id-reported-by-the-client", "capabilities": ["coding"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } }
+  ]
+}
+```
+
+An account is the local login boundary; it may expose multiple models and run multiple logical Agents. A model is not a separate login authorization. Every logical Agent still owns one state file, workspace, and durable session. Run multiple Worker processes on the same device/account when multiple roles are needed.
 
 Keep `requireTaskSpec=false` only while interoperating with an older server. Set it to `true` after the production server always sends `payload.taskSpec`.
 
@@ -287,7 +309,7 @@ Exhausted
 Unknown
 ```
 
-Classification rules:
+Coarse executor classification rules:
 
 ```text
 before a trusted execution result                  -> Unknown
@@ -299,9 +321,41 @@ authentication or unsupported-location error      -> executor Unhealthy, quota u
 
 Do not invent a numeric remaining percentage. Codex Plus and Google AI Pro CLIs do not currently expose a reliable common numeric quota interface to this Worker. If a future official command is added, preserve `Unknown` as the fallback and test the new parser against captured fixtures.
 
+Every Adapter should return machine-readable per-turn token usage when the official result contains it. The Worker normalizes input, output, cached, reasoning, tool, and total token counts and accumulates them per logical Agent; Hub also aggregates them per Agent and account.
+
+When an official client or a locally trusted sidecar can expose its displayed quota as JSON, configure an optional probe:
+
+```json
+{
+  "quotaProbe": {
+    "command": "path-to-local-official-quota-reader",
+    "args": ["--json"],
+    "source": "official-client",
+    "intervalMs": 60000,
+    "timeoutMs": 10000
+  }
+}
+```
+
+The command runs locally with `shell=false` and must print a JSON object containing `state` and `windows`. This interface must not read cookies, browser profiles, credentials, or authentication databases. A failed or unavailable probe preserves `Unknown`/the last trusted snapshot; it never derives a numeric percentage from token counts.
+
+## 11.1 Collaboration contracts
+
+One root workflow maps to one observable conversation. Role output is structured JSON:
+
+```text
+planner   -> brief, assignments, needsHuman, humanQuestion
+executor  -> brief, fullResult, upstreamIssue
+reviewer  -> verdict, brief, issues, correctionBrief
+```
+
+Only the reviewer receives an executor's complete result. After approval, the planner receives only the executor brief, review brief, and Artifact references. An executor-reported upstream error must first go to the reviewer. If confirmed, the reviewer sends a correction brief to the planner for replanning; if denied, the executor continues the original assignment.
+
+Planner assignments must be independent and non-overlapping. Do not add file locks, merge orchestration, or shared-deliverable conflict resolution to compensate for a bad split; keep one owner for one deliverable.
+
 ## 12 Persistent session invariants
 
-One Agent owns one durable local session.
+One logical Agent owns a map of durable local sessions. Legacy direct tasks use the `legacy` session. Collaboration tasks use `sessionScopeId`: planner follow-ups share the root planning scope, executor revisions share their original execution scope, and unrelated root tasks never share model history.
 
 For Codex:
 
@@ -319,6 +373,8 @@ read completion:   event=result
 persist:           conversation_id
 restart recovery:  --conversation <conversation_id>
 ```
+
+If the scheduler selects a different Antigravity model or reasoning effort, the Adapter restarts the stream process with `--model`/`--effort` and resumes the same locally owned conversation when supported.
 
 Never share a session ID between two Agents. Never send a local third-party session credential to another Worker for identity migration.
 
@@ -338,6 +394,11 @@ task.result.payload.checkpoint
 task.result.payload.executor
 task.error.payload.checkpoint
 task.error.payload.executor
+worker.hello.payload.deviceId/account/roles/models/usageTotals/quotaSnapshot
+worker.heartbeat.payload.usageTotals/quotaSnapshot
+task.assign.payload.role/stage/contextBundle/execution
+task.assign.payload.sessionScopeId
+task.result.payload.role/model/submission/usage/usageTotals/quotaSnapshot
 ```
 
 Protocol v1 allows new payload fields to be ignored by older peers, but a production server must treat `task.rejected` as a terminal state and must not repeatedly reschedule the same task to the same Worker without a human-approved Task Spec or Policy change.
@@ -390,6 +451,10 @@ MVP-L09  Adapter binary and readiness checks appear in observedCapabilities
 MVP-L10  rate limit maps to Low and explicit quota exhaustion maps to Exhausted
 MVP-L11  Antigravity fixture preserves one process and conversation ID
 MVP-L12  npm audit reports no production dependency vulnerabilities
+MVP-L13  planner/executor/reviewer workflow passes only minimal role context
+MVP-L14  upstream-error reports reach the planner only after reviewer confirmation
+MVP-L15  model selection is dynamic and token usage is accumulated without inventing quota percentages
+MVP-L16  unrelated root tasks do not share a model session; revisions keep their intended execution scope
 ```
 
 Do not report success if tests were skipped, a real failure was replaced with a mock result, or a security assertion was weakened.
@@ -436,22 +501,18 @@ safe next action
 
 ## 18 Current known boundary
 
-The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, capability/readiness telemetry, coarse quota telemetry, and Artifact hashing.
+The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, and Artifact hashing.
 
 The following remain outside this local package:
 
 ```text
-production task DAG and scheduler
+production-grade persistent task scheduler and lease reassignment
 server-side Lease and reassignment
 central database
-production Web UI
+production authentication and durable storage for the Web UI
 cross-Worker Artifact storage
-semantic Validator
-human approval interface
-exact third-party quota percentages when not exposed by official CLIs
+provider-specific official quota readers where the installed client has no machine-readable interface
 mid-turn recovery inside a black-box CLI model turn
 ```
 
 Do not claim that the local package alone implements the complete A446 platform.
-
-\n

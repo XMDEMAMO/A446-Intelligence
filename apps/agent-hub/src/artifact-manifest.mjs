@@ -98,5 +98,3 @@ function toPortableRelative(workspaceRoot, file) {
   const relative = path.relative(workspaceRoot, file);
   return relative.split(path.sep).join("/");
 }
-
-\n

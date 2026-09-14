@@ -17,5 +17,3 @@ printf 'Demo started: hub=%s agent-a=%s agent-b=%s\n' "$HUB_PID" "$AGENT_A_PID" 
 printf '%s\n' 'Loopback demo is unauthenticated unless HUB_TOKEN was already exported.'
 printf '%s\n' "Run: node src/hubctl.mjs send --agent agent-a --input 'hello' --route agent-b --wait"
 printf '%s\n' "Stop: ./scripts/stop-demo.sh"
-
-\n

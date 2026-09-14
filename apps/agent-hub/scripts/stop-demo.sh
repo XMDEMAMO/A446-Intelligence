@@ -16,5 +16,3 @@ while IFS= read -r PID; do
   esac
 done <"$PID_FILE"
 rm -f "$PID_FILE"
-
-\n

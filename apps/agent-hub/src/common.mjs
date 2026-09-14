@@ -97,5 +97,3 @@ export function commandExistsHint(command) {
   if (!command) return "No command configured";
   return `Command not found: ${command}`;
 }
-
-\n

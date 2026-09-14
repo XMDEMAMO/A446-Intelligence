@@ -63,6 +63,18 @@ function Wait-ForTask {
   throw "Timed out waiting for task $TaskId to reach: $($Statuses -join ', ')."
 }
 
+function Wait-ForWorkflow {
+  param([string]$RootTaskId)
+  for ($Attempt = 0; $Attempt -lt 100; $Attempt++) {
+    $Tasks = @((Invoke-HubRequest -Method Get -Path "/v1/tasks?rootTaskId=$RootTaskId").tasks)
+    if ($Tasks.Count -ge 4 -and ($Tasks | Where-Object status -NotIn @('completed', 'failed', 'rejected', 'cancelled')).Count -eq 0) {
+      return $Tasks
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  throw "Timed out waiting for workflow $RootTaskId."
+}
+
 try {
   $Health = $null
   try {
@@ -77,6 +89,23 @@ try {
 
   $Agents = Wait-ForAgents -ExpectedCount 2
   Assert-True ($Agents.Count -ge 2) 'two workers should be online'
+
+  $Workflow = Invoke-HubRequest -Method Post -Path '/v1/workflows' -Body @{
+    title = 'batch smoke collaboration'
+    objective = 'produce one reviewed mock result'
+    acceptance = @('reviewer approves the result')
+    maxReviewCycles = 2
+  }
+  $WorkflowTasks = Wait-ForWorkflow -RootTaskId $Workflow.task.rootTaskId
+  Assert-True ($WorkflowTasks.Count -eq 4) 'workflow should run planner, executor, reviewer, and planner intake'
+  $WorkflowRoles = @($WorkflowTasks | ForEach-Object role)
+  Assert-True (($WorkflowRoles -join ',') -eq 'planner,executor,reviewer,planner') 'workflow role order should be planner, executor, reviewer, planner'
+  $Messages = @((Invoke-HubRequest -Method Get -Path "/v1/messages?rootTaskId=$($Workflow.task.rootTaskId)").messages)
+  Assert-True (($Messages | Where-Object { $_.attachments.type -contains 'full_result' }).Count -ge 1) 'executor should publish a full-result attachment'
+  $Conversations = @((Invoke-HubRequest -Method Get -Path '/v1/conversations').conversations)
+  Assert-True (($Conversations | Where-Object rootTaskId -eq $Workflow.task.rootTaskId).Count -eq 1) 'one root task should create one conversation'
+  $Usage = Invoke-HubRequest -Method Get -Path '/v1/usage'
+  Assert-True ($Usage.totals.totalTokens -gt 0) 'workflow should accumulate token counts'
 
   $Success = Invoke-HubRequest -Method Post -Path '/v1/tasks' -Body @{
     targetAgentId = 'agent-a'
@@ -156,10 +185,12 @@ try {
     cancelledTask = $CancelledTask.status
     approveAfterCancel = $ApproveAfterCancelStatus
     eventsChecked = $Events.Count
+    collaborationTasks = $WorkflowTasks.Count
+    collaborationMessages = $Messages.Count
+    totalTokens = $Usage.totals.totalTokens
   } | Format-List
 } finally {
   if ($StartedHub) {
     & (Join-Path $HubRoot 'scripts\stop-demo.ps1')
   }
 }
-\n

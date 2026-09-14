@@ -18,7 +18,11 @@ foreach ($Entry in $State.processes) {
     Write-Warning "Skipped PID $($Entry.pid): the PID record has no start time."
     continue
   }
-  $ExpectedStart = [DateTimeOffset]::Parse($Entry.startedAt).UtcDateTime
+  $ExpectedStart = if ($Entry.startedAt -is [DateTime]) {
+    $Entry.startedAt.ToUniversalTime()
+  } else {
+    [DateTimeOffset]::Parse([string]$Entry.startedAt).UtcDateTime
+  }
   $ActualStart = $ProcessInfo.StartTime.ToUniversalTime()
   if ([Math]::Abs(($ActualStart - $ExpectedStart).TotalSeconds) -gt 2) {
     Write-Warning "Skipped PID $($Entry.pid): the process start time does not match the PID record."
@@ -28,4 +32,3 @@ foreach ($Entry in $State.processes) {
   Write-Output "Stopped $($Entry.name) (PID $($Entry.pid))."
 }
 Remove-Item -LiteralPath $PidFile
-\n

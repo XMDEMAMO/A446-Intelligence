@@ -1,0 +1,55 @@
+{
+  "agentId": "laptop-01-codex-executor-01",
+  "deviceId": "laptop-01",
+  "account": {
+    "id": "gpt-plus-01",
+    "provider": "openai",
+    "plan": "Plus",
+    "label": "GPT Plus 01"
+  },
+  "roles": ["executor"],
+  "models": [
+    {
+      "id": "gpt-5.6-terra",
+      "capabilities": ["coding", "document_editing"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    },
+    {
+      "id": "gpt-5.6-sol",
+      "capabilities": ["coding", "reasoning"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    }
+  ],
+  "hubUrl": "ws://192.168.137.1:8787/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": true,
+  "heartbeatMs": 5000,
+  "stateFile": "../var/state/laptop-01-codex-executor-private-lan.json",
+  "workspace": "../workspaces/laptop-01-codex-executor",
+  "capabilities": ["task.execute", "coding", "document_editing", "pause", "resume", "cancel"],
+  "policy": {
+    "requireTaskSpec": false,
+    "defaultDenyUnknownPermissions": true,
+    "allowedPermissions": ["project_workspace", "terminal"],
+    "deniedPermissions": ["browser", "system_settings"]
+  },
+  "checkpoints": { "includeOutput": true, "maxOutputChars": 200000 },
+  "artifacts": { "maxFileBytes": 104857600 },
+  "capabilityProbe": {
+    "timeoutMs": 5000,
+    "tools": [
+      { "name": "git", "command": "git", "args": ["--version"] }
+    ]
+  },
+  "reconnect": { "baseMs": 1000, "maxMs": 30000 },
+  "tls": { "rejectUnauthorized": true },
+  "adapter": {
+    "type": "codex",
+    "command": "codex",
+    "globalArgs": [],
+    "execArgs": [],
+    "sandbox": "workspace-write",
+    "approvalPolicy": "never",
+    "maxOutputChars": 200000
+  }
+}

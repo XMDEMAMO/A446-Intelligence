@@ -5,8 +5,9 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { WebSocketServer, WebSocket } from "ws";
 import { EventLog } from "./event-log.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
+import { addUsage, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
 
-const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running"]);
+const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
 
 export class AgentHub {
   constructor(config) {
@@ -17,6 +18,9 @@ export class AgentHub {
     this.agents = new Map();
     this.connections = new Map();
     this.tasks = new Map();
+    this.messages = [];
+    this.messageSeq = 0;
+    this.usageTotals = null;
     this.pendingDeliveries = new Map();
     this.log = new EventLog({
       file: config.logs?.file,
@@ -120,12 +124,26 @@ export class AgentHub {
             sessionId: message.payload?.sessionId,
             observedCapabilities: message.payload?.observedCapabilities,
             executors: message.payload?.executors ?? [],
+            deviceId: message.payload?.deviceId ?? registeredAgentId,
+            account: message.payload?.account ?? null,
+            roles: normalizeRoles(message.payload?.roles),
+            models: normalizeModels(message.payload?.models, { model: message.payload?.model }),
+            maxConcurrency: Number(message.payload?.maxConcurrency ?? 1),
+            activeTaskCount: [...this.tasks.values()].filter((task) => task.targetAgentId === registeredAgentId && ACTIVE_TASK_STATUSES.has(task.status)).length,
+            usageTotals: message.payload?.usageTotals ?? null,
+            quotaSnapshot: normalizeQuotaSnapshot(message.payload?.quotaSnapshot),
+            quotaProbeError: message.payload?.quotaProbeError ?? null,
             connectedAt: new Date().toISOString(),
             lastSeenAt: new Date().toISOString(),
           });
           await this.log.record("worker.online", this.agents.get(registeredAgentId));
           ws.send(JSON.stringify(makeEnvelope("hub.welcome", { agentId: registeredAgentId, replyTo: message.id, payload: { heartbeatMs: this.config.heartbeatMs ?? 10000 } })));
           this.flushAgentDeliveries(registeredAgentId);
+          for (const task of this.tasks.values()) {
+            if (task.status === "queued" && (!task.targetAgentId || task.targetAgentId === registeredAgentId)) {
+              await this.queueOrDispatch(task);
+            }
+          }
           return;
         }
         if (message.agentId && message.agentId !== registeredAgentId) throw new Error("agentId cannot change on an active connection");
@@ -166,6 +184,9 @@ export class AgentHub {
         agent.observedCapabilities = message.payload?.observedCapabilities ?? agent.observedCapabilities;
         agent.executors = message.payload?.executors ?? agent.executors;
         agent.currentTaskId = message.payload?.currentTaskId ?? null;
+        agent.usageTotals = message.payload?.usageTotals ?? agent.usageTotals;
+        agent.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot) ?? agent.quotaSnapshot;
+        agent.quotaProbeError = message.payload?.quotaProbeError ?? agent.quotaProbeError;
       }
       return;
     }
@@ -181,6 +202,12 @@ export class AgentHub {
       task.status = "running";
       task.startedAt = new Date().toISOString();
       task.checkpoint = message.payload?.checkpoint;
+      this.addMessage(task, {
+        senderId: agentId,
+        senderRole: task.role,
+        kind: "status",
+        text: `开始执行：${task.taskSpec?.title ?? task.input.slice(0, 80)}`,
+      });
       await this.log.record("task.started", { taskId: task.taskId, agentId, checkpoint: task.checkpoint });
       return;
     }
@@ -195,32 +222,60 @@ export class AgentHub {
       task.completedAt = new Date().toISOString();
       task.error = { name: "PolicyDeniedError", code: message.payload?.code, reasons: message.payload?.reasons ?? [] };
       task.checkpoint = message.payload?.checkpoint;
+      this.finishTaskActivity(task);
       await this.log.record("task.rejected", { taskId: task.taskId, agentId, payload: message.payload });
+      await this.retryQueuedTasks();
       return;
     }
     if ((message.type === "task.result" || message.type === "task.error") && task) {
       if (["completed", "failed", "cancelled", "rejected"].includes(task.status)) return;
-      task.status = message.type === "task.result" ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
+      const terminalStatus = message.type === "task.result" ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
+      task.status = "processing_result";
       task.completedAt = new Date().toISOString();
       task.output = message.payload?.output;
       task.error = message.payload?.error;
       task.sessionId = message.payload?.sessionId;
       task.artifacts = message.payload?.artifacts;
       task.checkpoint = message.payload?.checkpoint;
+      task.model = message.payload?.model ?? task.execution?.model ?? null;
+      task.usage = message.payload?.usage ?? null;
+      task.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot);
+      task.submission = message.payload?.submission ?? parseRoleSubmission(task.role, task.output);
+      if (task.usage) this.usageTotals = addUsage(this.usageTotals, task.usage);
+      const agentRecord = this.agents.get(agentId);
+      if (agentRecord && message.payload?.usageTotals) agentRecord.usageTotals = message.payload.usageTotals;
+      if (agentRecord && task.quotaSnapshot) agentRecord.quotaSnapshot = task.quotaSnapshot;
       await this.log.record(message.type, { taskId: task.taskId, agentId, payload: message.payload });
-      if (message.type === "task.result" && task.route.length > 0) {
-        const [nextAgentId, ...rest] = task.route;
-        const child = this.createTask({
-          targetAgentId: nextAgentId,
-          input: message.payload?.output ?? "",
-          route: rest,
-          rootTaskId: task.rootTaskId,
-          parentTaskId: task.taskId,
-          sourceAgentId: agentId,
-          metadata: task.metadata,
-        });
-        await this.queueOrDispatch(child);
+      if (message.type === "task.result") {
+        this.recordResultMessage(task);
       }
+      try {
+        if (message.type === "task.result" && task.workflow?.enabled) {
+          await this.advanceWorkflow(task);
+        } else if (message.type === "task.result" && task.route.length > 0) {
+          const [nextAgentId, ...rest] = task.route;
+          const child = this.createTask({
+            targetAgentId: nextAgentId,
+            input: message.payload?.output ?? "",
+            route: rest,
+            rootTaskId: task.rootTaskId,
+            parentTaskId: task.taskId,
+            sourceAgentId: agentId,
+            metadata: task.metadata,
+          });
+          await this.queueOrDispatch(child);
+        }
+      } catch (error) {
+        task.status = "failed";
+        task.error = { name: "WorkflowAdvanceError", message: String(error?.message ?? error) };
+        this.finishTaskActivity(task);
+        await this.log.record("workflow.advance_error", { taskId: task.taskId, error: safeError(error) });
+        await this.retryQueuedTasks();
+        return;
+      }
+      task.status = terminalStatus;
+      this.finishTaskActivity(task);
+      await this.retryQueuedTasks();
     }
   }
 
@@ -231,28 +286,371 @@ export class AgentHub {
 
   createTask(input) {
     const taskId = randomUUID();
+    const role = normalizeRoles(input.role)[0] ?? null;
+    const rootTaskId = input.rootTaskId ?? taskId;
     const task = {
       taskId,
-      rootTaskId: input.rootTaskId ?? taskId,
+      rootTaskId,
       parentTaskId: input.parentTaskId,
-      targetAgentId: input.targetAgentId,
+      targetAgentId: input.targetAgentId ?? null,
       sourceAgentId: input.sourceAgentId ?? "human",
       input: String(input.input ?? ""),
       route: Array.isArray(input.route) ? input.route : [],
       metadata: input.metadata ?? {},
       taskSpec: input.taskSpec ?? input.metadata?.taskSpec ?? null,
+      role,
+      stage: input.stage ?? (role ? role : "execution"),
+      workflow: input.workflow ?? null,
+      sessionScopeId: input.sessionScopeId ?? (input.workflow?.enabled ? (role === "planner" ? rootTaskId : taskId) : "legacy"),
+      contextBundle: input.contextBundle ?? {},
+      requiredCapabilities: Array.isArray(input.requiredCapabilities) ? input.requiredCapabilities.map(String) : [],
+      modelPreference: input.modelPreference ?? input.model ?? null,
+      reasoningEffort: input.reasoningEffort ?? null,
+      reviewCycle: Number(input.reviewCycle ?? 0),
       requiresApproval: Boolean(input.requiresApproval),
       status: input.requiresApproval ? "awaiting_approval" : "queued",
       createdAt: new Date().toISOString(),
     };
     this.tasks.set(taskId, task);
+    const sourceRole = task.sourceAgentId === "human"
+      ? "human"
+      : input.sourceRole ?? this.tasks.get(task.parentTaskId)?.role ?? "agent";
+    this.addMessage(task, {
+      senderId: task.sourceAgentId,
+      senderRole: sourceRole,
+      kind: "task_instruction",
+      text: task.input,
+      mentions: task.targetAgentId ? [task.targetAgentId] : task.role ? [`@${task.role}`] : [],
+    });
     void this.log.record("task.created", task);
     return task;
   }
 
+  async createWorkflow(input) {
+    if (typeof input.objective !== "string" || !input.objective.trim()) throw httpError(400, "workflow objective is required");
+    const workflow = {
+      enabled: true,
+      plannerAgentId: input.plannerAgentId ?? null,
+      reviewerAgentId: input.reviewerAgentId ?? null,
+      maxReviewCycles: Math.max(0, Number(input.maxReviewCycles ?? 2)),
+    };
+    const task = this.createTask({
+      targetAgentId: workflow.plannerAgentId,
+      sourceAgentId: "human",
+      input: input.objective.trim(),
+      role: "planner",
+      stage: "planning",
+      workflow,
+      requiredCapabilities: input.requiredCapabilities,
+      modelPreference: input.modelPreference,
+      reasoningEffort: input.reasoningEffort,
+      requiresApproval: Boolean(input.requiresApproval),
+      taskSpec: {
+        title: String(input.title ?? input.objective).trim().slice(0, 200),
+        type: "collaboration_workflow",
+        priority: input.priority ?? "P1",
+        inputs: [],
+        expected_outputs: [],
+        permissions_required: input.permissionsRequired ?? { project_workspace: true },
+        checkpoint_policy: { mode: "stage" },
+        acceptance: Array.isArray(input.acceptance) ? input.acceptance.map(String) : [],
+      },
+      contextBundle: {
+        objective: input.objective.trim(),
+        acceptance: Array.isArray(input.acceptance) ? input.acceptance.map(String) : [],
+      },
+    });
+    await this.queueOrDispatch(task);
+    return task;
+  }
+
+  addMessage(task, input) {
+    const message = {
+      messageId: randomUUID(),
+      seq: ++this.messageSeq,
+      rootTaskId: task.rootTaskId,
+      taskId: task.taskId,
+      parentTaskId: task.parentTaskId ?? null,
+      senderId: input.senderId ?? "system",
+      senderRole: input.senderRole ?? "system",
+      kind: input.kind ?? "message",
+      text: String(input.text ?? ""),
+      mentions: Array.isArray(input.mentions) ? input.mentions : [],
+      attachments: Array.isArray(input.attachments) ? input.attachments : [],
+      createdAt: new Date().toISOString(),
+    };
+    this.messages.push(message);
+    if (this.messages.length > Number(this.config.messages?.maxInMemory ?? 5000)) this.messages.shift();
+    return message;
+  }
+
+  recordResultMessage(task) {
+    const submission = task.submission ?? {};
+    const attachments = [];
+    if (task.role === "executor") {
+      attachments.push({
+        type: "full_result",
+        label: "完整成果",
+        taskId: task.taskId,
+        version: `v${task.reviewCycle + 1}`,
+        content: submission.fullResult ?? task.output ?? "",
+        artifacts: task.artifacts ?? null,
+      });
+    } else if (task.artifacts?.files?.length) {
+      attachments.push({ type: "artifacts", label: "成果附件", taskId: task.taskId, artifacts: task.artifacts });
+    }
+    this.addMessage(task, {
+      senderId: task.targetAgentId,
+      senderRole: task.role ?? "executor",
+      kind: task.role === "reviewer" ? "review_decision" : "task_brief",
+      text: submission.brief ?? task.output ?? "任务已完成",
+      mentions: task.role === "reviewer" && task.parentTaskId ? [this.tasks.get(task.parentTaskId)?.targetAgentId].filter(Boolean) : [],
+      attachments,
+    });
+  }
+
+  async advanceWorkflow(task) {
+    const submission = task.submission ?? {};
+    if (task.role === "planner") {
+      if (submission.needsHuman) {
+        this.requireHuman(task, submission.humanQuestion || submission.brief || "规划 Agent 请求人工介入");
+        return;
+      }
+      for (const assignment of submission.assignments ?? []) {
+        const child = this.createTask({
+          targetAgentId: assignment.targetAgentId,
+          input: assignment.instructions,
+          rootTaskId: task.rootTaskId,
+          parentTaskId: task.taskId,
+          sourceAgentId: task.targetAgentId,
+          role: "executor",
+          stage: "execution",
+          workflow: task.workflow,
+          requiredCapabilities: assignment.requiredCapabilities,
+          modelPreference: assignment.modelPreference,
+          taskSpec: {
+            title: assignment.title,
+            type: "collaboration_execution",
+            priority: task.taskSpec?.priority ?? "P1",
+            inputs: [],
+            expected_outputs: [],
+            permissions_required: task.taskSpec?.permissions_required ?? { project_workspace: true },
+            checkpoint_policy: { mode: "stage" },
+            acceptance: assignment.acceptance?.length ? assignment.acceptance : task.taskSpec?.acceptance ?? [],
+          },
+          contextBundle: {
+            objective: task.contextBundle?.objective ?? task.input,
+            plannerBrief: submission.brief,
+            acceptance: assignment.acceptance ?? [],
+          },
+        });
+        await this.queueOrDispatch(child);
+      }
+      return;
+    }
+
+    if (task.role === "executor") {
+      const reviewKind = submission.upstreamIssue ? "upstream_review" : "result_review";
+      const reviewer = this.createTask({
+        targetAgentId: task.workflow?.reviewerAgentId,
+        input: reviewKind === "upstream_review" ? "审核执行 Agent 提交的上游错误报告。" : "审核执行 Agent 提交的完整成果。",
+        rootTaskId: task.rootTaskId,
+        parentTaskId: task.taskId,
+        sourceAgentId: task.targetAgentId,
+        role: "reviewer",
+        stage: reviewKind,
+        workflow: task.workflow,
+        reviewCycle: task.reviewCycle,
+        taskSpec: {
+          title: reviewKind === "upstream_review" ? "上游错误裁定" : `审核：${task.taskSpec?.title ?? "执行成果"}`,
+          type: reviewKind,
+          priority: task.taskSpec?.priority ?? "P1",
+          inputs: [],
+          expected_outputs: [],
+          permissions_required: { project_workspace: true },
+          checkpoint_policy: { mode: "stage" },
+          acceptance: task.taskSpec?.acceptance ?? [],
+        },
+        contextBundle: reviewKind === "upstream_review" ? {
+          objective: task.contextBundle?.objective ?? task.input,
+          acceptance: task.taskSpec?.acceptance ?? [],
+          upstreamIssue: submission.upstreamIssue,
+          executorBrief: submission.brief,
+        } : {
+          objective: task.contextBundle?.objective ?? task.input,
+          acceptance: task.taskSpec?.acceptance ?? [],
+          executorBrief: submission.brief,
+          fullResult: submission.fullResult ?? task.output,
+          artifactReferences: (task.artifacts?.files ?? []).map((file) => ({ path: file.path, sha256: file.sha256, status: file.status })),
+          resultVersion: `v${task.reviewCycle + 1}`,
+        },
+      });
+      task.reviewStatus = "pending";
+      task.reviewTaskId = reviewer.taskId;
+      await this.queueOrDispatch(reviewer);
+      return;
+    }
+
+    if (task.role !== "reviewer") return;
+    const reviewed = this.tasks.get(task.parentTaskId);
+    if (!reviewed) return;
+    const verdict = submission.verdict;
+    reviewed.reviewStatus = verdict;
+    reviewed.reviewedAt = new Date().toISOString();
+    reviewed.reviewBrief = submission.brief;
+
+    if (verdict === "approved") {
+      await this.createPlannerIntake(task, reviewed, "result_intake", {
+        approved: true,
+        executorBrief: reviewed.submission?.brief,
+        reviewBrief: submission.brief,
+        artifactReferences: (reviewed.artifacts?.files ?? []).map((file) => ({ path: file.path, sha256: file.sha256, status: file.status })),
+      });
+      return;
+    }
+    if (verdict === "upstream_confirmed") {
+      await this.createPlannerIntake(task, reviewed, "replan", {
+        upstreamIssueConfirmed: true,
+        correctionBrief: submission.correctionBrief ?? submission.brief,
+        executorBrief: reviewed.submission?.brief,
+      });
+      return;
+    }
+    if (verdict === "upstream_denied") {
+      const nextCycle = reviewed.reviewCycle + 1;
+      const maxCycles = Number(task.workflow?.maxReviewCycles ?? 2);
+      if (nextCycle > maxCycles) {
+        this.requireHuman(task, `同一上游错误报告连续 ${nextCycle} 次未获审核认可：${submission.brief}`);
+        return;
+      }
+      await this.createRevisionTask(task, reviewed, { upstreamDenied: true, reviewBrief: submission.brief }, nextCycle);
+      return;
+    }
+
+    const nextCycle = reviewed.reviewCycle + 1;
+    const maxCycles = Number(task.workflow?.maxReviewCycles ?? 2);
+    if (nextCycle > maxCycles) {
+      this.requireHuman(task, `成果连续 ${nextCycle} 次未通过审核：${submission.brief}`);
+      return;
+    }
+    await this.createRevisionTask(task, reviewed, {
+      reviewBrief: submission.brief,
+      issues: submission.issues ?? [],
+      correctionBrief: submission.correctionBrief,
+    }, nextCycle);
+  }
+
+  async createPlannerIntake(reviewTask, reviewed, stage, details) {
+    const root = this.tasks.get(reviewTask.rootTaskId);
+    const planner = this.createTask({
+      targetAgentId: reviewTask.workflow?.plannerAgentId,
+      input: stage === "replan" ? "根据已确认的上游错误重新安排后续任务。" : "接收已审核通过的任务简报，并决定是否继续安排任务。",
+      rootTaskId: reviewTask.rootTaskId,
+      parentTaskId: reviewTask.taskId,
+      sourceAgentId: reviewTask.targetAgentId,
+      role: "planner",
+      stage,
+      workflow: reviewTask.workflow,
+      sessionScopeId: root?.sessionScopeId ?? reviewTask.rootTaskId,
+      taskSpec: {
+        title: stage === "replan" ? "重新规划" : "接收审核结果",
+        type: stage,
+        priority: reviewed.taskSpec?.priority ?? "P1",
+        permissions_required: { project_workspace: true },
+        acceptance: [],
+      },
+      contextBundle: details,
+    });
+    await this.queueOrDispatch(planner);
+  }
+
+  async createRevisionTask(reviewTask, reviewed, details, reviewCycle = reviewed.reviewCycle) {
+    const revision = this.createTask({
+      targetAgentId: reviewed.targetAgentId,
+      input: details.upstreamDenied ? "审核未认可上游错误报告，请继续原任务。" : "根据审核意见修改原成果。",
+      rootTaskId: reviewTask.rootTaskId,
+      parentTaskId: reviewTask.taskId,
+      sourceAgentId: reviewTask.targetAgentId,
+      role: "executor",
+      stage: "revision",
+      workflow: reviewTask.workflow,
+      sessionScopeId: reviewed.sessionScopeId,
+      reviewCycle,
+      taskSpec: reviewed.taskSpec,
+      contextBundle: {
+        objective: reviewed.contextBundle?.objective ?? reviewed.input,
+        previousBrief: reviewed.submission?.brief,
+        ...details,
+      },
+    });
+    await this.queueOrDispatch(revision);
+  }
+
+  requireHuman(task, question) {
+    const root = this.tasks.get(task.rootTaskId) ?? task;
+    root.humanIntervention = {
+      status: "required",
+      question: String(question),
+      requestedBy: task.targetAgentId,
+      requestedAt: new Date().toISOString(),
+    };
+    this.addMessage(task, {
+      senderId: task.targetAgentId,
+      senderRole: task.role,
+      kind: "human_intervention",
+      text: String(question),
+      mentions: ["human"],
+    });
+  }
+
+  conversations() {
+    const roots = [...this.tasks.values()].filter((task) => task.rootTaskId === task.taskId);
+    return roots.map((root) => {
+      const tasks = [...this.tasks.values()].filter((task) => task.rootTaskId === root.taskId);
+      const messages = this.messages.filter((message) => message.rootTaskId === root.taskId);
+      const active = tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
+      const failed = tasks.some((task) => ["failed", "rejected"].includes(task.status));
+      const status = root.humanIntervention?.status === "required" ? "needs_human" : active ? "active" : failed ? "failed" : "completed";
+      const participants = [...new Set(tasks.flatMap((task) => [task.sourceAgentId, task.targetAgentId]).filter(Boolean))];
+      return {
+        rootTaskId: root.taskId,
+        title: root.taskSpec?.title ?? (root.input.slice(0, 60) || "未命名任务"),
+        status,
+        createdAt: root.createdAt,
+        updatedAt: messages.at(-1)?.createdAt ?? root.completedAt ?? root.createdAt,
+        participants,
+        taskCount: tasks.length,
+        messageCount: messages.length,
+        humanIntervention: root.humanIntervention ?? null,
+      };
+    }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  }
+
   async queueOrDispatch(task) {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
-    const agent = this.agents.get(task.targetAgentId);
+    let selection;
+    try {
+      selection = chooseAgent(this.agents, {
+        targetAgentId: task.targetAgentId,
+        role: task.role,
+        requiredCapabilities: task.requiredCapabilities,
+        modelPreference: task.modelPreference,
+      });
+    } catch (error) {
+      task.status = "queued";
+      task.schedulingError = error.message;
+      await this.log.record("task.queued_no_candidate", { taskId: task.taskId, agentId: task.targetAgentId, error: error.message });
+      return;
+    }
+    const agent = selection.agent;
+    task.targetAgentId = agent.agentId;
+    task.execution = {
+      model: selection.model?.id ?? null,
+      reasoningEffort: task.reasoningEffort,
+      selectedAt: new Date().toISOString(),
+      reason: task.modelPreference ? "requested-model" : "capability-quota-load-score",
+    };
+    task.schedulingError = null;
     if (agent?.paused) {
       task.status = "queued";
       await this.log.record("task.queued_paused", { taskId: task.taskId, agentId: task.targetAgentId });
@@ -260,6 +658,10 @@ export class AgentHub {
     }
     task.status = "dispatched";
     task.dispatchedAt = new Date().toISOString();
+    if (!task.activeSlotAgentId) {
+      task.activeSlotAgentId = agent.agentId;
+      agent.activeTaskCount = Number(agent.activeTaskCount ?? 0) + 1;
+    }
     this.deliver(task.targetAgentId, makeEnvelope("task.assign", {
       agentId: task.targetAgentId,
       taskId: task.taskId,
@@ -270,9 +672,27 @@ export class AgentHub {
         sourceAgentId: task.sourceAgentId,
         metadata: task.metadata,
         taskSpec: task.taskSpec,
+        role: task.role,
+        stage: task.stage,
+        contextBundle: task.contextBundle,
+        sessionScopeId: task.sessionScopeId,
+        execution: task.execution,
       },
     }));
     await this.log.record("task.dispatched", { taskId: task.taskId, agentId: task.targetAgentId });
+  }
+
+  finishTaskActivity(task) {
+    if (!task.activeSlotAgentId) return;
+    const agent = this.agents.get(task.activeSlotAgentId);
+    if (agent) agent.activeTaskCount = Math.max(0, Number(agent.activeTaskCount ?? 0) - 1);
+    task.activeSlotAgentId = null;
+  }
+
+  async retryQueuedTasks() {
+    for (const candidate of this.tasks.values()) {
+      if (candidate.status === "queued") await this.queueOrDispatch(candidate);
+    }
   }
 
   deliver(agentId, envelope) {
@@ -325,9 +745,65 @@ export class AgentHub {
         const tasks = [...this.tasks.values()].filter((task) => !rootTaskId || task.rootTaskId === rootTaskId);
         return json(response, 200, { tasks, active: tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status)) });
       }
+      if (request.method === "GET" && url.pathname === "/v1/conversations") {
+        return json(response, 200, { conversations: this.conversations() });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/messages") {
+        const rootTaskId = url.searchParams.get("rootTaskId");
+        const messages = this.messages.filter((message) => !rootTaskId || message.rootTaskId === rootTaskId);
+        return json(response, 200, { messages });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/usage") {
+        const byAgent = [...this.agents.values()].map((agent) => ({
+          agentId: agent.agentId,
+          deviceId: agent.deviceId,
+          account: agent.account,
+          usageTotals: agent.usageTotals ?? null,
+          quotaSnapshot: agent.quotaSnapshot ?? null,
+        }));
+        const accounts = new Map();
+        for (const item of byAgent) {
+          const key = `${item.account?.provider ?? "unknown"}:${item.account?.id ?? item.agentId}`;
+          const current = accounts.get(key) ?? {
+            accountKey: key,
+            account: item.account,
+            agentIds: [],
+            deviceIds: [],
+            usageTotals: null,
+            quotaSnapshot: null,
+          };
+          current.agentIds.push(item.agentId);
+          if (!current.deviceIds.includes(item.deviceId)) current.deviceIds.push(item.deviceId);
+          if (item.usageTotals) current.usageTotals = addUsage(current.usageTotals, item.usageTotals);
+          if (item.quotaSnapshot && (!current.quotaSnapshot || Date.parse(item.quotaSnapshot.checkedAt) > Date.parse(current.quotaSnapshot.checkedAt))) {
+            current.quotaSnapshot = item.quotaSnapshot;
+          }
+          accounts.set(key, current);
+        }
+        return json(response, 200, { totals: this.usageTotals, byAgent, byAccount: [...accounts.values()] });
+      }
+      if (request.method === "POST" && url.pathname === "/v1/workflows") {
+        const body = await readBody(request);
+        const task = await this.createWorkflow(body);
+        return json(response, 202, { task });
+      }
+      if (request.method === "POST" && url.pathname === "/v1/messages") {
+        const body = await readBody(request);
+        if (typeof body.text !== "string" || !body.text.trim()) return json(response, 400, { error: "message text is required" });
+        const task = this.tasks.get(body.taskId ?? body.rootTaskId);
+        if (!task || task.rootTaskId !== String(body.rootTaskId ?? task.rootTaskId)) return json(response, 404, { error: "Unknown task conversation" });
+        const message = this.addMessage(task, {
+          senderId: body.senderId ?? "human",
+          senderRole: "human",
+          kind: "message",
+          text: body.text.trim(),
+          mentions: body.mentions,
+        });
+        return json(response, 201, { message });
+      }
       if (request.method === "POST" && url.pathname === "/v1/tasks") {
         const body = await readBody(request);
-        if (!body.targetAgentId || typeof body.input !== "string") return json(response, 400, { error: "targetAgentId and string input are required" });
+        if (typeof body.input !== "string" || (!body.targetAgentId && !body.role)) return json(response, 400, { error: "string input and targetAgentId or role are required" });
         const task = this.createTask(body);
         await this.queueOrDispatch(task);
         return json(response, 202, { task });
@@ -346,6 +822,37 @@ export class AgentHub {
   }
 
   async handleCommand(command) {
+    if (command.type === "workflow.human_response") {
+      const root = this.tasks.get(command.rootTaskId);
+      if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
+      if (root.humanIntervention?.status !== "required") throw httpError(409, `Workflow ${command.rootTaskId} is not awaiting human input`);
+      const response = String(command.response ?? "").trim();
+      if (!response) throw httpError(400, "Human response is required");
+      root.humanIntervention = {
+        ...root.humanIntervention,
+        status: "resolved",
+        response,
+        resolvedAt: new Date().toISOString(),
+        resolvedBy: command.by ?? "human",
+      };
+      this.addMessage(root, { senderId: command.by ?? "human", senderRole: "human", kind: "human_decision", text: response });
+      const planner = this.createTask({
+        targetAgentId: root.workflow?.plannerAgentId,
+        input: "根据人工决定继续规划。",
+        rootTaskId: root.taskId,
+        parentTaskId: root.taskId,
+        sourceAgentId: command.by ?? "human",
+        role: "planner",
+        stage: "human_followup",
+        workflow: root.workflow,
+        sessionScopeId: root.sessionScopeId,
+        taskSpec: root.taskSpec,
+        contextBundle: { objective: root.input, humanResponse: response },
+      });
+      await this.queueOrDispatch(planner);
+      await this.log.record("workflow.human_response", { rootTaskId: root.taskId, by: command.by ?? "human" });
+      return { ok: true, task: planner };
+    }
     if (command.type === "task.approve") {
       const task = this.tasks.get(command.taskId);
       if (!task) throw httpError(404, `Unknown task ${command.taskId}`);
@@ -377,8 +884,10 @@ export class AgentHub {
       }
       task.status = "cancelled";
       task.completedAt = new Date().toISOString();
+      this.finishTaskActivity(task);
       this.deliver(task.targetAgentId, makeEnvelope("task.cancel", { agentId: task.targetAgentId, taskId: task.taskId }));
       await this.log.record("task.cancelled", { taskId: task.taskId, agentId: task.targetAgentId });
+      await this.retryQueuedTasks();
       return { ok: true, task };
     }
     throw httpError(400, `Unsupported command type: ${command.type}`);
@@ -408,4 +917,3 @@ function json(response, status, value) {
   });
   response.end(body);
 }
-\n

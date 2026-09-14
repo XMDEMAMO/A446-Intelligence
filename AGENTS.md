@@ -7,5 +7,3 @@ Before modifying this repository, read the following files completely:
 3. apps/agent-hub/docs/protocol-v1.md when protocol or Worker behavior is in scope
 
 The current human request has highest priority. Preserve local security invariants and existing user changes. Run scripts/check-all.ps1 after meaningful implementation changes.
-
-\n

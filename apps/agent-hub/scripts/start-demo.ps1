@@ -76,4 +76,3 @@ Write-Output "Demo healthy. Hub PID=$($Hub.Id), Agent A PID=$($AgentA.Id), Agent
 Write-Output "Loopback demo is unauthenticated unless HUB_TOKEN was already set in this shell."
 Write-Output "Try: node src/hubctl.mjs send --agent agent-a --input 'hello' --route agent-b --wait"
 Write-Output "Stop: ./scripts/stop-demo.ps1"
-\n

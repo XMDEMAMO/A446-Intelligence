@@ -147,5 +147,3 @@ function cleanedEnvironment(stripProxyEnv) {
   }
   return env;
 }
-
-\n

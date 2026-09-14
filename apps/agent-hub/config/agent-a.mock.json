@@ -1,5 +1,9 @@
 {
   "agentId": "agent-a",
+  "deviceId": "mock-device-01",
+  "account": { "id": "mock-account-01", "provider": "mock", "plan": "test", "label": "Mock Account 01" },
+  "roles": ["planner", "executor"],
+  "models": [{ "id": "mock-balanced", "capabilities": ["planning", "task.execute"], "quota": { "state": "Healthy", "source": "mock", "windows": [] } }],
   "hubUrl": "ws://127.0.0.1:8787/worker",
   "authTokenEnv": "HUB_TOKEN",
   "authRequired": false,
@@ -12,8 +16,11 @@
   },
   "adapter": {
     "type": "mock",
-    "delayMs": 50
+    "delayMs": 50,
+    "roleOutputs": {
+      "planner:planning": "{\"brief\":\"已生成独立任务\",\"assignments\":[{\"title\":\"完成交付\",\"instructions\":\"完成用户要求并提交完整成果\",\"acceptance\":[\"成果可核验\"]}]}",
+      "planner": "{\"brief\":\"已接收审核简报\",\"assignments\":[]}",
+      "executor": "{\"brief\":\"交付已完成\",\"fullResult\":\"Mock 完整成果\",\"upstreamIssue\":null}"
+    }
   }
 }
-
-\n

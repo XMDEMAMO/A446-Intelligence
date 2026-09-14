@@ -94,5 +94,3 @@ function safeTaskId(value) {
 function portablePath(value) {
   return value.split(path.sep).join("/");
 }
-
-\n

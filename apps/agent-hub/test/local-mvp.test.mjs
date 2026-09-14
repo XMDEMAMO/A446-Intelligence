@@ -157,5 +157,3 @@ async function waitUntil(predicate, timeoutMs = 5000) {
   }
   throw new Error("Timed out waiting for condition");
 }
-
-\n

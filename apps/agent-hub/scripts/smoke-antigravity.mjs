@@ -39,5 +39,3 @@ try {
 } finally {
   await adapter.stop();
 }
-
-\n

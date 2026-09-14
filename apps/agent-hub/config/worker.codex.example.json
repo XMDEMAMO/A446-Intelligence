@@ -1,5 +1,12 @@
 {
-  "agentId": "laptop-01-codex",
+  "agentId": "laptop-01-codex-executor-01",
+  "deviceId": "laptop-01",
+  "account": { "id": "gpt-plus-01", "provider": "openai", "plan": "Plus", "label": "GPT Plus 01" },
+  "roles": ["executor"],
+  "models": [
+    { "id": "gpt-5.6-terra", "capabilities": ["coding", "document_editing"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } },
+    { "id": "gpt-5.6-sol", "capabilities": ["coding", "reasoning"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } }
+  ],
   "hubUrl": "wss://hub.example.com:9443/worker",
   "authTokenEnv": "HUB_TOKEN",
   "authRequired": true,
@@ -41,5 +48,3 @@
     "maxOutputChars": 200000
   }
 }
-
-\n

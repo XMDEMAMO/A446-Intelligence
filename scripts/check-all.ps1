@@ -31,4 +31,3 @@ Write-Output 'Running combined end-to-end smoke test...'
 & (Join-Path $ProjectRoot 'scripts\smoke-e2e.ps1')
 
 Write-Output 'All project checks passed.'
-\n

@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { mkdir } from "node:fs/promises";
+import { normalizeUsage } from "../collaboration.mjs";
 
 export class CodexAdapter {
   constructor(config, context) {
@@ -20,7 +21,15 @@ export class CodexAdapter {
   async run(input, context) {
     const command = this.config.command ?? "codex";
     const globalArgs = Array.isArray(this.config.globalArgs) ? this.config.globalArgs : [];
-    const execArgs = Array.isArray(this.config.execArgs) ? this.config.execArgs : [];
+    const execArgs = Array.isArray(this.config.execArgs) ? [...this.config.execArgs] : [];
+    const selectedModel = context.model ?? this.config.model;
+    if (selectedModel && !execArgs.includes("--model") && !execArgs.includes("-m")) {
+      execArgs.push("--model", selectedModel);
+    }
+    const reasoningEffort = context.reasoningEffort ?? this.config.reasoningEffort;
+    if (reasoningEffort) execArgs.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
+    if (this.config.sandbox && !execArgs.includes("--sandbox")) execArgs.push("--sandbox", this.config.sandbox);
+    if (this.config.approvalPolicy) execArgs.push("-c", `approval_policy="${this.config.approvalPolicy}"`);
     const args = context.sessionId
       ? [...globalArgs, "exec", "resume", "--json", "--skip-git-repo-check", ...execArgs, context.sessionId, "-"]
       : [...globalArgs, "exec", "--json", "--skip-git-repo-check", ...execArgs, "-"];
@@ -38,7 +47,6 @@ export class CodexAdapter {
     this.child?.kill();
   }
 }
-
 async function runJsonl(command, args, input, options) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
@@ -53,6 +61,7 @@ async function runJsonl(command, args, input, options) {
     let stderr = "";
     let sessionId;
     let output = "";
+    let usage = null;
     const events = [];
 
     const abort = () => child.kill();
@@ -71,6 +80,7 @@ async function runJsonl(command, args, input, options) {
           events.push(event);
           sessionId = findSessionId(event) ?? sessionId;
           output = findAgentText(event) ?? output;
+          usage = normalizeUsage(event) ?? usage;
         } catch {
           output = `${output}${output ? "\n" : ""}${line}`;
         }
@@ -88,6 +98,7 @@ async function runJsonl(command, args, input, options) {
           const event = JSON.parse(stdoutBuffer);
           sessionId = findSessionId(event) ?? sessionId;
           output = findAgentText(event) ?? output;
+          usage = normalizeUsage(event) ?? usage;
         } catch {
           output = `${output}${output ? "\n" : ""}${stdoutBuffer.trim()}`;
         }
@@ -99,13 +110,12 @@ async function runJsonl(command, args, input, options) {
       } else if (!output) {
         reject(new Error(`Codex completed without an agent message. Events: ${events.length}`));
       } else {
-        resolve({ output, sessionId });
+        resolve({ output, sessionId, usage });
       }
     });
     child.stdin.end(input);
   });
 }
-
 function findSessionId(event) {
   if (!event || typeof event !== "object") return undefined;
   if (event.type === "thread.started" && typeof event.thread_id === "string") return event.thread_id;
@@ -114,7 +124,6 @@ function findSessionId(event) {
   }
   return undefined;
 }
-
 function findAgentText(event) {
   const item = event?.item;
   if (event?.type === "item.completed" && item?.type === "agent_message") {
@@ -124,5 +133,3 @@ function findAgentText(event) {
   if (event?.type === "message.completed" && typeof event?.message?.content === "string") return event.message.content;
   return undefined;
 }
-
-\n

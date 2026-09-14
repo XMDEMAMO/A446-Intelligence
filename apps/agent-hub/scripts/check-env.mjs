@@ -72,5 +72,3 @@ function checkCommand(command, commandArgs) {
     detail: outcome.error?.message ?? (outcome.stdout || outcome.stderr).trim().split(/\r?\n/)[0] ?? "",
   });
 }
-
-\n

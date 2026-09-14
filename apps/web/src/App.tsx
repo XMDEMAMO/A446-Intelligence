@@ -1,56 +1,76 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useState } from 'react'
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { createDemoSnapshot } from './demo-data'
-import { createHubTask, getHubSnapshot, sendHubCommand } from './hub-api'
-import type { Agent, CreateTaskRequest, HubEvent, HubSnapshot, HubTask } from './types'
+import { createWorkflow, getHubSnapshot, sendConversationMessage, sendHubCommand } from './hub-api'
+import type {
+  Agent,
+  AgentRole,
+  Conversation,
+  CreateWorkflowRequest,
+  HubMessage,
+  HubSnapshot,
+  HubTask,
+  QuotaSnapshot,
+  TokenUsage,
+} from './types'
 
-type ViewKey = 'overview' | 'tasks' | 'agents' | 'approvals' | 'audit'
-type TaskFilter = 'all' | 'active' | 'approval' | 'completed' | 'failed'
-
-interface TaskDraft {
+interface WorkflowDraft {
   title: string
-  input: string
-  targetAgentId: string
-  expectedOutput: string
-  terminal: boolean
-  browser: boolean
-  requiresApproval: boolean
+  objective: string
+  acceptance: string
+  plannerAgentId: string
+  reviewerAgentId: string
+  modelPreference: string
+  reasoningEffort: string
+  maxReviewCycles: number
 }
 
-const navItems: Array<{ key: ViewKey; label: string; marker: string }> = [
-  { key: 'overview', label: '运行总览', marker: 'OV' },
-  { key: 'tasks', label: '任务中心', marker: 'TK' },
-  { key: 'agents', label: '执行节点', marker: 'AG' },
-  { key: 'approvals', label: '人工审批', marker: 'AP' },
-  { key: 'audit', label: '审计事件', marker: 'EV' },
-]
+const roleName: Record<string, string> = {
+  planner: '规划 Agent',
+  executor: '执行 Agent',
+  reviewer: '审核 Agent',
+  human: '人工',
+  system: '系统',
+}
 
-const activeStatuses = new Set(['created', 'queued', 'dispatched', 'running', 'awaiting_approval'])
-const failedStatuses = new Set(['failed', 'rejected', 'cancelled'])
+const statusName: Record<string, string> = {
+  active: '进行中',
+  completed: '已完成',
+  failed: '异常',
+  needs_human: '需人工',
+  queued: '排队中',
+  dispatched: '已指派',
+  running: '执行中',
+  awaiting_approval: '待批准',
+  rejected: '已拒绝',
+  cancelled: '已取消',
+}
 
-function createDraft(agentId = ''): TaskDraft {
+function emptyDraft(): WorkflowDraft {
   return {
     title: '',
-    input: '',
-    targetAgentId: agentId,
-    expectedOutput: 'outputs/result.md',
-    terminal: false,
-    browser: false,
-    requiresApproval: false,
+    objective: '',
+    acceptance: '',
+    plannerAgentId: '',
+    reviewerAgentId: '',
+    modelPreference: '',
+    reasoningEffort: '',
+    maxReviewCycles: 2,
   }
 }
 
 function App() {
   const [snapshot, setSnapshot] = useState<HubSnapshot>(() => createDemoSnapshot())
   const [connectionMode, setConnectionMode] = useState<'connecting' | 'live' | 'demo'>('connecting')
-  const [lastError, setLastError] = useState('')
-  const [view, setView] = useState<ViewKey>('overview')
-  const [filter, setFilter] = useState<TaskFilter>('all')
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
-  const [taskModalOpen, setTaskModalOpen] = useState(false)
-  const [draft, setDraft] = useState<TaskDraft>(() => createDraft())
-  const [isSubmitting, setIsSubmitting] = useState(false)
+  const [selectedRootId, setSelectedRootId] = useState<string | null>(null)
+  const [modalOpen, setModalOpen] = useState(false)
+  const [draft, setDraft] = useState<WorkflowDraft>(() => emptyDraft())
+  const [messageText, setMessageText] = useState('')
+  const [humanResponse, setHumanResponse] = useState('')
+  const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
+  const [lastError, setLastError] = useState('')
+  const chatEndRef = useRef<HTMLDivElement | null>(null)
 
   const refresh = useCallback(async () => {
     try {
@@ -59,8 +79,7 @@ function App() {
       setConnectionMode('live')
       setLastError('')
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Hub 暂时不可用'
-      setLastError(message)
+      setLastError(error instanceof Error ? error.message : 'Hub 暂时不可用')
       setConnectionMode((current) => (current === 'live' ? 'live' : 'demo'))
     }
   }, [])
@@ -76,233 +95,290 @@ function App() {
 
   useEffect(() => {
     if (!notice) return
-    const timer = window.setTimeout(() => setNotice(''), 2600)
+    const timer = window.setTimeout(() => setNotice(''), 2800)
     return () => window.clearTimeout(timer)
   }, [notice])
 
-  const tasks = useMemo(
-    () => [...snapshot.tasks].sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt)),
-    [snapshot.tasks],
+  const conversations = useMemo(
+    () => [...snapshot.conversations].sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)),
+    [snapshot.conversations],
   )
-  const onlineAgents = snapshot.agents.filter((agent) => agent.status === 'online')
-  const approvalTasks = tasks.filter((task) => task.status === 'awaiting_approval')
-  const selectedTask = tasks.find((task) => task.taskId === selectedTaskId) ?? null
+  const selectedConversation = conversations.find((item) => item.rootTaskId === selectedRootId) ?? conversations[0] ?? null
+  const selectedMessages = useMemo(
+    () => snapshot.messages.filter((item) => item.rootTaskId === selectedConversation?.rootTaskId).sort((a, b) => a.seq - b.seq),
+    [snapshot.messages, selectedConversation?.rootTaskId],
+  )
+  const selectedTasks = useMemo(
+    () => snapshot.tasks.filter((task) => task.rootTaskId === selectedConversation?.rootTaskId).sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt)),
+    [snapshot.tasks, selectedConversation?.rootTaskId],
+  )
+  const participants = useMemo(
+    () => (selectedConversation?.participants ?? []).map((id) => snapshot.agents.find((agent) => agent.agentId === id)).filter((agent): agent is Agent => Boolean(agent)),
+    [selectedConversation?.participants, snapshot.agents],
+  )
+  const accounts = useMemo(() => groupAccountUsage(snapshot.agents), [snapshot.agents])
+  const compatiblePlanners = snapshot.agents.filter((agent) => acceptsRole(agent, 'planner'))
+  const compatibleReviewers = snapshot.agents.filter((agent) => acceptsRole(agent, 'reviewer'))
+  const models = [...new Set(compatiblePlanners.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
 
-  function openTaskModal() {
-    const preferredAgent = onlineAgents.find((agent) => !agent.paused)?.agentId ?? onlineAgents[0]?.agentId ?? ''
-    setDraft(createDraft(preferredAgent))
-    setTaskModalOpen(true)
-  }
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
+  }, [selectedMessages.length, selectedConversation?.rootTaskId])
 
-  async function submitTask(event: FormEvent<HTMLFormElement>) {
+  async function submitWorkflow(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!draft.targetAgentId || !draft.input.trim()) return
-
-    const request: CreateTaskRequest = {
-      targetAgentId: draft.targetAgentId,
-      input: draft.input.trim(),
-      requiresApproval: draft.requiresApproval,
-      taskSpec: {
-        title: draft.title.trim() || draft.input.trim().slice(0, 32),
-        type: 'general',
-        priority: 'P1',
-        expected_outputs: draft.expectedOutput.trim() ? [draft.expectedOutput.trim()] : [],
-        permissions_required: {
-          project_workspace: true,
-          terminal: draft.terminal,
-          browser: draft.browser,
-        },
-        checkpoint_policy: { mode: 'stage' },
-        acceptance: ['按任务说明完成，并返回可核验的结果或产物清单'],
-      },
+    if (!draft.objective.trim()) return
+    const request: CreateWorkflowRequest = {
+      title: draft.title.trim() || draft.objective.trim().slice(0, 40),
+      objective: draft.objective.trim(),
+      acceptance: draft.acceptance.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+      plannerAgentId: draft.plannerAgentId || null,
+      reviewerAgentId: draft.reviewerAgentId || null,
+      modelPreference: draft.modelPreference || null,
+      reasoningEffort: draft.reasoningEffort || null,
+      maxReviewCycles: draft.maxReviewCycles,
     }
-
-    setIsSubmitting(true)
+    setSubmitting(true)
     try {
       if (connectionMode === 'live') {
-        const result = await createHubTask(request)
-        setSelectedTaskId(result.task.taskId)
+        const result = await createWorkflow(request)
+        setSelectedRootId(result.task.rootTaskId ?? result.task.taskId)
         await refresh()
       } else {
-        const taskId = 'demo-' + crypto.randomUUID()
+        const rootTaskId = `demo-${crypto.randomUUID()}`
         const now = new Date().toISOString()
         const task: HubTask = {
-          taskId,
-          rootTaskId: taskId,
+          taskId: rootTaskId,
+          rootTaskId,
+          targetAgentId: request.plannerAgentId || null,
           sourceAgentId: 'human',
-          targetAgentId: request.targetAgentId,
-          input: request.input,
-          requiresApproval: request.requiresApproval,
-          taskSpec: request.taskSpec,
-          status: request.requiresApproval ? 'awaiting_approval' : 'queued',
+          input: request.objective,
+          role: 'planner',
+          stage: 'planning',
+          status: 'queued',
+          taskSpec: { title: request.title, acceptance: request.acceptance },
+          createdAt: now,
+        }
+        const conversation: Conversation = {
+          rootTaskId,
+          title: request.title,
+          status: 'active',
+          createdAt: now,
+          updatedAt: now,
+          participants: ['human'],
+          taskCount: 1,
+          messageCount: 1,
+        }
+        const message: HubMessage = {
+          messageId: crypto.randomUUID(),
+          seq: Math.max(0, ...snapshot.messages.map((item) => item.seq)) + 1,
+          rootTaskId,
+          taskId: rootTaskId,
+          senderId: 'human',
+          senderRole: 'human',
+          kind: 'task_instruction',
+          text: request.objective,
+          mentions: ['@planner'],
+          attachments: [],
           createdAt: now,
         }
         setSnapshot((current) => ({
           ...current,
           tasks: [task, ...current.tasks],
-          events: [
-            {
-              seq: Math.max(0, ...current.events.map((item) => item.seq)) + 1,
-              ts: now,
-              type: request.requiresApproval ? 'approval.requested' : 'task.created',
-              details: { taskId, agentId: request.targetAgentId, demo: true },
-            },
-            ...current.events,
-          ],
+          conversations: [conversation, ...current.conversations],
+          messages: [...current.messages, message],
         }))
-        setSelectedTaskId(taskId)
+        setSelectedRootId(rootTaskId)
       }
-      setTaskModalOpen(false)
-      setNotice(connectionMode === 'live' ? '任务已提交到 Hub' : '演示任务已创建')
+      setDraft(emptyDraft())
+      setModalOpen(false)
+      setNotice(connectionMode === 'live' ? '协作任务已创建' : '演示群聊已创建')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : '任务提交失败')
+      setNotice(error instanceof Error ? error.message : '任务创建失败')
     } finally {
-      setIsSubmitting(false)
+      setSubmitting(false)
     }
   }
 
-  async function runCommand(command: Record<string, unknown>) {
+  async function submitMessage(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    const text = messageText.trim()
+    if (!selectedConversation || !text) return
+    setMessageText('')
     try {
       if (connectionMode === 'live') {
-        await sendHubCommand(command)
+        await sendConversationMessage(selectedConversation.rootTaskId, text, extractMentions(text))
         await refresh()
       } else {
-        applyDemoCommand(command, setSnapshot)
+        const now = new Date().toISOString()
+        setSnapshot((current) => ({
+          ...current,
+          messages: [...current.messages, {
+            messageId: crypto.randomUUID(),
+            seq: Math.max(0, ...current.messages.map((item) => item.seq)) + 1,
+            rootTaskId: selectedConversation.rootTaskId,
+            taskId: selectedConversation.rootTaskId,
+            senderId: 'human',
+            senderRole: 'human',
+            kind: 'message',
+            text,
+            mentions: extractMentions(text),
+            attachments: [],
+            createdAt: now,
+          }],
+          conversations: current.conversations.map((item) => item.rootTaskId === selectedConversation.rootTaskId ? { ...item, updatedAt: now, messageCount: item.messageCount + 1 } : item),
+        }))
       }
-      setNotice('操作已生效')
     } catch (error) {
-      setNotice(error instanceof Error ? error.message : '操作失败')
+      setNotice(error instanceof Error ? error.message : '消息发送失败')
+    }
+  }
+
+  async function resolveHumanIntervention(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!selectedConversation || !humanResponse.trim()) return
+    try {
+      if (connectionMode === 'live') {
+        await sendHubCommand({ type: 'workflow.human_response', rootTaskId: selectedConversation.rootTaskId, response: humanResponse.trim(), by: 'human' })
+        await refresh()
+      }
+      setHumanResponse('')
+      setNotice('人工决定已交给规划 Agent')
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : '提交失败')
     }
   }
 
   return (
     <div className="app-shell">
-      <aside className="sidebar">
-        <div className="brand">
-          <span className="brand-mark" aria-hidden="true">
-            A4
-          </span>
-          <span>
-            <strong>A446</strong>
-            <small>Agent control</small>
-          </span>
+      <aside className="room-sidebar">
+        <div className="brand-row">
+          <div className="brand-mark">A4</div>
+          <div><strong>A446 协作台</strong><span>Agent 群聊</span></div>
         </div>
 
-        <nav className="main-nav" aria-label="主导航">
-          <span className="nav-caption">控制中心</span>
-          {navItems.map((item) => (
+        <button className="new-task" type="button" onClick={() => setModalOpen(true)}>＋ 新建协作任务</button>
+
+        <div className="room-heading">
+          <span>任务群聊</span>
+          <b>{conversations.length}</b>
+        </div>
+        <div className="room-list">
+          {conversations.map((conversation) => (
             <button
-              className={view === item.key ? 'nav-item active' : 'nav-item'}
-              key={item.key}
-              onClick={() => setView(item.key)}
+              className={`room-item ${selectedConversation?.rootTaskId === conversation.rootTaskId ? 'selected' : ''}`}
+              key={conversation.rootTaskId}
               type="button"
+              onClick={() => setSelectedRootId(conversation.rootTaskId)}
             >
-              <span>{item.marker}</span>
-              {item.label}
-              {item.key === 'approvals' && approvalTasks.length > 0 && (
-                <b className="nav-count">{approvalTasks.length}</b>
-              )}
+              <i className={`room-status ${conversation.status}`} />
+              <span>
+                <strong>{conversation.title}</strong>
+                <small>{statusName[conversation.status] ?? conversation.status} · {conversation.messageCount} 条消息</small>
+              </span>
+              <time>{relativeTime(conversation.updatedAt)}</time>
             </button>
           ))}
-        </nav>
+          {conversations.length === 0 && <div className="empty-list">还没有任务群聊</div>}
+        </div>
 
-        <div className="sidebar-bottom">
-          <div className="hub-readout">
-            <div className="eyebrow">本地 Hub</div>
-            <div className="hub-state">
-              <i className={'signal ' + connectionMode} />
-              <strong>
-                {connectionMode === 'live' ? '实时连接' : connectionMode === 'demo' ? '演示模式' : '正在连接'}
-              </strong>
-            </div>
-            <small>
-              {connectionMode === 'live'
-                ? '协议 v' + snapshot.health.protocolVersion + ' · 3 秒同步'
-                : '启动 Hub 后自动切换'}
-            </small>
-          </div>
-          <button className="sync-button" type="button" onClick={() => void refresh()}>
-            ↻ 立即同步
-          </button>
+        <div className="hub-state">
+          <i className={`connection-dot ${connectionMode}`} />
+          <span><strong>{connectionMode === 'live' ? 'Hub 已连接' : connectionMode === 'demo' ? '演示模式' : '连接中'}</strong><small>{snapshot.agents.filter((agent) => agent.status === 'online').length} 个 Agent 在线</small></span>
         </div>
       </aside>
 
-      <main className="main-panel">
-        <header className="topbar">
-          <div>
-            <div className="breadcrumb">A446 / {viewTitle(view)}</div>
-            <h1>{viewTitle(view)}</h1>
-          </div>
-          <div className="topbar-actions">
-            <div className={'connection-chip ' + connectionMode} title={lastError || undefined}>
-              <span />
-              {connectionMode === 'live' ? 'Hub 已连接' : connectionMode === 'demo' ? '离线演示' : '正在连接'}
+      <main className="conversation-panel">
+        {selectedConversation ? (
+          <>
+            <header className="conversation-header">
+              <div>
+                <span className={`status-pill ${selectedConversation.status}`}>{statusName[selectedConversation.status] ?? selectedConversation.status}</span>
+                <h1>{selectedConversation.title}</h1>
+                <p>一个任务对应一个群聊 · {selectedConversation.taskCount} 个内部步骤</p>
+              </div>
+              <div className="avatar-stack" aria-label="参与者">
+                {participants.slice(0, 5).map((agent) => <AgentAvatar agent={agent} key={agent.agentId} />)}
+              </div>
+            </header>
+
+            <div className="workflow-strip">
+              {selectedTasks.map((task, index) => (
+                <div className={`workflow-step ${task.status}`} key={task.taskId} title={task.taskSpec?.title}>
+                  <span>{index + 1}</span>
+                  <div><strong>{roleName[task.role ?? ''] ?? 'Agent'}</strong><small>{statusName[task.status] ?? task.status}</small></div>
+                </div>
+              ))}
             </div>
-            <button className="primary-button" type="button" onClick={openTaskModal}>
-              <span>＋</span> 新建任务
-            </button>
-          </div>
-        </header>
 
-        {lastError && connectionMode === 'live' && (
-          <div className="warning-bar">最近一次同步失败，正在保留最后可用数据：{lastError}</div>
+            <section className="message-stream" aria-label="任务群聊消息">
+              <div className="chat-date">任务创建于 {formatDate(selectedConversation.createdAt)}</div>
+              {selectedMessages.map((message) => <MessageBubble key={message.messageId} message={message} task={snapshot.tasks.find((task) => task.taskId === message.taskId)} agents={snapshot.agents} />)}
+              {selectedMessages.length === 0 && <div className="empty-chat">Agent 的任务简报和成果附件会显示在这里。</div>}
+              <div ref={chatEndRef} />
+            </section>
+
+            {selectedConversation.humanIntervention?.status === 'required' && (
+              <form className="intervention-box" onSubmit={resolveHumanIntervention}>
+                <div><strong>需要你的决定</strong><p>{selectedConversation.humanIntervention.question}</p></div>
+                <input value={humanResponse} onChange={(event) => setHumanResponse(event.target.value)} placeholder="输入决定或补充信息" />
+                <button type="submit">交给规划 Agent</button>
+              </form>
+            )}
+
+            <form className="message-composer" onSubmit={submitMessage}>
+              <input value={messageText} onChange={(event) => setMessageText(event.target.value)} placeholder="发送旁注，可用 @agent-id 提醒相关 Agent" />
+              <button type="submit" disabled={!messageText.trim()}>发送</button>
+              <small>群聊用于观察与沟通；任务状态仍由正式流程控制。</small>
+            </form>
+          </>
+        ) : (
+          <div className="no-conversation"><div>◎</div><h1>创建第一个协作任务</h1><p>规划、执行和审核 Agent 的简报会进入同一个群聊。</p><button onClick={() => setModalOpen(true)} type="button">新建任务</button></div>
         )}
-
-        <section className="workspace">
-          {view === 'overview' && (
-            <Overview
-              agents={snapshot.agents}
-              events={snapshot.events}
-              tasks={tasks}
-              approvals={approvalTasks.length}
-              onSelectTask={setSelectedTaskId}
-              onOpenTasks={() => setView('tasks')}
-            />
-          )}
-          {view === 'tasks' && (
-            <TasksView
-              tasks={tasks}
-              filter={filter}
-              setFilter={setFilter}
-              onSelectTask={setSelectedTaskId}
-              onNewTask={openTaskModal}
-            />
-          )}
-          {view === 'agents' && (
-            <AgentsView
-              agents={snapshot.agents}
-              onCommand={(type, agentId) => void runCommand({ type, targetAgentId: agentId })}
-            />
-          )}
-          {view === 'approvals' && (
-            <ApprovalsView
-              tasks={approvalTasks}
-              onApprove={(taskId) => void runCommand({ type: 'task.approve', taskId, by: 'console-user' })}
-              onSelectTask={setSelectedTaskId}
-            />
-          )}
-          {view === 'audit' && <AuditView events={snapshot.events} />}
-        </section>
       </main>
 
-      {selectedTask && (
-        <TaskDrawer
-          task={selectedTask}
-          onClose={() => setSelectedTaskId(null)}
-          onApprove={(taskId) => void runCommand({ type: 'task.approve', taskId, by: 'console-user' })}
-          onCancel={(taskId) => void runCommand({ type: 'task.cancel', taskId })}
-        />
-      )}
+      <aside className="detail-sidebar">
+        <section className="side-section">
+          <div className="section-title"><h2>参与 Agent</h2><span>{participants.length}</span></div>
+          <div className="participant-list">
+            {participants.map((agent) => <Participant agent={agent} key={agent.agentId} />)}
+            {participants.length === 0 && <p className="muted">尚未指派 Agent</p>}
+          </div>
+        </section>
 
-      {taskModalOpen && (
-        <TaskModal
-          agents={snapshot.agents}
-          draft={draft}
-          setDraft={setDraft}
-          isSubmitting={isSubmitting}
-          onClose={() => setTaskModalOpen(false)}
-          onSubmit={submitTask}
-        />
+        <section className="side-section usage-section">
+          <div className="section-title"><h2>账号与额度</h2><span>本次 Hub {formatTokens(snapshot.usage.totals?.totalTokens ?? 0)} tokens</span></div>
+          {accounts.map((account) => (
+            <div className="account-card" key={account.key}>
+              <div className="account-title"><div><strong>{account.label}</strong><small>{account.provider} · {account.plan}</small></div><QuotaBadge quota={account.quota} /></div>
+              <div className="token-grid"><span>输入 <b>{formatTokens(account.usage.inputTokens)}</b></span><span>输出 <b>{formatTokens(account.usage.outputTokens)}</b></span><span>缓存 <b>{formatTokens(account.usage.cachedTokens)}</b></span><span>总计 <b>{formatTokens(account.usage.totalTokens)}</b></span></div>
+              <div className="account-agents">Agent 本地累计 · {account.agents.length} 个 Agent · {account.devices.size} 台设备</div>
+              <QuotaMeter quota={account.quota} />
+            </div>
+          ))}
+          {accounts.length === 0 && <p className="muted">还没有账号统计</p>}
+        </section>
+
+        {lastError && <div className="connection-warning">当前显示{connectionMode === 'demo' ? '演示数据' : '最后一次同步结果'}：{lastError}</div>}
+      </aside>
+
+      {modalOpen && (
+        <div className="modal-backdrop" role="presentation" onMouseDown={(event) => event.target === event.currentTarget && setModalOpen(false)}>
+          <form className="task-modal" onSubmit={submitWorkflow}>
+            <div className="modal-header"><div><span>新群聊</span><h2>创建协作任务</h2></div><button type="button" onClick={() => setModalOpen(false)}>×</button></div>
+            <label>任务名称<input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="例如：改进发布流程" /></label>
+            <label>目标<textarea required rows={5} value={draft.objective} onChange={(event) => setDraft({ ...draft, objective: event.target.value })} placeholder="说明最终要解决的问题；规划 Agent 会负责拆分和指派。" /></label>
+            <label>验收标准<textarea rows={3} value={draft.acceptance} onChange={(event) => setDraft({ ...draft, acceptance: event.target.value })} placeholder={'每行一项，例如：\n功能通过自动测试\n审核 Agent 确认无回归'} /></label>
+            <div className="form-grid">
+              <label>规划 Agent<select value={draft.plannerAgentId} onChange={(event) => setDraft({ ...draft, plannerAgentId: event.target.value })}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
+              <label>审核 Agent<select value={draft.reviewerAgentId} onChange={(event) => setDraft({ ...draft, reviewerAgentId: event.target.value })}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
+              <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => setDraft({ ...draft, modelPreference: event.target.value })}><option value="">自动选择</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+              <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
+            </div>
+            <p className="modal-note">自动选择会综合角色、能力、在线状态、设备负载和可用额度；模型不写死。</p>
+            <div className="modal-actions"><button type="button" onClick={() => setModalOpen(false)}>取消</button><button className="primary" type="submit" disabled={submitting || !draft.objective.trim()}>{submitting ? '创建中…' : '创建任务群聊'}</button></div>
+          </form>
+        </div>
       )}
 
       {notice && <div className="toast">{notice}</div>}
@@ -310,755 +386,115 @@ function App() {
   )
 }
 
-function Overview({
-  agents,
-  tasks,
-  events,
-  approvals,
-  onSelectTask,
-  onOpenTasks,
-}: {
-  agents: Agent[]
-  tasks: HubTask[]
-  events: HubEvent[]
-  approvals: number
-  onSelectTask: (taskId: string) => void
-  onOpenTasks: () => void
-}) {
-  const online = agents.filter((agent) => agent.status === 'online').length
-  const active = tasks.filter((task) => activeStatuses.has(task.status)).length
-  const terminal = tasks.filter((task) => ['completed', 'failed', 'rejected', 'cancelled'].includes(task.status))
-  const completionRate = terminal.length
-    ? Math.round((terminal.filter((task) => task.status === 'completed').length / terminal.length) * 100)
-    : 0
-
+function MessageBubble({ message, task, agents }: { message: HubMessage; task?: HubTask; agents: Agent[] }) {
+  const agent = agents.find((item) => item.agentId === message.senderId)
+  const isStatus = message.kind === 'status'
+  if (isStatus) return <div className="system-message"><span>{message.text}</span><time>{formatTime(message.createdAt)}</time></div>
   return (
-    <>
-      <div className="metric-strip">
-        <Metric label="在线节点" value={online + ' / ' + agents.length} detail="可被 Hub 调度" tone="blue" />
-        <Metric label="活动任务" value={String(active)} detail="排队、执行或待审批" tone="cyan" />
-        <Metric label="待人工处理" value={String(approvals)} detail={approvals ? '需要你的决策' : '当前没有阻塞'} tone="amber" />
-        <Metric label="终态成功率" value={completionRate + '%'} detail="当前任务样本" tone="green" />
-      </div>
-
-      <div className="section-heading">
-        <div>
-          <span className="eyebrow">执行网络</span>
-          <h2>节点态势</h2>
-        </div>
-        <span className="section-note">心跳、执行器与额度均来自 Worker 上报</span>
-      </div>
-      <div className="agent-ribbon">
-        {agents.map((agent) => (
-          <AgentSummary agent={agent} key={agent.agentId} />
+    <article className={`message ${message.senderRole}`}>
+      {agent ? <AgentAvatar agent={agent} role={isAgentRole(message.senderRole) ? message.senderRole : undefined} /> : <div className={`avatar ${message.senderRole}`}>{message.senderRole === 'human' ? '你' : '系'}</div>}
+      <div className="message-body">
+        <header><strong>{agent?.agentId ?? message.senderId}</strong><span className={`role-tag ${message.senderRole}`}>{roleName[message.senderRole] ?? message.senderRole}</span><time>{formatTime(message.createdAt)}</time></header>
+        <p>{message.text}</p>
+        {message.mentions.length > 0 && <div className="mentions">{message.mentions.map((mention) => <span key={mention}>{mention.startsWith('@') ? mention : `@${mention}`}</span>)}</div>}
+        {message.attachments.map((attachment, index) => (
+          <details className="attachment" key={`${attachment.taskId ?? message.taskId}-${index}`}>
+            <summary><span>▧</span><div><strong>{attachment.label}</strong><small>{attachment.version ?? '成果附件'} · 点击查看</small></div><i>⌄</i></summary>
+            {attachment.content && <pre>{attachment.content}</pre>}
+            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}><span>{file.path}</span><small>{file.status} · {formatBytes(file.size)}</small></div>)}
+          </details>
         ))}
-      </div>
-
-      <div className="dashboard-grid">
-        <section className="panel task-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">近期工作</span>
-              <h2>最近任务</h2>
-            </div>
-            <button className="text-button" type="button" onClick={onOpenTasks}>
-              查看全部
-            </button>
-          </div>
-          <TaskTable tasks={tasks.slice(0, 6)} onSelectTask={onSelectTask} compact />
-        </section>
-
-        <section className="panel event-panel">
-          <div className="panel-heading">
-            <div>
-              <span className="eyebrow">事件流</span>
-              <h2>实时事件</h2>
-            </div>
-            <span className="live-label"><i /> 实时</span>
-          </div>
-          <EventList events={events.slice(0, 8)} />
-        </section>
-      </div>
-    </>
-  )
-}
-
-function Metric({
-  label,
-  value,
-  detail,
-  tone,
-}: {
-  label: string
-  value: string
-  detail: string
-  tone: string
-}) {
-  return (
-    <article className={'metric ' + tone}>
-      <div>
-        <small>{label}</small>
-        <strong>{value}</strong>
-        <p>{detail}</p>
+        {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage) && <div className="message-metrics"><span>{task.model ?? task.execution?.model ?? '默认模型'}</span>{task.usage && <><span>输入 {formatTokens(task.usage.inputTokens)}</span><span>输出 {formatTokens(task.usage.outputTokens)}</span><b>共 {formatTokens(task.usage.totalTokens)} tokens</b></>}</div>}
       </div>
     </article>
   )
 }
 
-function AgentSummary({ agent }: { agent: Agent }) {
-  const executor = agent.executors?.[0]
-  const state = agent.status !== 'online' ? 'offline' : agent.paused ? 'paused' : agent.busy ? 'busy' : 'ready'
-  return (
-    <article className={'agent-summary ' + state}>
-      <div className="agent-topline">
-        <span className={'agent-orb ' + state}>{agent.agentId.slice(0, 2).toUpperCase()}</span>
-        <StatusPill status={state} />
-      </div>
-      <strong className="agent-name">{agent.agentId}</strong>
-      <span className="mono-muted">{agent.adapter ?? 'adapter unknown'}</span>
-      <div className="agent-gauges">
-        <span>健康 <b>{executor?.health ?? 'Unknown'}</b></span>
-        <span>额度 <b>{executor?.quota ?? 'Unknown'}</b></span>
-      </div>
-    </article>
-  )
+function AgentAvatar({ agent, role: roleOverride }: { agent: Agent; role?: AgentRole }) {
+  const role = roleOverride ?? agent.roles?.[0] ?? 'executor'
+  return <div className={`avatar ${role}`} title={agent.agentId}>{role === 'planner' ? '规' : role === 'reviewer' ? '审' : '执'}<i className={agent.status === 'online' ? 'online' : 'offline'} /></div>
 }
 
-function TasksView({
-  tasks,
-  filter,
-  setFilter,
-  onSelectTask,
-  onNewTask,
-}: {
-  tasks: HubTask[]
-  filter: TaskFilter
-  setFilter: (filter: TaskFilter) => void
-  onSelectTask: (taskId: string) => void
-  onNewTask: () => void
-}) {
-  const filters: Array<{ key: TaskFilter; label: string }> = [
-    { key: 'all', label: '全部' },
-    { key: 'active', label: '进行中' },
-    { key: 'approval', label: '待审批' },
-    { key: 'completed', label: '已完成' },
-    { key: 'failed', label: '异常' },
-  ]
-  const visible = tasks.filter((task) => {
-    if (filter === 'active') return activeStatuses.has(task.status)
-    if (filter === 'approval') return task.status === 'awaiting_approval'
-    if (filter === 'completed') return task.status === 'completed'
-    if (filter === 'failed') return failedStatuses.has(task.status)
-    return true
-  })
-
+function Participant({ agent }: { agent: Agent }) {
   return (
-    <section className="panel full-panel">
-      <div className="panel-heading task-heading">
-        <div>
-          <span className="eyebrow">任务登记</span>
-          <h2>任务队列</h2>
-          <p>从下发、审批、执行到产物校验的完整状态。</p>
-        </div>
-        <button className="primary-button small" type="button" onClick={onNewTask}>＋ 创建任务</button>
-      </div>
-      <div className="filter-bar" role="group" aria-label="任务筛选">
-        {filters.map((item) => (
-          <button
-            className={filter === item.key ? 'active' : ''}
-            key={item.key}
-            type="button"
-            onClick={() => setFilter(item.key)}
-          >
-            {item.label}
-            <span>{countForFilter(tasks, item.key)}</span>
-          </button>
-        ))}
-      </div>
-      <TaskTable tasks={visible} onSelectTask={onSelectTask} />
-    </section>
-  )
-}
-
-function TaskTable({
-  tasks,
-  onSelectTask,
-  compact = false,
-}: {
-  tasks: HubTask[]
-  onSelectTask: (taskId: string) => void
-  compact?: boolean
-}) {
-  if (!tasks.length) return <EmptyState title="没有匹配的任务" detail="创建一个任务，或切换筛选条件。" />
-  return (
-    <div className="table-scroll">
-      <table className="task-table">
-        <thead>
-          <tr>
-            <th>任务</th>
-            <th>执行节点</th>
-            {!compact && <th>权限</th>}
-            <th>状态</th>
-            <th>更新时间</th>
-            <th aria-label="打开">操作</th>
-          </tr>
-        </thead>
-        <tbody>
-          {tasks.map((task) => (
-            <tr key={task.taskId} onClick={() => onSelectTask(task.taskId)}>
-              <td>
-                <strong>{task.taskSpec?.title ?? task.input.slice(0, 36)}</strong>
-                <span className="task-id">#{shortId(task.taskId)}</span>
-              </td>
-              <td><span className="agent-inline"><i />{task.targetAgentId}</span></td>
-              {!compact && <td><PermissionTags task={task} /></td>}
-              <td><StatusPill status={task.status} /></td>
-              <td className="muted-cell">{relativeTime(task.completedAt ?? task.startedAt ?? task.createdAt)}</td>
-              <td className="arrow-cell">查看</td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+    <div className="participant">
+      <AgentAvatar agent={agent} />
+      <div><strong>{agent.agentId}</strong><small>{(agent.roles ?? []).map((role) => roleName[role]).join(' / ') || '通用 Agent'} · {agent.deviceId ?? agent.agentId}</small><em>{agent.models?.map((model) => model.label ?? model.id).filter(Boolean).join(' · ') || '默认模型'}</em></div>
+      <span className={agent.busy ? 'busy' : ''}>{agent.status !== 'online' ? '离线' : agent.busy ? '忙碌' : '空闲'}</span>
     </div>
   )
 }
 
-function AgentsView({
-  agents,
-  onCommand,
-}: {
-  agents: Agent[]
-  onCommand: (type: 'agent.pause' | 'agent.resume', agentId: string) => void
-}) {
-  return (
-    <div className="agents-layout">
-      <div className="section-heading flush">
-        <div>
-          <span className="eyebrow">节点目录</span>
-          <h2>已注册执行节点</h2>
-        </div>
-        <span className="section-note">{agents.length} 个节点 · {agents.filter((a) => a.status === 'online').length} 个在线</span>
-      </div>
-      <div className="agent-list">
-        {agents.map((agent) => {
-          const executor = agent.executors?.[0]
-          return (
-            <article className="agent-card" key={agent.agentId}>
-              <div className="agent-card-head">
-                <span className={'agent-orb large ' + (agent.status === 'online' ? 'ready' : 'offline')}>
-                  {agent.agentId.slice(0, 2).toUpperCase()}
-                </span>
-                <div>
-                  <h3>{agent.agentId}</h3>
-                  <span className="mono-muted">{agent.adapter ?? '未上报适配器'}</span>
-                </div>
-                <StatusPill status={agent.status !== 'online' ? 'offline' : agent.paused ? 'paused' : agent.busy ? 'busy' : 'ready'} />
-              </div>
-              <div className="agent-facts">
-                <div><small>执行器健康</small><strong>{executor?.health ?? 'Unknown'}</strong></div>
-                <div><small>额度状态</small><strong>{executor?.quota ?? 'Unknown'}</strong></div>
-                <div><small>最后心跳</small><strong>{relativeTime(agent.lastSeenAt ?? agent.disconnectedAt)}</strong></div>
-                <div><small>当前任务</small><strong>{agent.currentTaskId ? '#' + shortId(agent.currentTaskId) : '空闲'}</strong></div>
-              </div>
-              <div className="capability-block">
-                <small>声明能力</small>
-                <div className="tag-row">
-                  {(agent.capabilities ?? []).map((capability) => <span key={capability}>{capability}</span>)}
-                  {!agent.capabilities?.length && <span>未上报</span>}
-                </div>
-              </div>
-              <div className="tool-list">
-                {(agent.observedCapabilities?.tools ?? []).map((tool) => (
-                  <span key={tool.name}><i className={tool.available ? 'ok' : 'bad'} />{tool.name} {tool.version ?? ''}</span>
-                ))}
-              </div>
-              <div className="agent-actions">
-                <button
-                  type="button"
-                  disabled={agent.status !== 'online'}
-                  onClick={() => onCommand(agent.paused ? 'agent.resume' : 'agent.pause', agent.agentId)}
-                >
-                  {agent.paused ? '恢复节点' : '暂停接单'}
-                </button>
-              </div>
-            </article>
-          )
-        })}
-      </div>
-    </div>
-  )
+function QuotaBadge({ quota }: { quota: QuotaSnapshot | null }) {
+  const state = quota?.state ?? 'Unknown'
+  return <span className={`quota-badge ${state.toLowerCase()}`}>{state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'}</span>
 }
 
-function ApprovalsView({
-  tasks,
-  onApprove,
-  onSelectTask,
-}: {
-  tasks: HubTask[]
-  onApprove: (taskId: string) => void
-  onSelectTask: (taskId: string) => void
-}) {
-  return (
-    <section className="panel full-panel">
-      <div className="panel-heading">
-        <div>
-          <span className="eyebrow">人工确认</span>
-          <h2>等待人工决策</h2>
-          <p>审批只解除 Hub 的等待状态，本地 Worker 仍会再次执行策略检查。</p>
-        </div>
-      </div>
-      {!tasks.length ? (
-        <EmptyState title="审批队列为空" detail="需要人工确认的任务会出现在这里。" />
-      ) : (
-        <div className="approval-list">
-          {tasks.map((task) => (
-            <article className="approval-item" key={task.taskId}>
-              <span className="approval-flag">!</span>
-              <div className="approval-copy">
-                <small>{task.taskSpec?.type ?? 'general'} · {relativeTime(task.createdAt)}</small>
-                <h3>{task.taskSpec?.title ?? task.input.slice(0, 50)}</h3>
-                <p>{task.input}</p>
-                <PermissionTags task={task} />
-              </div>
-              <div className="approval-side">
-                <span>目标节点</span>
-                <strong>{task.targetAgentId}</strong>
-                <button className="primary-button small" type="button" onClick={() => onApprove(task.taskId)}>
-                  批准执行
-                </button>
-                <button className="text-button" type="button" onClick={() => onSelectTask(task.taskId)}>
-                  查看详情
-                </button>
-              </div>
-            </article>
-          ))}
-        </div>
-      )}
-    </section>
-  )
+function QuotaMeter({ quota }: { quota: QuotaSnapshot | null }) {
+  const window = quota?.windows?.find((item) => item.usedPercent != null)
+  if (!window || window.usedPercent == null) return <div className="quota-unknown">客户端暂无可读取的额度快照</div>
+  return <div className="quota-meter"><div><span>{window.name}</span><b>已用 {Math.round(window.usedPercent)}%</b></div><progress max="100" value={window.usedPercent} /><small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small></div>
 }
 
-function AuditView({ events }: { events: HubEvent[] }) {
-  return (
-    <section className="panel full-panel">
-      <div className="panel-heading">
-        <div>
-          <span className="eyebrow">审计记录</span>
-          <h2>协议与审计事件</h2>
-          <p>显示 Hub 最近记录的事件，便于定位任务流转和 Worker 状态变化。</p>
-        </div>
-        <span className="event-count">{events.length} 条事件</span>
-      </div>
-      <EventList events={events} detailed />
-    </section>
-  )
+function acceptsRole(agent: Agent, role: AgentRole) {
+  return agent.status === 'online' && !agent.paused && (!agent.roles?.length || agent.roles.includes(role))
 }
 
-function EventList({ events, detailed = false }: { events: HubEvent[]; detailed?: boolean }) {
-  if (!events.length) return <EmptyState title="还没有事件" detail="Worker 连接或任务创建后会留下记录。" />
-  return (
-    <div className={detailed ? 'event-list detailed' : 'event-list'}>
-      {events.map((event) => (
-        <article className="event-row" key={event.seq + '-' + event.ts}>
-          <span className={'event-icon ' + eventTone(event.type)}>{event.seq}</span>
-          <div className="event-copy">
-            <div><strong>{eventLabel(event.type)}</strong><code>{event.type}</code></div>
-            <p>{eventDescription(event)}</p>
-            {detailed && <pre>{JSON.stringify(event.details, null, 2)}</pre>}
-          </div>
-          <time>{relativeTime(event.ts)}</time>
-        </article>
-      ))}
-    </div>
-  )
+function isAgentRole(value: string): value is AgentRole {
+  return value === 'planner' || value === 'executor' || value === 'reviewer'
 }
 
-function TaskDrawer({
-  task,
-  onClose,
-  onApprove,
-  onCancel,
-}: {
-  task: HubTask
-  onClose: () => void
-  onApprove: (taskId: string) => void
-  onCancel: (taskId: string) => void
-}) {
-  const cancellable = activeStatuses.has(task.status)
-  return (
-    <div className="drawer-layer" role="presentation" onMouseDown={onClose}>
-      <aside
-        className="task-drawer"
-        role="dialog"
-        aria-modal="true"
-        aria-label="任务详情"
-        onMouseDown={(event) => event.stopPropagation()}
-      >
-        <div className="drawer-head">
-          <div>
-            <span className="eyebrow">任务 #{shortId(task.taskId)}</span>
-            <h2>{task.taskSpec?.title ?? '未命名任务'}</h2>
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">×</button>
-        </div>
-
-        <div className="drawer-status">
-          <StatusPill status={task.status} />
-          <span>{task.targetAgentId}</span>
-          <span>{relativeTime(task.createdAt)}</span>
-        </div>
-
-        <DrawerSection title="任务说明">
-          <p className="task-prompt">{task.input}</p>
-        </DrawerSection>
-
-        <DrawerSection title="任务约束">
-          <dl className="detail-grid">
-            <div><dt>类型</dt><dd>{task.taskSpec?.type ?? 'general'}</dd></div>
-            <div><dt>优先级</dt><dd>{task.taskSpec?.priority ?? '未设置'}</dd></div>
-            <div><dt>根任务</dt><dd>#{shortId(task.rootTaskId ?? task.taskId)}</dd></div>
-            <div><dt>人工门禁</dt><dd>{task.requiresApproval ? '需要' : '不需要'}</dd></div>
-          </dl>
-          <PermissionTags task={task} />
-          {!!task.taskSpec?.expected_outputs?.length && (
-            <div className="path-list">
-              <small>预期产物</small>
-              {task.taskSpec.expected_outputs.map((output) => (
-                <code key={typeof output === 'string' ? output : output.path}>
-                  {typeof output === 'string' ? output : output.path}
-                </code>
-              ))}
-            </div>
-          )}
-        </DrawerSection>
-
-        {task.checkpoint && (
-          <DrawerSection title="最近检查点">
-            <div className="checkpoint">
-              <span>{task.checkpoint.stage ?? 'UNKNOWN'}</span>
-              <code>{task.checkpoint.path ?? task.checkpoint.checkpointId}</code>
-            </div>
-          </DrawerSection>
-        )}
-
-        {(task.output || task.error) && (
-          <DrawerSection title={task.error ? '异常信息' : '执行结果'}>
-            <pre className={task.error ? 'result-box error' : 'result-box'}>
-              {task.error ? JSON.stringify(task.error, null, 2) : task.output}
-            </pre>
-          </DrawerSection>
-        )}
-
-        {!!task.artifacts?.files?.length && (
-          <DrawerSection title="产物清单">
-            <div className="artifact-list">
-              {task.artifacts.files.map((file) => (
-                <div key={file.path}>
-                  <strong>{file.path}</strong>
-                  <span>{formatBytes(file.size)} · {file.status}</span>
-                  <code>{file.sha256 ? 'sha256:' + file.sha256.slice(0, 20) + '…' : '未计算哈希'}</code>
-                </div>
-              ))}
-            </div>
-          </DrawerSection>
-        )}
-
-        <div className="drawer-actions">
-          {task.status === 'awaiting_approval' && (
-            <button className="primary-button" type="button" onClick={() => onApprove(task.taskId)}>批准执行</button>
-          )}
-          {cancellable && (
-            <button className="danger-button" type="button" onClick={() => onCancel(task.taskId)}>取消任务</button>
-          )}
-        </div>
-      </aside>
-    </div>
-  )
-}
-
-function DrawerSection({ title, children }: { title: string; children: React.ReactNode }) {
-  return (
-    <section className="drawer-section">
-      <h3>{title}</h3>
-      {children}
-    </section>
-  )
-}
-
-function TaskModal({
-  agents,
-  draft,
-  setDraft,
-  isSubmitting,
-  onClose,
-  onSubmit,
-}: {
-  agents: Agent[]
-  draft: TaskDraft
-  setDraft: React.Dispatch<React.SetStateAction<TaskDraft>>
-  isSubmitting: boolean
-  onClose: () => void
-  onSubmit: (event: FormEvent<HTMLFormElement>) => void
-}) {
-  const eligibleAgents = agents.filter((agent) => agent.status === 'online')
-  return (
-    <div className="modal-layer" role="presentation" onMouseDown={onClose}>
-      <form className="task-modal" onSubmit={onSubmit} onMouseDown={(event) => event.stopPropagation()}>
-        <div className="drawer-head">
-          <div>
-            <span className="eyebrow">下发任务</span>
-            <h2>创建通用任务</h2>
-          </div>
-          <button className="icon-button" type="button" onClick={onClose} aria-label="关闭">×</button>
-        </div>
-        <p className="modal-intro">描述目标、选择执行节点，并明确这次任务可以使用的能力。</p>
-
-        <label>
-          <span>任务名称 <em>可选</em></span>
-          <input
-            value={draft.title}
-            onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
-            placeholder="例如：整理会议材料"
-          />
-        </label>
-        <label>
-          <span>任务说明 <b>*</b></span>
-          <textarea
-            required
-            value={draft.input}
-            onChange={(event) => setDraft((current) => ({ ...current, input: event.target.value }))}
-            placeholder="清楚说明目标、输入信息和完成标准…"
-            rows={5}
-          />
-        </label>
-        <div className="form-grid">
-          <label>
-            <span>执行节点 <b>*</b></span>
-            <select
-              required
-              value={draft.targetAgentId}
-              onChange={(event) => setDraft((current) => ({ ...current, targetAgentId: event.target.value }))}
-            >
-              <option value="">选择在线节点</option>
-              {eligibleAgents.map((agent) => (
-                <option key={agent.agentId} value={agent.agentId}>
-                  {agent.agentId}{agent.paused ? '（已暂停）' : ''}
-                </option>
-              ))}
-            </select>
-          </label>
-          <label>
-            <span>预期产物路径</span>
-            <input
-              value={draft.expectedOutput}
-              onChange={(event) => setDraft((current) => ({ ...current, expectedOutput: event.target.value }))}
-              placeholder="outputs/result.md"
-            />
-          </label>
-        </div>
-
-        <fieldset>
-          <legend>权限声明</legend>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={draft.terminal}
-              onChange={(event) => setDraft((current) => ({ ...current, terminal: event.target.checked }))}
-            />
-            <span><strong>终端命令</strong><small>允许 Worker 在受控工作区调用命令行工具</small></span>
-          </label>
-          <label className="check-row">
-            <input
-              type="checkbox"
-              checked={draft.browser}
-              onChange={(event) => setDraft((current) => ({ ...current, browser: event.target.checked }))}
-            />
-            <span><strong>浏览器访问</strong><small>仅声明需求，最终仍由 Worker 本地策略决定</small></span>
-          </label>
-          <label className="check-row approval-check">
-            <input
-              type="checkbox"
-              checked={draft.requiresApproval}
-              onChange={(event) => setDraft((current) => ({ ...current, requiresApproval: event.target.checked }))}
-            />
-            <span><strong>执行前需要人工批准</strong><small>任务先进入等待审批状态</small></span>
-          </label>
-        </fieldset>
-
-        {!eligibleAgents.length && <div className="form-warning">没有在线节点，暂时无法提交真实任务。</div>}
-        <div className="modal-actions">
-          <button className="secondary-button" type="button" onClick={onClose}>取消</button>
-          <button className="primary-button" type="submit" disabled={isSubmitting || !eligibleAgents.length || !draft.input.trim()}>
-            {isSubmitting ? '正在提交…' : draft.requiresApproval ? '提交审批' : '下发任务'}
-          </button>
-        </div>
-      </form>
-    </div>
-  )
-}
-
-function PermissionTags({ task }: { task: HubTask }) {
-  const permissions = Object.entries(task.taskSpec?.permissions_required ?? {}).filter(([, enabled]) => enabled)
-  if (!permissions.length) return <span className="permission-none">仅工作区</span>
-  return (
-    <span className="permission-tags">
-      {permissions.slice(0, 3).map(([name]) => <span key={name}>{permissionLabel(name)}</span>)}
-      {permissions.length > 3 && <span>+{permissions.length - 3}</span>}
-    </span>
-  )
-}
-
-function StatusPill({ status }: { status: string }) {
-  return <span className={'status-pill ' + statusTone(status)}><i />{statusLabel(status)}</span>
-}
-
-function EmptyState({ title, detail }: { title: string; detail: string }) {
-  return (
-    <div className="empty-state">
-      <span>∅</span>
-      <strong>{title}</strong>
-      <p>{detail}</p>
-    </div>
-  )
-}
-
-function applyDemoCommand(
-  command: Record<string, unknown>,
-  setSnapshot: React.Dispatch<React.SetStateAction<HubSnapshot>>,
-) {
-  const now = new Date().toISOString()
-  setSnapshot((current) => {
-    const type = String(command.type ?? '')
-    let tasks = current.tasks
-    let agents = current.agents
-    if (type === 'task.approve') {
-      tasks = tasks.map((task) =>
-        task.taskId === command.taskId
-          ? { ...task, status: 'queued', requiresApproval: false, approval: { approvedAt: now, approvedBy: 'console-user' } }
-          : task,
-      )
-    } else if (type === 'task.cancel') {
-      tasks = tasks.map((task) =>
-        task.taskId === command.taskId ? { ...task, status: 'cancelled', completedAt: now } : task,
-      )
-    } else if (type === 'agent.pause' || type === 'agent.resume') {
-      agents = agents.map((agent) =>
-        agent.agentId === command.targetAgentId ? { ...agent, paused: type === 'agent.pause' } : agent,
-      )
+function groupAccountUsage(agents: Agent[]) {
+  const empty = (): TokenUsage => ({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0, toolTokens: 0, totalTokens: 0 })
+  const groups = new Map<string, { key: string; label: string; provider: string; plan: string; usage: TokenUsage; agents: Agent[]; devices: Set<string>; quota: QuotaSnapshot | null }>()
+  for (const agent of agents) {
+    const key = `${agent.account?.provider ?? 'unknown'}:${agent.account?.id ?? agent.agentId}`
+    const group = groups.get(key) ?? {
+      key,
+      label: agent.account?.label ?? agent.account?.id ?? '未标记账号',
+      provider: agent.account?.provider ?? '未知服务',
+      plan: agent.account?.plan ?? '未知套餐',
+      usage: empty(),
+      agents: [],
+      devices: new Set<string>(),
+      quota: agent.quotaSnapshot ?? null,
     }
-    return {
-      ...current,
-      tasks,
-      agents,
-      events: [
-        {
-          seq: Math.max(0, ...current.events.map((event) => event.seq)) + 1,
-          ts: now,
-          type,
-          details: { ...command, demo: true },
-        },
-        ...current.events,
-      ],
-    }
-  })
-}
-
-function viewTitle(view: ViewKey) {
-  return navItems.find((item) => item.key === view)?.label ?? '运行总览'
-}
-
-function countForFilter(tasks: HubTask[], filter: TaskFilter) {
-  if (filter === 'all') return tasks.length
-  if (filter === 'active') return tasks.filter((task) => activeStatuses.has(task.status)).length
-  if (filter === 'approval') return tasks.filter((task) => task.status === 'awaiting_approval').length
-  if (filter === 'completed') return tasks.filter((task) => task.status === 'completed').length
-  return tasks.filter((task) => failedStatuses.has(task.status)).length
-}
-
-function statusTone(status: string) {
-  if (['online', 'ready', 'completed', 'Healthy'].includes(status)) return 'success'
-  if (['running', 'busy', 'dispatched'].includes(status)) return 'info'
-  if (['created', 'queued', 'paused', 'awaiting_approval', 'Low', 'Degraded'].includes(status)) return 'warning'
-  if (['failed', 'rejected', 'cancelled', 'offline', 'Unhealthy', 'Exhausted'].includes(status)) return 'danger'
-  return 'neutral'
-}
-
-function statusLabel(status: string) {
-  const labels: Record<string, string> = {
-    online: '在线',
-    offline: '离线',
-    ready: '就绪',
-    busy: '执行中',
-    paused: '已暂停',
-    created: '已创建',
-    queued: '排队中',
-    dispatched: '已下发',
-    running: '执行中',
-    awaiting_approval: '待审批',
-    completed: '已完成',
-    failed: '失败',
-    rejected: '已拒绝',
-    cancelled: '已取消',
+    group.agents.push(agent)
+    group.devices.add(agent.deviceId ?? agent.agentId)
+    for (const field of Object.keys(group.usage) as Array<keyof TokenUsage>) group.usage[field] += agent.usageTotals?.[field] ?? 0
+    const candidate = agent.quotaSnapshot
+    if (candidate && (!group.quota || Date.parse(candidate.checkedAt) > Date.parse(group.quota.checkedAt))) group.quota = candidate
+    groups.set(key, group)
   }
-  return labels[status] ?? status
+  return [...groups.values()]
 }
 
-function permissionLabel(permission: string) {
-  const labels: Record<string, string> = {
-    project_workspace: '工作区',
-    terminal: '终端',
-    browser: '浏览器',
-    browser_profile: '浏览器资料',
-  }
-  return labels[permission] ?? permission
+function extractMentions(text: string) {
+  return [...new Set(text.match(/@[\w.-]+/g) ?? [])]
 }
 
-function eventLabel(type: string) {
-  if (type.includes('rejected')) return '策略拒绝'
-  if (type.includes('approval')) return '等待审批'
-  if (type.includes('result') || type.includes('completed')) return '任务完成'
-  if (type.includes('started') || type.includes('assign')) return '开始执行'
-  if (type.includes('heartbeat')) return '节点心跳'
-  if (type.includes('connected') || type.includes('hello')) return '节点接入'
-  if (type.includes('cancel')) return '任务取消'
-  if (type.includes('pause')) return '节点暂停'
-  return '状态更新'
+function formatTokens(value: number) {
+  return new Intl.NumberFormat('zh-CN', { notation: value >= 10_000 ? 'compact' : 'standard', maximumFractionDigits: 1 }).format(value)
 }
 
-function eventTone(type: string) {
-  if (type.includes('rejected') || type.includes('failed') || type.includes('cancel')) return 'danger'
-  if (type.includes('approval') || type.includes('pause')) return 'warning'
-  if (type.includes('result') || type.includes('completed')) return 'success'
-  return 'info'
+function formatTime(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
 }
 
-function eventDescription(event: HubEvent) {
-  const taskId = typeof event.details.taskId === 'string' ? '#' + shortId(event.details.taskId) : ''
-  const agentId = typeof event.details.agentId === 'string' ? event.details.agentId : ''
-  return [taskId, agentId].filter(Boolean).join(' · ') || 'Hub 记录了一次协议状态变化'
+function formatDate(value: string) {
+  return new Intl.DateTimeFormat('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }).format(new Date(value))
 }
 
-function shortId(id: string) {
-  return id.length > 14 ? id.slice(-8) : id
+function relativeTime(value: string) {
+  const minutes = Math.max(0, Math.floor((Date.now() - Date.parse(value)) / 60_000))
+  if (minutes < 1) return '刚刚'
+  if (minutes < 60) return `${minutes}分`
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}时`
+  return `${Math.floor(minutes / 1440)}天`
 }
 
-function relativeTime(value?: string) {
-  if (!value) return '未知'
-  const delta = Date.now() - Date.parse(value)
-  if (!Number.isFinite(delta)) return value
-  if (delta < 45_000) return '刚刚'
-  const minutes = Math.floor(delta / 60_000)
-  if (minutes < 60) return minutes + ' 分钟前'
-  const hours = Math.floor(minutes / 60)
-  if (hours < 24) return hours + ' 小时前'
-  return Math.floor(hours / 24) + ' 天前'
-}
-
-function formatBytes(bytes: number) {
-  if (bytes < 1024) return bytes + ' B'
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-  return (bytes / 1024 / 1024).toFixed(1) + ' MB'
+function formatBytes(value: number) {
+  return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`
 }
 
 export default App
-\n

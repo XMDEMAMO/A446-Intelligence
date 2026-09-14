@@ -1,5 +1,14 @@
 {
-  "agentId": "laptop-03-antigravity",
+  "agentId": "laptop-03-antigravity-reviewer-01",
+  "deviceId": "laptop-03",
+  "account": { "id": "gemini-pro-01", "provider": "google", "plan": "AI Pro", "label": "Gemini AI Pro 01" },
+  "roles": ["reviewer"],
+  "models": [
+    { "id": "gemini-3.8-flash-high", "capabilities": ["reasoning", "review", "document_editing"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } },
+    { "id": "gemini-3.8-flash-low", "capabilities": ["review", "document_editing"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } },
+    { "id": "gemini-3.1-pro-high", "capabilities": ["reasoning", "review"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } },
+    { "id": "claude-sonnet-4-6", "capabilities": ["reasoning", "review"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } }
+  ],
   "hubUrl": "wss://hub.example.com:9443/worker",
   "authTokenEnv": "HUB_TOKEN",
   "authRequired": true,
@@ -21,7 +30,7 @@
     "maxFileBytes": 104857600
   },
   "capabilityProbe": {
-    "timeoutMs": 5000,
+    "timeoutMs": 15000,
     "stripProxyEnv": true,
     "tools": [
       { "name": "git", "command": "git", "args": ["--version"] }
@@ -43,5 +52,3 @@
     "shutdownTimeoutMs": 5000
   }
 }
-
-\n

@@ -1,20 +1,21 @@
 {
-  "host": "127.0.0.1",
+  "host": "192.168.137.1",
   "port": 8787,
   "heartbeatMs": 5000,
   "auth": {
-    "required": false,
+    "required": true,
     "tokenEnv": "HUB_TOKEN"
   },
   "tls": {
     "enabled": false
   },
+  "allowPlaintextRemote": true,
   "delivery": {
     "ackTimeoutMs": 3000,
     "maxAttemptsPerConnection": 5
   },
   "logs": {
-    "file": "../var/log/hub-events.jsonl",
-    "includePayloads": true
+    "file": "../var/log/hub-private-lan-events.jsonl",
+    "includePayloads": false
   }
 }

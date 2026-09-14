@@ -1,0 +1,68 @@
+{
+  "agentId": "laptop-02-gemini-reviewer-01",
+  "deviceId": "laptop-02",
+  "account": {
+    "id": "gemini-pro-01",
+    "provider": "google",
+    "plan": "AI Pro",
+    "label": "Gemini AI Pro 01"
+  },
+  "roles": ["reviewer"],
+  "models": [
+    {
+      "id": "gemini-3.8-flash-high",
+      "capabilities": ["reasoning", "review", "document_editing"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    },
+    {
+      "id": "gemini-3.8-flash-medium",
+      "capabilities": ["review", "document_editing"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    },
+    {
+      "id": "gemini-3.1-pro-high",
+      "capabilities": ["reasoning", "review"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    },
+    {
+      "id": "claude-sonnet-4-6",
+      "capabilities": ["reasoning", "review"],
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    }
+  ],
+  "hubUrl": "ws://192.168.137.1:8787/worker",
+  "authTokenEnv": "HUB_TOKEN",
+  "authRequired": true,
+  "heartbeatMs": 5000,
+  "stateFile": "../var/state/laptop-02-gemini-private-lan.json",
+  "workspace": "../workspaces/laptop-02-gemini",
+  "capabilities": ["task.execute", "reasoning", "review", "document_editing", "pause", "resume", "cancel"],
+  "policy": {
+    "requireTaskSpec": false,
+    "defaultDenyUnknownPermissions": true,
+    "allowedPermissions": ["project_workspace", "terminal"],
+    "deniedPermissions": ["browser", "system_settings"]
+  },
+  "checkpoints": {
+    "includeOutput": true,
+    "maxOutputChars": 200000
+  },
+  "artifacts": { "maxFileBytes": 104857600 },
+  "capabilityProbe": {
+    "timeoutMs": 15000,
+    "stripProxyEnv": false,
+    "tools": [
+      { "name": "git", "command": "git", "args": ["--version"] }
+    ]
+  },
+  "reconnect": { "baseMs": 1000, "maxMs": 30000 },
+  "tls": { "rejectUnauthorized": true },
+  "adapter": {
+    "type": "antigravity",
+    "command": "agy",
+    "args": ["--mode", "accept-edits"],
+    "stripProxyEnv": false,
+    "resumeOnStart": true,
+    "shutdownTimeoutMs": 5000
+  }
+}

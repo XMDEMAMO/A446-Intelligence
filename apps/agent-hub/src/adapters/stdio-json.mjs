@@ -74,5 +74,3 @@ export class StdioJsonAdapter {
     this.child?.kill();
   }
 }
-
-\n

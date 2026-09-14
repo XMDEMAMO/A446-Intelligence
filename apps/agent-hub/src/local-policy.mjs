@@ -185,5 +185,3 @@ async function nearestExistingParent(start) {
     }
   }
 }
-
-\n

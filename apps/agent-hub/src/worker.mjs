@@ -12,6 +12,8 @@ import { buildArtifactManifest } from "./artifact-manifest.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
 import { initialExecutorStatus, probeLocalCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
+import { addUsage, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
+import { probeQuota } from "./quota-probe.mjs";
 
 export class AgentWorker {
   constructor(config) {
@@ -26,6 +28,7 @@ export class AgentWorker {
     this.current = null;
     this.currentAbort = null;
     this.heartbeatTimer = null;
+    this.quotaTimer = null;
     this.reconnectAttempt = 0;
     this.saveChain = Promise.resolve();
     this.state = {
@@ -35,6 +38,8 @@ export class AgentWorker {
       processed: {},
       outbox: {},
       executorStatus: null,
+      usageTotals: null,
+      sessions: {},
     };
     this.policy = normalizePolicy(config.policy, config.workspace);
     this.checkpoints = new CheckpointStore({
@@ -44,6 +49,8 @@ export class AgentWorker {
       maxOutputChars: config.checkpoints?.maxOutputChars ?? 200_000,
     });
     this.observedCapabilities = null;
+    this.quotaSnapshot = normalizeQuotaSnapshot(config.quotaSnapshot);
+    this.quotaProbeError = null;
     this.adapter = createAdapter(config.adapter ?? { type: "mock" }, {
       agentId: this.agentId,
       workspace: config.workspace,
@@ -58,6 +65,7 @@ export class AgentWorker {
     await this.loadState();
     await this.adapter.start(this.state);
     this.observedCapabilities = probeLocalCapabilities(this.config);
+    await this.refreshQuota();
     const detected = initialExecutorStatus(this.adapter.type, this.observedCapabilities);
     this.state.executorStatus = this.state.executorStatus
       ? { ...detected, quota: this.state.executorStatus.quota ?? "Unknown", lastError: this.state.executorStatus.lastError ?? detected.lastError }
@@ -71,11 +79,24 @@ export class AgentWorker {
   async stop() {
     this.stopping = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+    if (this.quotaTimer) clearInterval(this.quotaTimer);
     this.currentAbort?.abort();
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.close(1000, "Worker stopping");
     else if (this.ws && this.ws.readyState !== WebSocket.CLOSED) this.ws.terminate();
     await this.adapter.stop();
     await this.saveState();
+  }
+
+  async refreshQuota() {
+    if (!this.config.quotaProbe?.command) return this.quotaSnapshot;
+    try {
+      const snapshot = await probeQuota(this.config.quotaProbe, { workspace: this.config.workspace });
+      if (snapshot) this.quotaSnapshot = snapshot;
+      this.quotaProbeError = null;
+    } catch (error) {
+      this.quotaProbeError = { message: String(error?.message ?? error).slice(0, 500), checkedAt: new Date().toISOString() };
+    }
+    return this.quotaSnapshot;
   }
 
   async loadState() {
@@ -88,6 +109,8 @@ export class AgentWorker {
         processed: saved.processed ?? {},
         outbox: saved.outbox ?? {},
         executorStatus: saved.executorStatus ?? null,
+        usageTotals: saved.usageTotals ?? null,
+        sessions: saved.sessions ?? {},
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -150,6 +173,7 @@ export class AgentWorker {
             node: process.version,
             observedCapabilities: this.observedCapabilities,
             executors: [this.state.executorStatus],
+            ...this.agentProfile(),
           },
         }));
         for (const message of Object.values(this.state.outbox)) this.send(message);
@@ -179,10 +203,18 @@ export class AgentWorker {
         observedCapabilities: this.observedCapabilities,
         executors: [this.state.executorStatus],
         currentTaskId: this.current?.taskId ?? null,
+        usageTotals: this.state.usageTotals,
+        quotaSnapshot: this.quotaSnapshot,
+        quotaProbeError: this.quotaProbeError,
       },
     }));
     beat();
     this.heartbeatTimer = setInterval(beat, Number(this.config.heartbeatMs ?? 5000));
+    if (this.quotaTimer) clearInterval(this.quotaTimer);
+    if (this.config.quotaProbe?.command) {
+      this.quotaTimer = setInterval(() => void this.refreshQuota(), Number(this.config.quotaProbe.intervalMs ?? 60_000));
+      this.quotaTimer.unref();
+    }
   }
 
   send(message) {
@@ -237,6 +269,7 @@ export class AgentWorker {
     }
     this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
     try {
+      this.validateRole(message);
       await evaluateTaskPolicy(message, this.policy);
     } catch (error) {
       if (!(error instanceof PolicyDeniedError)) throw error;
@@ -292,6 +325,7 @@ export class AgentWorker {
     this.current = message;
     this.currentAbort = new AbortController();
     try {
+      this.validateRole(message);
       await evaluateTaskPolicy(message, this.policy);
     } catch (error) {
       this.busy = false;
@@ -321,19 +355,36 @@ export class AgentWorker {
     }));
     let completion;
     try {
-      const result = await this.adapter.run(message.payload?.input ?? "", {
+      const role = String(message.payload?.role ?? "").toLowerCase();
+      const execution = message.payload?.execution ?? {};
+      const sessionKey = String(message.payload?.sessionScopeId ?? "legacy");
+      const scopedSessionId = this.state.sessions[sessionKey] ?? (sessionKey === "legacy" ? this.state.sessionId : null);
+      const prompt = buildRolePrompt(role, message.payload?.input ?? "", message.payload ?? {});
+      const result = await this.adapter.run(prompt, {
         agentId: this.agentId,
         taskId: message.taskId,
-        sessionId: this.state.sessionId,
+        sessionId: scopedSessionId,
+        sessionKey,
         metadata: message.payload?.metadata ?? {},
+        role,
+        stage: message.payload?.stage ?? null,
+        model: execution.model ?? null,
+        reasoningEffort: execution.reasoningEffort ?? null,
         signal: this.currentAbort.signal,
       });
-      if (result.sessionId) this.state.sessionId = result.sessionId;
+      if (result.sessionId) {
+        this.state.sessions[sessionKey] = result.sessionId;
+        this.state.sessionId = result.sessionId;
+      }
       const taskSpec = message.payload?.taskSpec ?? message.payload?.metadata?.taskSpec;
       const artifacts = await buildArtifactManifest(taskSpec, this.policy, {
         maxFileBytes: this.config.artifacts?.maxFileBytes,
       });
       this.state.executorStatus = statusAfterSuccess(this.state.executorStatus);
+      const usage = normalizeUsage(result.usage);
+      if (usage) this.state.usageTotals = addUsage(this.state.usageTotals, usage);
+      await this.refreshQuota();
+      const submission = parseRoleSubmission(role, result.output);
       const checkpoint = await this.checkpoints.save(message, "COMPLETED", {
         sessionId: this.state.sessionId,
         output: result.output,
@@ -342,7 +393,19 @@ export class AgentWorker {
       completion = makeEnvelope("task.result", {
         agentId: this.agentId,
         taskId: message.taskId,
-        payload: { output: result.output, sessionId: this.state.sessionId, artifacts, checkpoint, executor: this.state.executorStatus },
+        payload: {
+          output: result.output,
+          role,
+          model: execution.model ?? this.config.adapter?.model ?? null,
+          submission,
+          usage,
+          usageTotals: this.state.usageTotals,
+          quotaSnapshot: this.quotaSnapshot,
+          sessionId: this.state.sessionId,
+          artifacts,
+          checkpoint,
+          executor: this.state.executorStatus,
+        },
       });
     } catch (error) {
       if (error?.name !== "AbortError") this.state.executorStatus = statusAfterError(this.state.executorStatus, error);
@@ -373,8 +436,33 @@ export class AgentWorker {
     await this.sendReliable(completion);
     void this.drainQueue();
   }
-}
 
+  validateRole(message) {
+    const requested = String(message.payload?.role ?? "").toLowerCase();
+    const roles = normalizeRoles(this.config.roles ?? this.config.role);
+    if (requested && roles.length && !roles.includes(requested)) {
+      throw new PolicyDeniedError([`agent ${this.agentId} does not accept role ${requested}`]);
+    }
+  }
+
+  agentProfile() {
+    return {
+      deviceId: this.config.deviceId ?? this.agentId,
+      account: this.config.account && typeof this.config.account === "object" ? {
+        id: this.config.account.id ? String(this.config.account.id) : undefined,
+        provider: this.config.account.provider ? String(this.config.account.provider) : undefined,
+        plan: this.config.account.plan ? String(this.config.account.plan) : undefined,
+        label: this.config.account.label ? String(this.config.account.label) : undefined,
+      } : null,
+      roles: normalizeRoles(this.config.roles ?? this.config.role),
+      models: normalizeModels(this.config.models, this.config.adapter),
+      maxConcurrency: 1,
+      usageTotals: this.state.usageTotals,
+      quotaSnapshot: this.quotaSnapshot,
+      quotaProbeError: this.quotaProbeError,
+    };
+  }
+}
 function createAdapter(config, context) {
   if (config.type === "mock") return new MockAdapter(config, context);
   if (config.type === "codex") return new CodexAdapter(config, context);
@@ -382,10 +470,7 @@ function createAdapter(config, context) {
   if (config.type === "stdio-json") return new StdioJsonAdapter(config, context);
   throw new Error(`Unsupported adapter type: ${config.type}`);
 }
-
 function trimProcessed(processed, max) {
   const keys = Object.keys(processed);
   for (const key of keys.slice(0, Math.max(0, keys.length - max))) delete processed[key];
 }
-
-\n
