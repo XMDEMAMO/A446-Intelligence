@@ -31,6 +31,7 @@
       { "id": "configured-model-a", "capabilities": ["coding"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } }
     ],
     "capabilities": ["task.execute", "coding", "pause", "resume", "cancel"],
+    "protocolFeatures": ["attempt-lease-v1"],
     "sessionId": null,
     "paused": false,
     "platform": "win32",
@@ -46,9 +47,9 @@
 }
 ```
 
-Hub 返回 `hub.welcome`。同一 `agentId` 的新连接替换旧连接。
+Hub 返回 `hub.welcome`。同一 `agentId` 的新连接替换旧连接。支持租约的 Hub 会在 `hub.welcome.payload.protocolFeatures` 返回 `attempt-lease-v1`，并同时返回 `leaseTtlMs`。生产 Server Hub 启用租约后，只向在 hello 中声明该特性的 Worker 派发任务。
 
-`worker.heartbeat.payload` 除 `busy`、`paused`、`sessionId` 外，还应携带 `currentTaskId`、`observedCapabilities`、`executors`、`usageTotals` 和 `quotaSnapshot`。额度状态只允许使用 `Healthy / Low / Exhausted / Unknown`；无法从官方工具可靠读取时必须上报 `Unknown`，不得伪造精确百分比。
+`worker.heartbeat.payload` 除 `busy`、`paused`、`sessionId` 外，还应携带 `currentTaskId`、`currentAttemptId`、`observedCapabilities`、`executors`、`usageTotals` 和 `quotaSnapshot`。当前 Attempt 存在时，Hub 以 heartbeat 续租。额度状态只允许使用 `Healthy / Low / Exhausted / Unknown`；无法从官方工具可靠读取时必须上报 `Unknown`，不得伪造精确百分比。
 
 `deviceId` 表示物理设备，`account` 表示本地已登录账号，`agentId` 表示该设备上的一个逻辑 Agent。一个账号可以承载多个 Agent；每个 Agent 仍必须使用独立的 `agentId`、工作区、状态文件和 session。`models` 是当前账号实际允许调度的模型清单，不表示模型拥有独立登录授权。
 
@@ -71,6 +72,25 @@ queued -> dispatched -> running -> completed
                          -> awaiting_approval -> running
 ```
 
+启用 `attempt-lease-v1` 后，任务与执行尝试分开记录：
+
+```text
+Attempt: assigned -> running -> completed | failed | cancelled | rejected
+                    |
+                    +---------> expired
+Task:    queued -> dispatched -> running -> terminal
+                    |              |
+                    +-- lease -----+-> queued（仅明确可安全重试）
+                                   +-> awaiting_approval（副作用未知或外部副作用）
+```
+
+- 每次派发创建唯一 `attemptId`，同一任务的 `attemptNumber` 单调递增。
+- 只有任务的 `currentAttemptId` 与消息中的 `attemptId` 相等，且 Attempt 仍为 `assigned` 或 `running`，结果才可改变任务状态。
+- 过期 Attempt 的迟到 `task.started`、`task.result`、`task.error`、`task.rejected` 或 `approval.request` 只记审计并 ACK，不覆盖当前结果。
+- 租约过期后，只有 Task Spec 明确声明 `side_effects` 为 `none` 或 `idempotent` 时才允许自动重派。`external`、`unknown` 或未声明一律进入人工确认。
+- 自动恢复次数由服务器 `leases.maxRecoveryAttempts` 限制，默认 3 次；达到上限后即使任务可安全重试也转人工确认，禁止单 Worker 无限重派。
+- `task.cancel.payload.attemptId` 存在时，Worker 只取消匹配的当前 Attempt，避免旧取消消息影响新派发。
+
 `task.assign.payload`：
 
 Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会在接收任务和真正执行前各做一次本地校验；服务器端校验成功不替代本地校验。
@@ -91,6 +111,8 @@ Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会�
     "acceptance": ["verifiable condition"]
   },
   "execution": { "model": "configured-model-a", "reasoningEffort": "medium" },
+  "attemptId": "unique-attempt-uuid",
+  "lease": { "expiresAt": "2026-09-12T00:00:30.000Z", "ttlMs": 30000 },
   "taskSpec": {
     "inputs": ["input.txt"],
     "expected_outputs": ["artifact.txt"],
@@ -98,6 +120,10 @@ Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会�
       "project_workspace": true,
       "terminal": true,
       "browser": false
+    },
+    "execution_policy": {
+      "side_effects": "none",
+      "on_lease_expiry": "retry"
     }
   }
 }
@@ -107,6 +133,7 @@ Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会�
 
 ```json
 {
+  "attemptId": "unique-attempt-uuid",
   "output": "agent output",
   "role": "executor",
   "model": "configured-model-a",
@@ -137,6 +164,7 @@ Worker 至少在 `ACCEPTED / RUNNING / COMPLETED / FAILED / CANCELLED / REJECTED
 
 ```json
 {
+  "attemptId": "unique-attempt-uuid",
   "error": { "name": "Error", "message": "safe message" },
   "cancelled": false,
   "sessionId": "optional session id",
@@ -177,12 +205,15 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - 时间一律为 UTC ISO-8601；顺序以任务关系和消息 ID 为准，不能依赖四台机器的时钟完全一致。
 - prompt/output 是否进入 Hub 日志由部署配置决定；认证 token 永远不得写日志。Token 数量属于可审计用量指标，可以记录；不得把它与认证凭据混淆。
 
-## HTTP control plane in the mock
+`task.started`、`task.rejected` 和 `approval.request` 也必须在 payload 中回传当前 `attemptId`。未协商 `attempt-lease-v1` 的旧版本地模式保持 v1 原有行为。
+
+## HTTP control plane
 
 - `GET /health`
 - `GET /v1/agents`
 - `GET /v1/events?limit=N`
 - `GET /v1/tasks?rootTaskId=UUID`
+- `GET /v1/attempts?taskId=UUID`
 - `GET /v1/conversations`
 - `GET /v1/messages?rootTaskId=UUID`
 - `GET /v1/usage`
@@ -191,4 +222,4 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - `POST /v1/tasks`
 - `POST /v1/commands`
 
-正式服务器可以使用其他控制台或数据库，但 WebSocket envelope 应保持兼容。
+开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL，并保持相同的 HTTP 与 WebSocket 契约。

@@ -14,6 +14,11 @@ export class EventLog {
     if (this.file) await mkdir(path.dirname(this.file), { recursive: true });
   }
 
+  restore(events = []) {
+    this.events = Array.isArray(events) ? structuredClone(events).slice(-this.maxMemoryEvents) : [];
+    this.sequence = this.events.reduce((maximum, event) => Math.max(maximum, Number(event?.seq ?? 0)), 0);
+  }
+
   async record(type, details = {}) {
     const event = {
       seq: ++this.sequence,

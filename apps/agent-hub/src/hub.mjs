@@ -2,15 +2,20 @@ import http from "node:http";
 import https from "node:https";
 import { readFile } from "node:fs/promises";
 import { randomUUID, timingSafeEqual } from "node:crypto";
-import { WebSocketServer, WebSocket } from "ws";
 import { EventLog } from "./event-log.mjs";
+import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
 import { addUsage, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
+const ACTIVE_SLOT_STATUSES = new Set(["dispatched", "running", "processing_result"]);
+const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "rejected"]);
+const ACTIVE_ATTEMPT_STATUSES = new Set(["assigned", "running"]);
+const RELIABLE_WORKER_MESSAGES = new Set(["task.started", "task.result", "task.error", "task.rejected", "approval.request"]);
+const LEASE_PROTOCOL_FEATURE = "attempt-lease-v1";
 
 export class AgentHub {
-  constructor(config) {
+  constructor(config, services = {}) {
     this.config = config;
     this.host = config.host ?? "127.0.0.1";
     this.port = Number(config.port ?? 8787);
@@ -22,6 +27,16 @@ export class AgentHub {
     this.messageSeq = 0;
     this.usageTotals = null;
     this.pendingDeliveries = new Map();
+    this.attempts = new Map();
+    this.processedInbound = new Set();
+    this.store = services.store ?? new MemoryHubStore();
+    this.webSocketModule = services.webSocketModule ?? null;
+    this.WebSocket = null;
+    this.persistenceReady = false;
+    this.storageFault = null;
+    this.dirty = createDirtyState();
+    this.pendingEventWrites = [];
+    this.commitChain = Promise.resolve();
     this.log = new EventLog({
       file: config.logs?.file,
       includePayloads: config.logs?.includePayloads !== false,
@@ -29,11 +44,163 @@ export class AgentHub {
     this.server = null;
     this.wss = null;
     this.retryTimer = null;
+    this.leaseTimer = null;
+    this.stopping = false;
+  }
+
+  async restorePersistedState() {
+    const state = await this.store.load();
+    this.tasks = new Map((state.tasks ?? []).map((task) => [task.taskId, task]));
+    const maximumMessages = Number(this.config.messages?.maxInMemory ?? 5000);
+    this.messages = (state.messages ?? []).sort((a, b) => Number(a.seq ?? 0) - Number(b.seq ?? 0)).slice(-maximumMessages);
+    this.messageSeq = Math.max(
+      Number(state.metadata?.messageSeq ?? 0),
+      ...this.messages.map((message) => Number(message.seq ?? 0)),
+      0,
+    );
+    this.usageTotals = state.metadata?.usageTotals ?? null;
+    this.pendingDeliveries = new Map((state.deliveries ?? []).map((delivery) => {
+      const restored = { ...delivery, sentAt: 0, attempts: 0 };
+      return [deliveryKey(restored.agentId, restored.envelope.id), restored];
+    }));
+    this.attempts = new Map((state.attempts ?? []).map((attempt) => [attempt.attemptId, attempt]));
+    this.processedInbound = new Set((state.inboundMessages ?? []).map((message) => message.messageId));
+    this.log.restore(state.auditEvents ?? []);
+
+    this.agents = new Map((state.agents ?? []).map((agent) => {
+      const restored = {
+        ...agent,
+        status: "offline",
+        busy: false,
+        currentTaskId: null,
+        activeTaskCount: 0,
+      };
+      this.markAgent(restored);
+      return [restored.agentId, restored];
+    }));
+  }
+
+  leasesEnabled() {
+    return this.config.leases?.enabled === true;
+  }
+
+  leaseTtlMs() {
+    return Math.max(1000, Number(this.config.leases?.ttlMs ?? 30_000));
+  }
+
+  leaseScanIntervalMs() {
+    return Math.max(250, Number(this.config.leases?.scanIntervalMs ?? 5_000));
+  }
+
+  leaseMaxRecoveryAttempts() {
+    return Math.max(0, Number(this.config.leases?.maxRecoveryAttempts ?? 3));
+  }
+
+  markTask(task, guard) {
+    if (!task?.taskId) return;
+    this.dirty.tasks.set(task.taskId, task);
+    if (guard) this.dirty.taskGuards.set(task.taskId, guard);
+  }
+
+  markAgent(agent) {
+    if (agent?.agentId) this.dirty.agents.set(agent.agentId, agent);
+  }
+
+  markAttempt(attempt) {
+    if (attempt?.attemptId) this.dirty.attempts.set(attempt.attemptId, attempt);
+  }
+
+  markDelivery(delivery) {
+    const key = deliveryKey(delivery.agentId, delivery.envelope.id);
+    this.dirty.deletedDeliveries.delete(key);
+    this.dirty.deliveries.set(key, delivery);
+  }
+
+  markDeliveryDeleted(agentId, messageId) {
+    const key = deliveryKey(agentId, messageId);
+    this.dirty.deliveries.delete(key);
+    this.dirty.deletedDeliveries.set(key, { agentId, messageId });
+  }
+
+  markInbound(agentId, message) {
+    const record = {
+      messageId: message.id,
+      agentId,
+      type: message.type,
+      taskId: message.taskId ?? null,
+      receivedAt: new Date().toISOString(),
+    };
+    this.processedInbound.add(message.id);
+    this.dirty.inboundMessages.set(message.id, record);
+  }
+
+  async recordEvent(type, details = {}) {
+    const event = await this.log.record(type, details);
+    this.dirty.auditEvents.set(event.seq, event);
+    return event;
+  }
+
+  queueEvent(type, details = {}) {
+    const pending = this.recordEvent(type, details);
+    pending.catch(() => {});
+    this.pendingEventWrites.push(pending);
+  }
+
+  async flushState() {
+    if (!this.persistenceReady) return;
+    if (this.storageFault) throw this.storageFault;
+    const operation = this.commitChain.then(async () => {
+      while (this.pendingEventWrites.length > 0) {
+        const writes = this.pendingEventWrites.splice(0);
+        await Promise.all(writes);
+      }
+      while (hasDirtyState(this.dirty)) {
+        const changes = takeDirtyState(this);
+        try {
+          await this.store.commit(changes);
+        } catch (error) {
+          mergeDirtyState(this.dirty, changes);
+          throw error;
+        }
+      }
+    });
+    this.commitChain = operation.catch(() => {});
+    try {
+      await operation;
+    } catch (error) {
+      this.storageFault = Object.assign(new Error(`Hub persistence failed: ${error.message}`), { cause: error });
+      throw this.storageFault;
+    }
+  }
+
+  async commitAndDispatch() {
+    await this.flushState();
+    this.flushNewDeliveries();
+  }
+
+  flushNewDeliveries() {
+    for (const delivery of this.pendingDeliveries.values()) {
+      if (!delivery.sentAt) this.sendDelivery(delivery);
+    }
+  }
+
+  async handleBackgroundError(type, error) {
+    console.error(`[hub] ${type}: ${error.message}`);
+    if (this.storageFault) return;
+    try {
+      await this.recordEvent(type, { error: safeError(error) });
+      await this.flushState();
+    } catch {}
   }
 
   async start() {
     this.validateSecurity();
+    const webSocketModule = this.webSocketModule ?? await import("ws");
+    this.WebSocket = webSocketModule.WebSocket;
     await this.log.init();
+    await this.store.init();
+    this.persistenceReady = true;
+    await this.restorePersistedState();
     const requestHandler = this.handleHttp.bind(this);
     if (this.config.tls?.enabled) {
       const [key, cert] = await Promise.all([
@@ -45,7 +212,7 @@ export class AgentHub {
       this.server = http.createServer(requestHandler);
     }
 
-    this.wss = new WebSocketServer({ noServer: true });
+    this.wss = new webSocketModule.WebSocketServer({ noServer: true });
     this.server.on("upgrade", (request, socket, head) => {
       const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
       if (url.pathname !== "/worker" || !this.authorized(request.headers.authorization)) {
@@ -67,7 +234,15 @@ export class AgentHub {
     if (typeof address === "object" && address) this.port = address.port;
     this.retryTimer = setInterval(() => this.retryDeliveries(), 1000);
     this.retryTimer.unref();
-    await this.log.record("hub.started", { host: this.host, port: this.port, tls: Boolean(this.config.tls?.enabled) });
+    if (this.leasesEnabled()) {
+      this.leaseTimer = setInterval(() => {
+        void this.reapExpiredLeases().catch((error) => this.handleBackgroundError("lease.reaper_error", error));
+      }, this.leaseScanIntervalMs());
+      this.leaseTimer.unref();
+      await this.reapExpiredLeases();
+    }
+    await this.recordEvent("hub.started", { host: this.host, port: this.port, tls: Boolean(this.config.tls?.enabled) });
+    await this.flushState();
     return this;
   }
 
@@ -87,11 +262,24 @@ export class AgentHub {
   }
 
   async stop() {
+    this.stopping = true;
     if (this.retryTimer) clearInterval(this.retryTimer);
+    if (this.leaseTimer) clearInterval(this.leaseTimer);
+    for (const agent of this.agents.values()) {
+      if (agent.status !== "offline") {
+        agent.status = "offline";
+        agent.busy = false;
+        agent.currentTaskId = null;
+        agent.disconnectedAt = new Date().toISOString();
+        this.markAgent(agent);
+      }
+    }
+    await this.recordEvent("hub.stopped");
+    await this.flushState();
     for (const ws of this.connections.values()) ws.close(1001, "Hub stopping");
     await new Promise((resolve) => this.wss?.close(() => resolve()));
     await new Promise((resolve) => this.server?.close(() => resolve()));
-    await this.log.record("hub.stopped");
+    await this.store.close();
   }
 
   authorized(header) {
@@ -107,6 +295,7 @@ export class AgentHub {
     const helloDeadline = setTimeout(() => ws.close(1008, "worker.hello required"), 5000);
     ws.on("message", async (raw) => {
       try {
+        if (this.storageFault) throw this.storageFault;
         const message = parseEnvelope(raw);
         if (!registeredAgentId) {
           if (message.type !== "worker.hello" || !message.agentId) throw new Error("First message must be worker.hello with agentId");
@@ -115,11 +304,15 @@ export class AgentHub {
           const existing = this.connections.get(registeredAgentId);
           if (existing && existing !== ws) existing.close(4001, "Replaced by newer connection");
           this.connections.set(registeredAgentId, ws);
-          this.agents.set(registeredAgentId, {
+          const previous = this.agents.get(registeredAgentId);
+          const now = new Date().toISOString();
+          const agent = {
+            ...previous,
             agentId: registeredAgentId,
             status: "online",
             paused: Boolean(message.payload?.paused),
             capabilities: message.payload?.capabilities ?? [],
+            protocolFeatures: Array.isArray(message.payload?.protocolFeatures) ? message.payload.protocolFeatures.map(String) : [],
             adapter: message.payload?.adapter,
             sessionId: message.payload?.sessionId,
             observedCapabilities: message.payload?.observedCapabilities,
@@ -129,38 +322,60 @@ export class AgentHub {
             roles: normalizeRoles(message.payload?.roles),
             models: normalizeModels(message.payload?.models, { model: message.payload?.model }),
             maxConcurrency: Number(message.payload?.maxConcurrency ?? 1),
-            activeTaskCount: [...this.tasks.values()].filter((task) => task.targetAgentId === registeredAgentId && ACTIVE_TASK_STATUSES.has(task.status)).length,
+            activeTaskCount: [...this.tasks.values()].filter((task) => task.activeSlotAgentId === registeredAgentId && ACTIVE_SLOT_STATUSES.has(task.status)).length,
             usageTotals: message.payload?.usageTotals ?? null,
             quotaSnapshot: normalizeQuotaSnapshot(message.payload?.quotaSnapshot),
             quotaProbeError: message.payload?.quotaProbeError ?? null,
-            connectedAt: new Date().toISOString(),
-            lastSeenAt: new Date().toISOString(),
-          });
-          await this.log.record("worker.online", this.agents.get(registeredAgentId));
-          ws.send(JSON.stringify(makeEnvelope("hub.welcome", { agentId: registeredAgentId, replyTo: message.id, payload: { heartbeatMs: this.config.heartbeatMs ?? 10000 } })));
-          this.flushAgentDeliveries(registeredAgentId);
+            connectedAt: previous?.connectedAt ?? now,
+            reconnectedAt: previous ? now : undefined,
+            lastSeenAt: now,
+          };
+          this.agents.set(registeredAgentId, agent);
+          this.markAgent(agent);
+          await this.recordEvent("worker.online", agent);
           for (const task of this.tasks.values()) {
             if (task.status === "queued" && (!task.targetAgentId || task.targetAgentId === registeredAgentId)) {
               await this.queueOrDispatch(task);
             }
           }
+          await this.flushState();
+          ws.send(JSON.stringify(makeEnvelope("hub.welcome", {
+            agentId: registeredAgentId,
+            replyTo: message.id,
+            payload: {
+              heartbeatMs: this.config.heartbeatMs ?? 10000,
+              protocolFeatures: this.leasesEnabled() ? [LEASE_PROTOCOL_FEATURE] : [],
+              ...(this.leasesEnabled() ? {
+                leaseTtlMs: this.leaseTtlMs(),
+                lease: { feature: LEASE_PROTOCOL_FEATURE, ttlMs: this.leaseTtlMs() },
+              } : {}),
+            },
+          })));
+          this.flushAgentDeliveries(registeredAgentId, true);
           return;
         }
         if (message.agentId && message.agentId !== registeredAgentId) throw new Error("agentId cannot change on an active connection");
         await this.handleWorkerMessage(registeredAgentId, message);
       } catch (error) {
-        await this.log.record("worker.protocol_error", { agentId: registeredAgentId, error: safeError(error) });
-        ws.close(1008, "Protocol error");
+        try {
+          await this.recordEvent("worker.protocol_error", { agentId: registeredAgentId, error: safeError(error) });
+          await this.flushState();
+        } catch {}
+        ws.close(this.storageFault ? 1011 : 1008, this.storageFault ? "Hub persistence unavailable" : "Protocol error");
       }
     });
     ws.on("close", async () => {
       clearTimeout(helloDeadline);
       if (!registeredAgentId || this.connections.get(registeredAgentId) !== ws) return;
       this.connections.delete(registeredAgentId);
+      if (this.stopping) return;
       const agent = this.agents.get(registeredAgentId);
       if (agent) {
         agent.status = "offline";
+        agent.busy = false;
+        agent.currentTaskId = null;
         agent.disconnectedAt = new Date().toISOString();
+        this.markAgent(agent);
       }
       for (const delivery of this.pendingDeliveries.values()) {
         if (delivery.agentId === registeredAgentId) {
@@ -168,14 +383,26 @@ export class AgentHub {
           delivery.attempts = 0;
         }
       }
-      await this.log.record("worker.offline", { agentId: registeredAgentId });
+      try {
+        await this.recordEvent("worker.offline", { agentId: registeredAgentId });
+        await this.flushState();
+      } catch (error) {
+        await this.handleBackgroundError("worker.offline_persist_error", error);
+      }
     });
   }
 
   async handleWorkerMessage(agentId, message) {
+    const reliable = RELIABLE_WORKER_MESSAGES.has(message.type);
+    if (reliable && this.processedInbound.has(message.id)) {
+      this.sendAck(agentId, message.id);
+      return;
+    }
     const agent = this.agents.get(agentId);
-    if (agent) agent.lastSeenAt = new Date().toISOString();
-    if (agent && message.payload?.executor) agent.executors = [message.payload.executor];
+    if (agent) {
+      agent.lastSeenAt = new Date().toISOString();
+      if (message.payload?.executor) agent.executors = [message.payload.executor];
+    }
     if (message.type === "worker.heartbeat") {
       if (agent) {
         agent.sessionId = message.payload?.sessionId ?? agent.sessionId;
@@ -187,48 +414,72 @@ export class AgentHub {
         agent.usageTotals = message.payload?.usageTotals ?? agent.usageTotals;
         agent.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot) ?? agent.quotaSnapshot;
         agent.quotaProbeError = message.payload?.quotaProbeError ?? agent.quotaProbeError;
+        this.markAgent(agent);
       }
+      this.renewLeaseFromHeartbeat(agentId, message);
+      await this.flushState();
       return;
     }
     if (message.type === "ack") {
-      this.pendingDeliveries.delete(`${agentId}:${message.replyTo}`);
+      const key = deliveryKey(agentId, message.replyTo);
+      if (this.pendingDeliveries.delete(key)) this.markDeliveryDeleted(agentId, message.replyTo);
+      await this.flushState();
       return;
     }
-    if (["task.started", "task.result", "task.error", "task.rejected", "approval.request"].includes(message.type)) {
-      this.sendAck(agentId, message.id);
-    }
     const task = message.taskId ? this.tasks.get(message.taskId) : undefined;
+    if (reliable && task && this.isStaleAttemptMessage(task, agentId, message)) {
+      await this.recordLateAttemptMessage(task, agentId, message);
+      this.markInbound(agentId, message);
+      await this.flushState();
+      this.sendAck(agentId, message.id);
+      return;
+    }
     if (message.type === "task.started" && task) {
       task.status = "running";
       task.startedAt = new Date().toISOString();
       task.checkpoint = message.payload?.checkpoint;
+      const attempt = this.currentAttempt(task);
+      if (attempt) {
+        attempt.status = "running";
+        attempt.startedAt = task.startedAt;
+        attempt.lastHeartbeatAt = task.startedAt;
+        attempt.leaseExpiresAt = new Date(Date.now() + this.leaseTtlMs()).toISOString();
+        this.markAttempt(attempt);
+      }
       this.addMessage(task, {
         senderId: agentId,
         senderRole: task.role,
         kind: "status",
         text: `开始执行：${task.taskSpec?.title ?? task.input.slice(0, 80)}`,
       });
-      await this.log.record("task.started", { taskId: task.taskId, agentId, checkpoint: task.checkpoint });
-      return;
-    }
-    if (message.type === "approval.request" && task) {
+      this.markTask(task, this.taskAttemptGuard(message));
+      await this.recordEvent("task.started", { taskId: task.taskId, agentId, attemptId: attempt?.attemptId, checkpoint: task.checkpoint });
+    } else if (message.type === "approval.request" && task) {
       task.status = "awaiting_approval";
       task.approval = message.payload;
-      await this.log.record("approval.requested", { taskId: task.taskId, agentId, approval: message.payload });
-      return;
-    }
-    if (message.type === "task.rejected" && task) {
+      const attempt = this.currentAttempt(task);
+      if (attempt) {
+        attempt.status = "awaiting_approval";
+        attempt.completedAt = new Date().toISOString();
+        this.markAttempt(attempt);
+      }
+      this.finishTaskActivity(task);
+      this.markTask(task, this.taskAttemptGuard(message));
+      await this.recordEvent("approval.requested", { taskId: task.taskId, agentId, attemptId: attempt?.attemptId, approval: message.payload });
+    } else if (message.type === "task.rejected" && task) {
       task.status = "rejected";
       task.completedAt = new Date().toISOString();
       task.error = { name: "PolicyDeniedError", code: message.payload?.code, reasons: message.payload?.reasons ?? [] };
       task.checkpoint = message.payload?.checkpoint;
+      this.completeAttempt(task, "rejected", message);
       this.finishTaskActivity(task);
-      await this.log.record("task.rejected", { taskId: task.taskId, agentId, payload: message.payload });
+      this.markTask(task, this.taskAttemptGuard(message));
+      await this.recordEvent("task.rejected", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, payload: message.payload });
       await this.retryQueuedTasks();
-      return;
-    }
-    if ((message.type === "task.result" || message.type === "task.error") && task) {
-      if (["completed", "failed", "cancelled", "rejected"].includes(task.status)) return;
+    } else if ((message.type === "task.result" || message.type === "task.error") && task) {
+      if (TERMINAL_TASK_STATUSES.has(task.status)) {
+        await this.recordLateAttemptMessage(task, agentId, message);
+      } else {
       const terminalStatus = message.type === "task.result" ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
       task.status = "processing_result";
       task.completedAt = new Date().toISOString();
@@ -241,11 +492,17 @@ export class AgentHub {
       task.usage = message.payload?.usage ?? null;
       task.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot);
       task.submission = message.payload?.submission ?? parseRoleSubmission(task.role, task.output);
-      if (task.usage) this.usageTotals = addUsage(this.usageTotals, task.usage);
+      this.markTask(task, this.taskAttemptGuard(message));
+      if (task.usage) {
+        this.usageTotals = addUsage(this.usageTotals, task.usage);
+        this.dirty.metadata = true;
+      }
       const agentRecord = this.agents.get(agentId);
       if (agentRecord && message.payload?.usageTotals) agentRecord.usageTotals = message.payload.usageTotals;
       if (agentRecord && task.quotaSnapshot) agentRecord.quotaSnapshot = task.quotaSnapshot;
-      await this.log.record(message.type, { taskId: task.taskId, agentId, payload: message.payload });
+      if (agentRecord) this.markAgent(agentRecord);
+      this.completeAttempt(task, terminalStatus, message);
+      await this.recordEvent(message.type, { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, payload: message.payload });
       if (message.type === "task.result") {
         this.recordResultMessage(task);
       }
@@ -269,19 +526,100 @@ export class AgentHub {
         task.status = "failed";
         task.error = { name: "WorkflowAdvanceError", message: String(error?.message ?? error) };
         this.finishTaskActivity(task);
-        await this.log.record("workflow.advance_error", { taskId: task.taskId, error: safeError(error) });
+        this.markTask(task);
+        await this.recordEvent("workflow.advance_error", { taskId: task.taskId, error: safeError(error) });
         await this.retryQueuedTasks();
-        return;
       }
-      task.status = terminalStatus;
-      this.finishTaskActivity(task);
-      await this.retryQueuedTasks();
+      if (task.status === "processing_result") {
+        task.status = terminalStatus;
+        this.finishTaskActivity(task);
+        this.markTask(task);
+        await this.retryQueuedTasks();
+      }
+      }
+    } else if (reliable && !task) {
+      await this.recordEvent("worker.unknown_task_message", { agentId, messageId: message.id, taskId: message.taskId, type: message.type });
     }
+
+    if (reliable) this.markInbound(agentId, message);
+    await this.commitAndDispatch();
+    if (reliable) this.sendAck(agentId, message.id);
+  }
+
+  currentAttempt(task) {
+    return task?.currentAttemptId ? this.attempts.get(task.currentAttemptId) : undefined;
+  }
+
+  taskAttemptGuard(message) {
+    if (!this.leasesEnabled()) return undefined;
+    return {
+      currentAttemptId: message.payload?.attemptId,
+      allowedStatuses: ["dispatched", "running", "processing_result"],
+    };
+  }
+
+  isStaleAttemptMessage(task, agentId, message) {
+    if (!this.leasesEnabled()) return false;
+    const attemptId = message.payload?.attemptId;
+    const attempt = attemptId ? this.attempts.get(attemptId) : undefined;
+    return !attemptId
+      || attemptId !== task.currentAttemptId
+      || !attempt
+      || attempt.workerId !== agentId
+      || !ACTIVE_ATTEMPT_STATUSES.has(attempt.status);
+  }
+
+  async recordLateAttemptMessage(task, agentId, message) {
+    const attemptId = message.payload?.attemptId;
+    const attempt = attemptId ? this.attempts.get(attemptId) : undefined;
+    if (attempt) {
+      attempt.lateResultCount = Number(attempt.lateResultCount ?? 0) + 1;
+      attempt.lastLateResult = {
+        messageId: message.id,
+        type: message.type,
+        receivedAt: new Date().toISOString(),
+        hasOutput: typeof message.payload?.output === "string",
+        error: message.payload?.error ? safeError(message.payload.error) : null,
+      };
+      this.markAttempt(attempt);
+    }
+    await this.recordEvent("task.late_attempt_message", {
+      taskId: task.taskId,
+      currentAttemptId: task.currentAttemptId ?? null,
+      receivedAttemptId: attemptId ?? null,
+      agentId,
+      messageId: message.id,
+      type: message.type,
+    });
+  }
+
+  completeAttempt(task, status, message) {
+    const attempt = this.currentAttempt(task);
+    if (!attempt) return;
+    attempt.status = status;
+    attempt.completedAt = new Date().toISOString();
+    attempt.resultMessageId = message.id;
+    this.markAttempt(attempt);
+  }
+
+  renewLeaseFromHeartbeat(agentId, message) {
+    if (!this.leasesEnabled()) return;
+    const taskId = message.payload?.currentTaskId;
+    const attemptId = message.payload?.currentAttemptId;
+    if (!taskId || !attemptId) return;
+    const task = this.tasks.get(taskId);
+    const attempt = this.attempts.get(attemptId);
+    if (!task || task.currentAttemptId !== attemptId || !attempt || attempt.workerId !== agentId || !ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) return;
+    const now = new Date().toISOString();
+    attempt.lastHeartbeatAt = now;
+    attempt.leaseExpiresAt = new Date(Date.now() + this.leaseTtlMs()).toISOString();
+    this.markAttempt(attempt);
   }
 
   sendAck(agentId, replyTo) {
     const ws = this.connections.get(agentId);
-    if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(makeEnvelope("ack", { agentId, replyTo })));
+    const openState = this.WebSocket?.OPEN ?? 1;
+    if (ws?.readyState === openState) ws.send(JSON.stringify(makeEnvelope("ack", { agentId, replyTo })));
   }
 
   createTask(input) {
@@ -293,6 +631,7 @@ export class AgentHub {
       rootTaskId,
       parentTaskId: input.parentTaskId,
       targetAgentId: input.targetAgentId ?? null,
+      requestedAgentId: input.requestedAgentId ?? input.targetAgentId ?? null,
       sourceAgentId: input.sourceAgentId ?? "human",
       input: String(input.input ?? ""),
       route: Array.isArray(input.route) ? input.route : [],
@@ -307,11 +646,15 @@ export class AgentHub {
       modelPreference: input.modelPreference ?? input.model ?? null,
       reasoningEffort: input.reasoningEffort ?? null,
       reviewCycle: Number(input.reviewCycle ?? 0),
+      attemptNumber: Number(input.attemptNumber ?? 0),
+      currentAttemptId: input.currentAttemptId ?? null,
+      recoveryCount: Number(input.recoveryCount ?? 0),
       requiresApproval: Boolean(input.requiresApproval),
       status: input.requiresApproval ? "awaiting_approval" : "queued",
       createdAt: new Date().toISOString(),
     };
     this.tasks.set(taskId, task);
+    this.markTask(task);
     const sourceRole = task.sourceAgentId === "human"
       ? "human"
       : input.sourceRole ?? this.tasks.get(task.parentTaskId)?.role ?? "agent";
@@ -322,7 +665,7 @@ export class AgentHub {
       text: task.input,
       mentions: task.targetAgentId ? [task.targetAgentId] : task.role ? [`@${task.role}`] : [],
     });
-    void this.log.record("task.created", task);
+    this.queueEvent("task.created", task);
     return task;
   }
 
@@ -381,6 +724,8 @@ export class AgentHub {
     };
     this.messages.push(message);
     if (this.messages.length > Number(this.config.messages?.maxInMemory ?? 5000)) this.messages.shift();
+    this.dirty.messages.set(message.messageId, message);
+    this.dirty.metadata = true;
     return message;
   }
 
@@ -487,6 +832,7 @@ export class AgentHub {
       });
       task.reviewStatus = "pending";
       task.reviewTaskId = reviewer.taskId;
+      this.markTask(task);
       await this.queueOrDispatch(reviewer);
       return;
     }
@@ -498,6 +844,7 @@ export class AgentHub {
     reviewed.reviewStatus = verdict;
     reviewed.reviewedAt = new Date().toISOString();
     reviewed.reviewBrief = submission.brief;
+    this.markTask(reviewed);
 
     if (verdict === "approved") {
       await this.createPlannerIntake(task, reviewed, "result_intake", {
@@ -594,6 +941,7 @@ export class AgentHub {
       requestedBy: task.targetAgentId,
       requestedAt: new Date().toISOString(),
     };
+    this.markTask(root);
     this.addMessage(task, {
       senderId: task.targetAgentId,
       senderRole: task.role,
@@ -630,7 +978,10 @@ export class AgentHub {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
     let selection;
     try {
-      selection = chooseAgent(this.agents, {
+      const candidates = this.leasesEnabled()
+        ? new Map([...this.agents].filter(([, agent]) => agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE)))
+        : this.agents;
+      selection = chooseAgent(candidates, {
         targetAgentId: task.targetAgentId,
         role: task.role,
         requiredCapabilities: task.requiredCapabilities,
@@ -639,7 +990,8 @@ export class AgentHub {
     } catch (error) {
       task.status = "queued";
       task.schedulingError = error.message;
-      await this.log.record("task.queued_no_candidate", { taskId: task.taskId, agentId: task.targetAgentId, error: error.message });
+      this.markTask(task);
+      await this.recordEvent("task.queued_no_candidate", { taskId: task.taskId, agentId: task.targetAgentId, error: error.message });
       return;
     }
     const agent = selection.agent;
@@ -653,7 +1005,8 @@ export class AgentHub {
     task.schedulingError = null;
     if (agent?.paused) {
       task.status = "queued";
-      await this.log.record("task.queued_paused", { taskId: task.taskId, agentId: task.targetAgentId });
+      this.markTask(task);
+      await this.recordEvent("task.queued_paused", { taskId: task.taskId, agentId: task.targetAgentId });
       return;
     }
     task.status = "dispatched";
@@ -661,8 +1014,27 @@ export class AgentHub {
     if (!task.activeSlotAgentId) {
       task.activeSlotAgentId = agent.agentId;
       agent.activeTaskCount = Number(agent.activeTaskCount ?? 0) + 1;
+      this.markAgent(agent);
     }
-    this.deliver(task.targetAgentId, makeEnvelope("task.assign", {
+    let attempt;
+    if (this.leasesEnabled()) {
+      const attemptId = randomUUID();
+      task.attemptNumber = Number(task.attemptNumber ?? 0) + 1;
+      task.currentAttemptId = attemptId;
+      attempt = {
+        attemptId,
+        taskId: task.taskId,
+        attemptNumber: task.attemptNumber,
+        workerId: agent.agentId,
+        status: "assigned",
+        createdAt: new Date().toISOString(),
+        assignedAt: new Date().toISOString(),
+        leaseExpiresAt: new Date(Date.now() + this.leaseTtlMs()).toISOString(),
+        lastHeartbeatAt: null,
+      };
+      this.attempts.set(attemptId, attempt);
+    }
+    const assignment = makeEnvelope("task.assign", {
       agentId: task.targetAgentId,
       taskId: task.taskId,
       payload: {
@@ -677,16 +1049,38 @@ export class AgentHub {
         contextBundle: task.contextBundle,
         sessionScopeId: task.sessionScopeId,
         execution: task.execution,
+        ...(attempt ? {
+          attemptId: attempt.attemptId,
+          lease: {
+            expiresAt: attempt.leaseExpiresAt,
+            ttlMs: this.leaseTtlMs(),
+          },
+        } : {}),
       },
-    }));
-    await this.log.record("task.dispatched", { taskId: task.taskId, agentId: task.targetAgentId });
+    });
+    if (attempt) {
+      attempt.assignmentMessageId = assignment.id;
+      this.markAttempt(attempt);
+    }
+    this.markTask(task);
+    this.deliver(task.targetAgentId, assignment);
+    await this.recordEvent("task.dispatched", {
+      taskId: task.taskId,
+      agentId: task.targetAgentId,
+      attemptId: attempt?.attemptId ?? null,
+      leaseExpiresAt: attempt?.leaseExpiresAt ?? null,
+    });
   }
 
   finishTaskActivity(task) {
     if (!task.activeSlotAgentId) return;
     const agent = this.agents.get(task.activeSlotAgentId);
-    if (agent) agent.activeTaskCount = Math.max(0, Number(agent.activeTaskCount ?? 0) - 1);
+    if (agent) {
+      agent.activeTaskCount = Math.max(0, Number(agent.activeTaskCount ?? 0) - 1);
+      this.markAgent(agent);
+    }
     task.activeSlotAgentId = null;
+    this.markTask(task);
   }
 
   async retryQueuedTasks() {
@@ -696,24 +1090,26 @@ export class AgentHub {
   }
 
   deliver(agentId, envelope) {
-    const key = `${agentId}:${envelope.id}`;
+    const key = deliveryKey(agentId, envelope.id);
     if (!this.pendingDeliveries.has(key)) {
-      this.pendingDeliveries.set(key, { agentId, envelope, attempts: 0, sentAt: 0 });
+      const delivery = { agentId, envelope, attempts: 0, sentAt: 0, createdAt: new Date().toISOString() };
+      this.pendingDeliveries.set(key, delivery);
+      this.markDelivery(delivery);
     }
-    this.sendDelivery(this.pendingDeliveries.get(key));
   }
 
   sendDelivery(delivery) {
     const ws = this.connections.get(delivery.agentId);
-    if (ws?.readyState !== WebSocket.OPEN) return;
+    const openState = this.WebSocket?.OPEN ?? 1;
+    if (!ws || ws.readyState !== openState) return;
     ws.send(JSON.stringify(delivery.envelope));
     delivery.sentAt = Date.now();
     delivery.attempts += 1;
   }
 
-  flushAgentDeliveries(agentId) {
+  flushAgentDeliveries(agentId, force = false) {
     for (const delivery of this.pendingDeliveries.values()) {
-      if (delivery.agentId === agentId) this.sendDelivery(delivery);
+      if (delivery.agentId === agentId && (force || !delivery.sentAt)) this.sendDelivery(delivery);
     }
   }
 
@@ -721,18 +1117,119 @@ export class AgentHub {
     const timeout = Number(this.config.delivery?.ackTimeoutMs ?? 5000);
     const maxAttempts = Number(this.config.delivery?.maxAttemptsPerConnection ?? 5);
     for (const delivery of this.pendingDeliveries.values()) {
-      if (!delivery.sentAt || Date.now() - delivery.sentAt < timeout) continue;
+      if (!delivery.sentAt) {
+        this.sendDelivery(delivery);
+        continue;
+      }
+      if (Date.now() - delivery.sentAt < timeout) continue;
       if (delivery.attempts >= maxAttempts) continue;
       this.sendDelivery(delivery);
     }
+  }
+
+  async reapExpiredLeases(nowMs = Date.now()) {
+    if (!this.leasesEnabled() || this.storageFault) return;
+    let changed = false;
+    for (const attempt of this.attempts.values()) {
+      if (!ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) continue;
+      if (Date.parse(attempt.leaseExpiresAt) > nowMs) continue;
+      const task = this.tasks.get(attempt.taskId);
+      attempt.status = "expired";
+      attempt.expiredAt = new Date(nowMs).toISOString();
+      this.markAttempt(attempt);
+      changed = true;
+
+      if (attempt.assignmentMessageId) {
+        const key = deliveryKey(attempt.workerId, attempt.assignmentMessageId);
+        if (this.pendingDeliveries.delete(key)) this.markDeliveryDeleted(attempt.workerId, attempt.assignmentMessageId);
+      }
+      if (!task || task.currentAttemptId !== attempt.attemptId || TERMINAL_TASK_STATUSES.has(task.status)) continue;
+
+      this.finishTaskActivity(task);
+      task.recoveryCount = Number(task.recoveryCount ?? 0) + 1;
+      const retrySafe = this.canRetryExpiredTask(task);
+      const recoveryLimitExceeded = task.recoveryCount > this.leaseMaxRecoveryAttempts();
+      if (retrySafe && !recoveryLimitExceeded) {
+        task.status = "queued";
+        task.currentAttemptId = null;
+        task.targetAgentId = task.requestedAgentId ?? null;
+        task.schedulingError = null;
+        this.addMessage(task, {
+          senderId: "system",
+          senderRole: "system",
+          kind: "status",
+          text: `执行租约已过期，任务进入第 ${task.recoveryCount} 次恢复调度。`,
+        });
+        await this.recordEvent("task.lease_expired_requeued", {
+          taskId: task.taskId,
+          attemptId: attempt.attemptId,
+          workerId: attempt.workerId,
+          recoveryCount: task.recoveryCount,
+        });
+      } else {
+        task.status = "awaiting_approval";
+        task.requiresApproval = true;
+        task.approval = {
+          type: "lease_expired",
+          attemptId: attempt.attemptId,
+          workerId: attempt.workerId,
+          requestedAt: new Date(nowMs).toISOString(),
+          reason: recoveryLimitExceeded
+            ? `Automatic lease recovery limit (${this.leaseMaxRecoveryAttempts()}) reached`
+            : "Task may have external side effects or has no explicit retry-safe policy",
+        };
+        this.addMessage(task, {
+          senderId: "system",
+          senderRole: "system",
+          kind: "human_intervention",
+          text: recoveryLimitExceeded
+            ? `执行租约再次过期，已达到自动恢复上限 ${this.leaseMaxRecoveryAttempts()} 次，需要人工确认。`
+            : "执行租约已过期。该任务未声明可安全重试，需要人工确认后才能重新派发。",
+          mentions: ["human"],
+        });
+        await this.recordEvent("task.lease_expired_needs_approval", {
+          taskId: task.taskId,
+          attemptId: attempt.attemptId,
+          workerId: attempt.workerId,
+          recoveryLimitExceeded,
+        });
+      }
+      this.markTask(task);
+    }
+    if (!changed) return;
+    await this.retryQueuedTasks();
+    await this.commitAndDispatch();
+  }
+
+  canRetryExpiredTask(task) {
+    const policy = task.taskSpec?.execution_policy ?? task.taskSpec?.executionPolicy ?? {};
+    const sideEffects = String(policy.side_effects ?? policy.sideEffects ?? "unknown").toLowerCase();
+    const onExpiry = String(policy.on_lease_expiry ?? policy.onLeaseExpiry ?? "").toLowerCase();
+    if (onExpiry === "human") return false;
+    if (onExpiry === "retry") return sideEffects === "none" || sideEffects === "idempotent";
+    return sideEffects === "none" || sideEffects === "idempotent";
   }
 
   async handleHttp(request, response) {
     try {
       const url = new URL(request.url ?? "/", this.url());
       if (request.method === "GET" && url.pathname === "/health") {
-        return json(response, 200, { ok: true, protocolVersion: 1, now: new Date().toISOString() });
+        return json(response, this.storageFault ? 503 : 200, {
+          ok: !this.storageFault,
+          protocolVersion: 1,
+          now: new Date().toISOString(),
+          storage: {
+            driver: this.store.constructor.name,
+            healthy: !this.storageFault,
+            error: this.storageFault?.message ?? null,
+          },
+          leases: {
+            enabled: this.leasesEnabled(),
+            ttlMs: this.leasesEnabled() ? this.leaseTtlMs() : null,
+          },
+        });
       }
+      if (this.storageFault) return json(response, 503, { error: this.storageFault.message });
       if (!this.authorized(request.headers.authorization)) return json(response, 401, { error: "Unauthorized" });
       if (request.method === "GET" && url.pathname === "/v1/agents") {
         return json(response, 200, { agents: [...this.agents.values()] });
@@ -744,6 +1241,11 @@ export class AgentHub {
         const rootTaskId = url.searchParams.get("rootTaskId");
         const tasks = [...this.tasks.values()].filter((task) => !rootTaskId || task.rootTaskId === rootTaskId);
         return json(response, 200, { tasks, active: tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status)) });
+      }
+      if (request.method === "GET" && url.pathname === "/v1/attempts") {
+        const taskId = url.searchParams.get("taskId");
+        const attempts = [...this.attempts.values()].filter((attempt) => !taskId || attempt.taskId === taskId);
+        return json(response, 200, { attempts });
       }
       if (request.method === "GET" && url.pathname === "/v1/conversations") {
         return json(response, 200, { conversations: this.conversations() });
@@ -785,6 +1287,7 @@ export class AgentHub {
       if (request.method === "POST" && url.pathname === "/v1/workflows") {
         const body = await readBody(request);
         const task = await this.createWorkflow(body);
+        await this.commitAndDispatch();
         return json(response, 202, { task });
       }
       if (request.method === "POST" && url.pathname === "/v1/messages") {
@@ -799,6 +1302,7 @@ export class AgentHub {
           text: body.text.trim(),
           mentions: body.mentions,
         });
+        await this.flushState();
         return json(response, 201, { message });
       }
       if (request.method === "POST" && url.pathname === "/v1/tasks") {
@@ -806,16 +1310,23 @@ export class AgentHub {
         if (typeof body.input !== "string" || (!body.targetAgentId && !body.role)) return json(response, 400, { error: "string input and targetAgentId or role are required" });
         const task = this.createTask(body);
         await this.queueOrDispatch(task);
+        await this.commitAndDispatch();
         return json(response, 202, { task });
       }
       if (request.method === "POST" && url.pathname === "/v1/commands") {
         const body = await readBody(request);
         const result = await this.handleCommand(body);
+        await this.commitAndDispatch();
         return json(response, 200, result);
       }
       return json(response, 404, { error: "Not found" });
     } catch (error) {
-      await this.log.record("http.error", { error: safeError(error) });
+      if (!this.storageFault) {
+        try {
+          await this.recordEvent("http.error", { error: safeError(error) });
+          await this.flushState();
+        } catch {}
+      }
       const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
       return json(response, statusCode, { error: error.message });
     }
@@ -835,6 +1346,7 @@ export class AgentHub {
         resolvedAt: new Date().toISOString(),
         resolvedBy: command.by ?? "human",
       };
+      this.markTask(root);
       this.addMessage(root, { senderId: command.by ?? "human", senderRole: "human", kind: "human_decision", text: response });
       const planner = this.createTask({
         targetAgentId: root.workflow?.plannerAgentId,
@@ -850,7 +1362,7 @@ export class AgentHub {
         contextBundle: { objective: root.input, humanResponse: response },
       });
       await this.queueOrDispatch(planner);
-      await this.log.record("workflow.human_response", { rootTaskId: root.taskId, by: command.by ?? "human" });
+      await this.recordEvent("workflow.human_response", { rootTaskId: root.taskId, by: command.by ?? "human" });
       return { ok: true, task: planner };
     }
     if (command.type === "task.approve") {
@@ -861,19 +1373,24 @@ export class AgentHub {
       }
       task.requiresApproval = false;
       task.approval = { ...(task.approval ?? {}), approvedAt: new Date().toISOString(), approvedBy: command.by ?? "human" };
+      this.markTask(task);
       await this.queueOrDispatch(task);
+      await this.recordEvent("task.approved", { taskId: task.taskId, by: command.by ?? "human" });
       return { ok: true, task };
     }
     if (["agent.pause", "agent.resume"].includes(command.type)) {
       const agent = this.agents.get(command.targetAgentId);
-      if (agent) agent.paused = command.type === "agent.pause";
+      if (agent) {
+        agent.paused = command.type === "agent.pause";
+        this.markAgent(agent);
+      }
       this.deliver(command.targetAgentId, makeEnvelope(command.type, { agentId: command.targetAgentId }));
       if (command.type === "agent.resume") {
         for (const task of this.tasks.values()) {
           if (task.targetAgentId === command.targetAgentId && task.status === "queued") await this.queueOrDispatch(task);
         }
       }
-      await this.log.record(command.type, { agentId: command.targetAgentId });
+      await this.recordEvent(command.type, { agentId: command.targetAgentId });
       return { ok: true, agent };
     }
     if (command.type === "task.cancel") {
@@ -884,14 +1401,97 @@ export class AgentHub {
       }
       task.status = "cancelled";
       task.completedAt = new Date().toISOString();
+      const attempt = this.currentAttempt(task);
+      if (attempt && ACTIVE_ATTEMPT_STATUSES.has(attempt.status)) {
+        attempt.status = "cancelled";
+        attempt.completedAt = task.completedAt;
+        this.markAttempt(attempt);
+      }
       this.finishTaskActivity(task);
-      this.deliver(task.targetAgentId, makeEnvelope("task.cancel", { agentId: task.targetAgentId, taskId: task.taskId }));
-      await this.log.record("task.cancelled", { taskId: task.taskId, agentId: task.targetAgentId });
+      this.markTask(task);
+      if (task.targetAgentId) {
+        this.deliver(task.targetAgentId, makeEnvelope("task.cancel", {
+          agentId: task.targetAgentId,
+          taskId: task.taskId,
+          payload: { attemptId: task.currentAttemptId ?? null },
+        }));
+      }
+      await this.recordEvent("task.cancelled", { taskId: task.taskId, agentId: task.targetAgentId, attemptId: task.currentAttemptId ?? null });
       await this.retryQueuedTasks();
       return { ok: true, task };
     }
     throw httpError(400, `Unsupported command type: ${command.type}`);
   }
+}
+
+function createDirtyState() {
+  return {
+    tasks: new Map(),
+    taskGuards: new Map(),
+    messages: new Map(),
+    agents: new Map(),
+    attempts: new Map(),
+    deliveries: new Map(),
+    deletedDeliveries: new Map(),
+    inboundMessages: new Map(),
+    auditEvents: new Map(),
+    metadata: false,
+  };
+}
+
+function hasDirtyState(dirty) {
+  return dirty.metadata
+    || dirty.tasks.size > 0
+    || dirty.messages.size > 0
+    || dirty.agents.size > 0
+    || dirty.attempts.size > 0
+    || dirty.deliveries.size > 0
+    || dirty.deletedDeliveries.size > 0
+    || dirty.inboundMessages.size > 0
+    || dirty.auditEvents.size > 0;
+}
+
+function takeDirtyState(hub) {
+  const dirty = hub.dirty;
+  hub.dirty = createDirtyState();
+  return {
+    tasks: structuredClone([...dirty.tasks.values()]),
+    taskGuards: structuredClone(Object.fromEntries(dirty.taskGuards)),
+    messages: structuredClone([...dirty.messages.values()]),
+    agents: structuredClone([...dirty.agents.values()]),
+    attempts: structuredClone([...dirty.attempts.values()]),
+    deliveries: structuredClone([...dirty.deliveries.values()]),
+    deletedDeliveries: structuredClone([...dirty.deletedDeliveries.values()]),
+    inboundMessages: structuredClone([...dirty.inboundMessages.values()]),
+    auditEvents: structuredClone([...dirty.auditEvents.values()]),
+    ...(dirty.metadata ? {
+      metadata: {
+        messageSeq: hub.messageSeq,
+        usageTotals: structuredClone(hub.usageTotals),
+      },
+    } : {}),
+  };
+}
+
+function mergeDirtyState(dirty, changes) {
+  for (const task of changes.tasks ?? []) dirty.tasks.set(task.taskId, task);
+  for (const [taskId, guard] of Object.entries(changes.taskGuards ?? {})) dirty.taskGuards.set(taskId, guard);
+  for (const message of changes.messages ?? []) dirty.messages.set(message.messageId, message);
+  for (const agent of changes.agents ?? []) dirty.agents.set(agent.agentId, agent);
+  for (const attempt of changes.attempts ?? []) dirty.attempts.set(attempt.attemptId, attempt);
+  for (const delivery of changes.deliveries ?? []) dirty.deliveries.set(deliveryKey(delivery.agentId, delivery.envelope.id), delivery);
+  for (const delivery of changes.deletedDeliveries ?? []) {
+    const key = deliveryKey(delivery.agentId, delivery.messageId);
+    dirty.deliveries.delete(key);
+    dirty.deletedDeliveries.set(key, delivery);
+  }
+  for (const message of changes.inboundMessages ?? []) dirty.inboundMessages.set(message.messageId, message);
+  for (const event of changes.auditEvents ?? []) dirty.auditEvents.set(event.seq, event);
+  if (changes.metadata) dirty.metadata = true;
+}
+
+function deliveryKey(agentId, messageId) {
+  return `${agentId}:${messageId}`;
 }
 
 function httpError(statusCode, message) {

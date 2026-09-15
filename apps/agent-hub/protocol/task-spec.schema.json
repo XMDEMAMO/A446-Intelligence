@@ -13,6 +13,8 @@
     "artifacts": { "$ref": "#/$defs/pathList" },
     "permissions_required": { "$ref": "#/$defs/permissions" },
     "permissionsRequired": { "$ref": "#/$defs/permissions" },
+    "execution_policy": { "$ref": "#/$defs/executionPolicy" },
+    "executionPolicy": { "$ref": "#/$defs/executionPolicy" },
     "checkpoint_policy": { "type": "object" },
     "acceptance": { "type": "array", "items": { "type": "string" } }
   },
@@ -41,6 +43,24 @@
           { "type": "integer", "enum": [0, 1] }
         ]
       }
+    },
+    "executionPolicy": {
+      "type": "object",
+      "properties": {
+        "side_effects": { "$ref": "#/$defs/sideEffects" },
+        "sideEffects": { "$ref": "#/$defs/sideEffects" },
+        "on_lease_expiry": { "$ref": "#/$defs/onLeaseExpiry" },
+        "onLeaseExpiry": { "$ref": "#/$defs/onLeaseExpiry" }
+      },
+      "additionalProperties": false
+    },
+    "sideEffects": {
+      "type": "string",
+      "enum": ["none", "idempotent", "external", "unknown"]
+    },
+    "onLeaseExpiry": {
+      "type": "string",
+      "enum": ["retry", "human"]
     }
   }
 }

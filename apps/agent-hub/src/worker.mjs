@@ -167,6 +167,7 @@ export class AgentWorker {
           payload: {
             adapter: this.adapter.type,
             capabilities: this.config.capabilities ?? ["task.execute", "pause", "resume", "cancel"],
+            protocolFeatures: ["attempt-lease-v1"],
             sessionId: this.state.sessionId,
             paused: this.state.paused,
             platform: process.platform,
@@ -203,6 +204,7 @@ export class AgentWorker {
         observedCapabilities: this.observedCapabilities,
         executors: [this.state.executorStatus],
         currentTaskId: this.current?.taskId ?? null,
+        currentAttemptId: this.current?.payload?.attemptId ?? null,
         usageTotals: this.state.usageTotals,
         quotaSnapshot: this.quotaSnapshot,
         quotaProbeError: this.quotaProbeError,
@@ -251,8 +253,9 @@ export class AgentWorker {
         return;
       }
       if (message.type === "task.cancel") {
-        await this.removeQueuedTask(message.taskId);
-        if (this.current?.taskId === message.taskId) this.currentAbort?.abort();
+        const attemptId = message.payload?.attemptId;
+        await this.removeQueuedTask(message.taskId, attemptId);
+        if (this.current?.taskId === message.taskId && (!attemptId || this.current.payload?.attemptId === attemptId)) this.currentAbort?.abort();
         this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
       }
     } catch (error) {
@@ -277,7 +280,7 @@ export class AgentWorker {
       const rejected = makeEnvelope("task.rejected", {
         agentId: this.agentId,
         taskId: message.taskId,
-        payload: { code: error.code, reasons: error.reasons, checkpoint },
+        payload: { code: error.code, reasons: error.reasons, checkpoint, attemptId: message.payload?.attemptId ?? null },
       });
       this.state.processed[message.id] = rejected;
       trimProcessed(this.state.processed, Number(this.config.maxProcessedMessages ?? 1000));
@@ -300,10 +303,10 @@ export class AgentWorker {
     this.queue.push(message);
   }
 
-  async removeQueuedTask(taskId) {
+  async removeQueuedTask(taskId, attemptId) {
     const removed = [];
     this.queue = this.queue.filter((message) => {
-      if (message.taskId !== taskId) return true;
+      if (message.taskId !== taskId || (attemptId && message.payload?.attemptId !== attemptId)) return true;
       removed.push(message);
       this.queuedIds.delete(message.id);
       delete this.state.pendingTasks[message.id];
@@ -336,7 +339,7 @@ export class AgentWorker {
         const rejected = makeEnvelope("task.rejected", {
           agentId: this.agentId,
           taskId: message.taskId,
-          payload: { code: error.code, reasons: error.reasons, checkpoint },
+          payload: { code: error.code, reasons: error.reasons, checkpoint, attemptId: message.payload?.attemptId ?? null },
         });
         delete this.state.pendingTasks[message.id];
         this.state.processed[message.id] = rejected;
@@ -351,7 +354,7 @@ export class AgentWorker {
     await this.sendReliable(makeEnvelope("task.started", {
       agentId: this.agentId,
       taskId: message.taskId,
-      payload: { checkpoint: startedCheckpoint },
+      payload: { checkpoint: startedCheckpoint, attemptId: message.payload?.attemptId ?? null },
     }));
     let completion;
     try {
@@ -405,6 +408,7 @@ export class AgentWorker {
           artifacts,
           checkpoint,
           executor: this.state.executorStatus,
+          attemptId: message.payload?.attemptId ?? null,
         },
       });
     } catch (error) {
@@ -423,6 +427,7 @@ export class AgentWorker {
           sessionId: this.state.sessionId,
           checkpoint,
           executor: this.state.executorStatus,
+          attemptId: message.payload?.attemptId ?? null,
         },
       });
     }

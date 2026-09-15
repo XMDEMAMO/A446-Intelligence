@@ -21,6 +21,9 @@ function Invoke-NpmStep {
 Write-Output 'Running Hub tests...'
 Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'apps\agent-hub') -Arguments @('test')
 
+Write-Output 'Checking PostgreSQL Server Hub package...'
+Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'apps\server-hub') -Arguments @('run', 'check')
+
 Write-Output 'Running web lint...'
 Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'apps\web') -Arguments @('run', 'lint')
 

@@ -75,6 +75,10 @@ export function chooseAgent(agents, request = {}) {
   if (request.targetAgentId) {
     const selected = agents.get(request.targetAgentId);
     if (!selected) throw httpError(409, `Agent ${request.targetAgentId} is not registered`);
+    if (selected.status !== "online") throw httpError(409, `Agent ${request.targetAgentId} is not online`);
+    if (Number(selected.activeTaskCount ?? 0) >= Number(selected.maxConcurrency ?? 1)) {
+      throw httpError(409, `Agent ${request.targetAgentId} is at capacity`);
+    }
     if (selected.quotaSnapshot?.state === "Exhausted") throw httpError(409, `Agent ${request.targetAgentId} account quota is exhausted`);
     const role = request.role ? String(request.role).toLowerCase() : null;
     if (role && selected.roles?.length && !selected.roles.includes(role)) {

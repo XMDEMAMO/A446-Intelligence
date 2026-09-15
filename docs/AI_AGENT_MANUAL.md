@@ -39,18 +39,17 @@ A446 Intelligence 的目标是通用本地/分布式 Agent 平台。软件项目
 - 任务创建、审批、暂停、恢复、取消和审计事件。
 - 规划/执行/审核闭环、最小上下文和上游错误裁定。
 - 动态 Agent/模型调度、任务群聊、Token 与可信额度快照。
+- PostgreSQL 支持的单进程 Server Hub alpha、持久可靠投递、Attempt/Lease 和重启恢复。
 
-不得声称当前原型已经具备：
+不得声称当前仓库已经具备：
 
-- 生产级持久调度和 Lease 重派。
-- 数据库持久化。
+- 多副本高可用调度、自动主从切换或跨实例并发写入。
 - 多租户身份与 RBAC。
-- 服务器 Lease 和超时重派。
 - 跨 Worker 产物存储。
 - 官方客户端未提供机器可读接口时的精确第三方额度百分比。
 - 黑盒 CLI 单轮内部的细粒度恢复。
 
-apps/agent-hub/src/hub.mjs 是开发模拟器，不是生产控制平面。
+`apps/agent-hub/src/hub.mjs` 仍是可注入 Store 的共享编排核心和开发入口；正式服务器入口位于 `apps/server-hub`，当前只支持单进程部署。
 
 ## 3. 仓库地图
 
@@ -65,6 +64,7 @@ apps/web/
 
 apps/agent-hub/
   src/hub.mjs            本地 Hub 与 HTTP 控制面
+  src/hub-store.mjs      Hub Store 契约的内存实现
   src/worker.mjs         Worker 生命周期和任务队列
   src/local-policy.mjs   权限与路径约束
   src/checkpoint-store.mjs
@@ -76,6 +76,11 @@ apps/agent-hub/
   protocol/              envelope 与 Task Spec Schema
   docs/protocol-v1.md    WebSocket 兼容契约
   test/                  回归和集成测试
+
+apps/server-hub/
+  src/                   PostgreSQL Store、migration 与正式服务器入口
+  migrations/            仅向前执行的 SQL migration
+  test/                  专用 PostgreSQL 重启恢复测试
 
 scripts/
   start-prototype.ps1    一键启动网页、Hub 和 Mock Worker
@@ -116,6 +121,7 @@ Local Hub
 | GET | /health | 健康与协议版本 |
 | GET | /v1/agents | Worker 状态 |
 | GET | /v1/tasks | 任务列表，可按 rootTaskId 筛选 |
+| GET | /v1/attempts | Attempt 列表，可按 taskId 筛选 |
 | GET | /v1/events | 近期事件 |
 | GET | /v1/conversations | 根任务群聊列表 |
 | GET | /v1/messages | 群聊消息，可按 rootTaskId 筛选 |
@@ -330,6 +336,9 @@ Antigravity：
 
 - HTTP 错误码和状态机。
 - ACK 与 pending delivery。
+- 状态、消息和可靠投递是否在发送前完成同一持久化事务。
+- currentAttemptId 条件更新、Lease 续期/过期和迟到结果隔离。
+- 未声明安全重试的任务在 Lease 过期后进入人工确认。
 - Worker 重连和同 Agent 连接替换。
 - 终态任务不会被晚到的结果覆盖。
 - 路由子任务保留 rootTaskId 和 parentTaskId。
@@ -373,6 +382,7 @@ Antigravity：
 该命令统一执行：
 
 - Hub 自动测试。
+- Server Hub 包结构与 PostgreSQL 驱动检查。
 - Web ESLint。
 - TypeScript 与 Vite 生产构建。
 - 组合端到端测试。
@@ -393,6 +403,16 @@ Antigravity：
 - 测试进程自动清理。
 
 不要在测试失败、跳过或只验证 Mock 输出时声称真实模型适配已经通过。
+
+涉及 `apps/server-hub` 持久化或 Lease 行为时，还必须对专用测试库运行：
+
+~~~powershell
+cd apps\server-hub
+$env:A446_TEST_DATABASE_URL = 'postgresql://USER:PASSWORD@127.0.0.1:5432/a446_test'
+npm.cmd run test:postgres
+~~~
+
+该测试会清空目标数据库中的 A446 表，禁止指向生产库或含有需保留数据的数据库。没有真实 PostgreSQL 结果时，不得宣布持久化或 Lease 阶段通过。
 
 ## 13. 真实 Adapter 检查
 

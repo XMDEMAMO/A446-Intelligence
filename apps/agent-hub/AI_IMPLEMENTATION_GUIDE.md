@@ -119,6 +119,7 @@ src/artifact-manifest.mjs      Artifact discovery and SHA-256
 src/capability-probe.mjs       Adapter/tool readiness and quota state classification
 src/quota-probe.mjs            optional machine-readable official-client quota snapshots
 src/collaboration.mjs          role contracts, output parsing, usage normalization, scheduling
+src/hub-store.mjs              in-memory Hub Store contract implementation
 src/adapters/codex.mjs         Codex session continuation
 src/adapters/antigravity.mjs   Antigravity persistent stream-json conversation
 src/adapters/stdio-json.mjs    generic persistent JSONL Adapter
@@ -128,6 +129,7 @@ docs/protocol-v1.md            message contract
 protocol/envelope.schema.json  envelope JSON Schema
 protocol/task-spec.schema.json local Task Spec JSON Schema
 test/                          regression and integration tests
+../server-hub/                 PostgreSQL Store, migrations, production-oriented server entrypoint
 ```
 
 ## 6 Worker configuration contract
@@ -399,9 +401,14 @@ worker.heartbeat.payload.usageTotals/quotaSnapshot
 task.assign.payload.role/stage/contextBundle/execution
 task.assign.payload.sessionScopeId
 task.result.payload.role/model/submission/usage/usageTotals/quotaSnapshot
+worker.hello.payload.protocolFeatures
+worker.heartbeat.payload.currentAttemptId
+task.assign.payload.attemptId/lease
+task.started.payload.attemptId
+task.result/task.error/task.rejected/approval.request payload.attemptId
 ```
 
-Protocol v1 allows new payload fields to be ignored by older peers, but a production server must treat `task.rejected` as a terminal state and must not repeatedly reschedule the same task to the same Worker without a human-approved Task Spec or Policy change.
+Protocol v1 allows new payload fields to be ignored by older peers. A server with leases enabled must dispatch only to Workers advertising `attempt-lease-v1`, persist the assignment before sending it, renew only the matching current Attempt, and prevent expired or superseded Attempt messages from changing task state. It must treat `task.rejected` as terminal and must not repeatedly reschedule the same task without an explicitly retry-safe Task Spec or a human-approved Policy change.
 
 ## 14 Required verification
 
@@ -414,6 +421,8 @@ npm audit --omit=dev
 node scripts/check-env.mjs --config config/worker.codex.example.json
 node scripts/check-env.mjs --config config/worker.antigravity.example.json
 ```
+
+For Server Hub persistence or lease changes, also run `npm.cmd run test:postgres` in `apps/server-hub` with `A446_TEST_DATABASE_URL` pointing to a dedicated disposable PostgreSQL database. Never use a production database; the test truncates A446-owned tables.
 
 The environment checks must confirm:
 
@@ -455,6 +464,10 @@ MVP-L13  planner/executor/reviewer workflow passes only minimal role context
 MVP-L14  upstream-error reports reach the planner only after reviewer confirmation
 MVP-L15  model selection is dynamic and token usage is accumulated without inventing quota percentages
 MVP-L16  unrelated root tasks do not share a model session; revisions keep their intended execution scope
+MVP-L17  task, message, Attempt, delivery, inbound dedupe, agent snapshot, and audit state survive Hub restart
+MVP-L18  a running task completes after Hub restart and Worker reconnect without a second winning result
+MVP-L19  expired retry-safe work receives a new Attempt; stale Attempt results are audited but cannot mutate the task
+MVP-L20  expired work with unknown or external side effects stops for human approval
 ```
 
 Do not report success if tests were skipped, a real failure was replaced with a mock result, or a security assertion was weakened.
@@ -501,15 +514,14 @@ safe next action
 
 ## 18 Current known boundary
 
-The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, and Artifact hashing.
+The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, and Artifact hashing. The separate `apps/server-hub` alpha adds a single-process PostgreSQL-backed scheduler, durable reliable-delivery records, Attempt/Lease recovery, and database-guarded result transitions without adding PostgreSQL to the Worker runtime.
 
 The following remain outside this local package:
 
 ```text
-production-grade persistent task scheduler and lease reassignment
-server-side Lease and reassignment
-central database
-production authentication and durable storage for the Web UI
+multi-replica/high-availability scheduling and leader coordination
+independent Worker/Web identities, rotation, and RBAC
+durable authenticated storage for the Web UI
 cross-Worker Artifact storage
 provider-specific official quota readers where the installed client has no machine-readable interface
 mid-turn recovery inside a black-box CLI model turn
