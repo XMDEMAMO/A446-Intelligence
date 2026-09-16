@@ -2,8 +2,8 @@
 
 状态：已确认作为后续实施基线
 建立日期：2026-09-15
-当前基线：local-agent-hub v0.5.0-alpha.2 + a446-server-hub v0.5.0-alpha.2
-实施状态：批次一（阶段 0、A、B）与批次二（阶段 C、D）已验收；下一批为阶段 E、F
+当前基线：local-agent-hub v0.5.0-alpha.3 + a446-server-hub v0.5.0-alpha.3
+实施状态：批次一（阶段 0、A、B）与批次二（阶段 C、D）已验收；批次三进行中，阶段 E 已验收，阶段 F 等待真实 PostgreSQL 验收
 
 ## 1 目的与适用范围
 
@@ -54,8 +54,8 @@ v0.5 允许一次实现多个紧密相关的阶段，不要求每次对话只完
 - 批次一已解决服务器侧 Attempt、Lease、超时恢复和安全重派。
 - 批次二已解决中央 Artifact 内容存储、跨 Worker 下载、双端哈希校验和结果门禁。
 - 批次二已解决独立 Worker 凭据、Web 登录 Session、CSRF 和管理员/操作者权限。
-- 资源探针主要在启动时运行，模型发现、设备目录和 Provider 额度读取仍不完整。
-- 人工介入状态尚未形成可事务恢复、只能处理一次的持久工作流记录。
+- 阶段 E 已将资源探针扩展为启动及运行期低频刷新，统一能力、设备、模型、可信额度的来源、时间、最后成功、陈旧和错误语义；未提供官方接口的 Provider 额度仍保持 `Unknown`。
+- 阶段 F 的独立人工介入记录、最小恢复上下文、单次条件处理、Web 操作和原节点/session 恢复已实现；真实 PostgreSQL migration/重启/并发验收尚待专用测试数据库。
 
 ## 4 目标运行结构
 
@@ -394,8 +394,8 @@ TLS 反向代理
 | 阶段 B Attempt Lease 与恢复 | 已验收 | 2026-09-15：Attempt、Lease、能力协商、条件状态更新、过期重派、stale 隔离及恢复上限完成；Hub 17/17、全仓 E2E 与真实 PostgreSQL 测试 PASS |
 | 阶段 C 中央 Artifact Store | 已验收 | 2026-09-15：仓库外 Local Artifact Store、服务器对象键、流式临时写入与原子落盘、大小/SHA-256 校验、声明路径约束、跨 Worker 下载复核、结果门禁和重启恢复完成；真实 PostgreSQL/文件流场景 PASS |
 | 阶段 D 最小身份与权限 | 已验收 | 2026-09-15：独立 Worker 凭据及即时撤销/轮换、agentId/deviceId 绑定、Web scrypt 用户与服务端 Session、HttpOnly/Secure/SameSite Cookie、CSRF/Origin、admin/operator RBAC 和真实 Actor 审计完成；真实身份/权限场景 PASS |
-| 阶段 E 资源探针统一 | 未开始 |  |
-| 阶段 F 人工介入持久化 | 未开始 |  |
+| 阶段 E 资源探针统一 | 已验收 | 2026-09-16：启动及低频刷新、设备/工具/服务/模型/额度统一快照、来源与最后成功时间、陈旧保留、配置模型回退、动态能力刷新和 Web 状态展示完成；资源专项 4/4、Hub 全量 23/23、Web lint/build、E2E PASS |
+| 阶段 F 人工介入持久化 | 进行中 | 2026-09-16：独立 Store/表记录、migration 003、最小上下文、Web 批准/拒绝/回复、pending 条件更新、并发单次处理、原父任务/角色/阶段/session 恢复及审计已实现；Memory 重启与并发测试 2/2 PASS，真实 PostgreSQL 测试因未提供 `A446_TEST_DATABASE_URL` 尚未执行，不能标记已验收 |
 | 阶段 G 验证与发布准备 | 未开始 |  |
 
 每次交付后更新本表，并按以下结构报告：

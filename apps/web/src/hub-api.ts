@@ -7,6 +7,7 @@ import type {
   HubMessage,
   HubSnapshot,
   HubTask,
+  HumanIntervention,
   TokenUsage,
   UsageAgentSummary,
 } from './types'
@@ -64,12 +65,13 @@ function readCookie(name: string) {
 }
 
 export async function getHubSnapshot(): Promise<HubSnapshot> {
-  const [health, agents, tasks, conversations, messages, usage, events] = await Promise.all([
+  const [health, agents, tasks, conversations, messages, interventions, usage, events] = await Promise.all([
     request<HubHealth>('/health'),
     request<{ agents: Agent[] }>('/v1/agents'),
     request<{ tasks: HubTask[] }>('/v1/tasks'),
     request<{ conversations: Conversation[] }>('/v1/conversations'),
     request<{ messages: HubMessage[] }>('/v1/messages'),
+    request<{ interventions: HumanIntervention[] }>('/v1/interventions?status=pending'),
     request<{ totals: TokenUsage | null; byAgent: UsageAgentSummary[] }>('/v1/usage'),
     request<{ events: HubEvent[] }>('/v1/events?limit=120'),
   ])
@@ -79,6 +81,7 @@ export async function getHubSnapshot(): Promise<HubSnapshot> {
     tasks: tasks.tasks,
     conversations: conversations.conversations,
     messages: messages.messages,
+    interventions: interventions.interventions,
     usage,
     events: events.events,
   }
@@ -99,5 +102,12 @@ export function sendHubCommand(command: Record<string, unknown>) {
   return request<{ ok: boolean; task?: HubTask; agent?: Agent }>('/v1/commands', {
     method: 'POST',
     body: JSON.stringify(command),
+  })
+}
+
+export function resolveIntervention(interventionId: string, decision: 'approve' | 'reject' | 'respond', response = '') {
+  return request<{ ok: boolean; intervention: HumanIntervention; task?: HubTask }>(`/v1/interventions/${encodeURIComponent(interventionId)}/resolve`, {
+    method: 'POST',
+    body: JSON.stringify({ decision, response }),
   })
 }

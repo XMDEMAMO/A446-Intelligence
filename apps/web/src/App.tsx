@@ -1,7 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { createDemoSnapshot } from './demo-data'
-import { artifactDownloadUrl, createWorkflow, getHubSnapshot, HubApiError, login as loginToHub, sendConversationMessage, sendHubCommand } from './hub-api'
+import { artifactDownloadUrl, createWorkflow, getHubSnapshot, HubApiError, login as loginToHub, resolveIntervention as resolveHubIntervention, sendConversationMessage, sendHubCommand } from './hub-api'
 import type {
   Agent,
   AgentRole,
@@ -113,6 +113,8 @@ function App() {
     [snapshot.conversations],
   )
   const selectedConversation = conversations.find((item) => item.rootTaskId === selectedRootId) ?? conversations[0] ?? null
+  const selectedIntervention = snapshot.interventions.find((item) => item.rootTaskId === selectedConversation?.rootTaskId && item.status === 'pending')
+    ?? (selectedConversation?.humanIntervention?.status === 'required' ? selectedConversation.humanIntervention : null)
   const selectedMessages = useMemo(
     () => snapshot.messages.filter((item) => item.rootTaskId === selectedConversation?.rootTaskId).sort((a, b) => a.seq - b.seq),
     [snapshot.messages, selectedConversation?.rootTaskId],
@@ -243,18 +245,30 @@ function App() {
     }
   }
 
-  async function resolveHumanIntervention(event: FormEvent<HTMLFormElement>) {
+  async function submitHumanResponse(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    if (!selectedConversation || !humanResponse.trim()) return
+    await decideIntervention('respond')
+  }
+
+  async function decideIntervention(decision: 'approve' | 'reject' | 'respond') {
+    if (!selectedConversation || !selectedIntervention) return
+    if (decision === 'respond' && !humanResponse.trim()) return
+    setSubmitting(true)
     try {
       if (connectionMode === 'live') {
-        await sendHubCommand({ type: 'workflow.human_response', rootTaskId: selectedConversation.rootTaskId, response: humanResponse.trim(), by: 'human' })
+        if (selectedIntervention.interventionId) {
+          await resolveHubIntervention(selectedIntervention.interventionId, decision, humanResponse.trim())
+        } else if (decision === 'respond') {
+          await sendHubCommand({ type: 'workflow.human_response', rootTaskId: selectedConversation.rootTaskId, response: humanResponse.trim() })
+        }
         await refresh()
       }
       setHumanResponse('')
-      setNotice('人工决定已交给规划 Agent')
+      setNotice(decision === 'approve' ? '请求已批准' : decision === 'reject' ? '请求已拒绝' : '人工回复已从原节点继续')
     } catch (error) {
       setNotice(error instanceof Error ? error.message : '提交失败')
+    } finally {
+      setSubmitting(false)
     }
   }
 
@@ -358,11 +372,15 @@ function App() {
               <div ref={chatEndRef} />
             </section>
 
-            {selectedConversation.humanIntervention?.status === 'required' && (
-              <form className="intervention-box" onSubmit={resolveHumanIntervention}>
-                <div><strong>需要你的决定</strong><p>{selectedConversation.humanIntervention.question}</p></div>
-                <input value={humanResponse} onChange={(event) => setHumanResponse(event.target.value)} placeholder="输入决定或补充信息" />
-                <button type="submit">交给规划 Agent</button>
+            {selectedIntervention && ['pending', 'required'].includes(selectedIntervention.status) && (
+              <form className="intervention-box" onSubmit={submitHumanResponse}>
+                <div><strong>需要你的决定</strong><p>{selectedIntervention.question}</p><small>{selectedIntervention.requesterRole ? `${roleName[selectedIntervention.requesterRole] ?? selectedIntervention.requesterRole} · ${selectedIntervention.requesterStage ?? '等待恢复'}` : '持久人工介入'}</small></div>
+                <input value={humanResponse} onChange={(event) => setHumanResponse(event.target.value)} placeholder={selectedIntervention.allowedActions?.includes('respond') ? '输入决定或补充信息' : '可选：说明批准或拒绝原因'} />
+                <div className="intervention-actions">
+                  {selectedIntervention.allowedActions?.includes('approve') && <button type="button" disabled={submitting} onClick={() => void decideIntervention('approve')}>批准</button>}
+                  {selectedIntervention.allowedActions?.includes('reject') && <button className="reject" type="button" disabled={submitting} onClick={() => void decideIntervention('reject')}>拒绝</button>}
+                  {(selectedIntervention.allowedActions?.includes('respond') ?? true) && <button type="submit" disabled={submitting || !humanResponse.trim()}>提交回复</button>}
+                </div>
               </form>
             )}
 
@@ -456,10 +474,16 @@ function AgentAvatar({ agent, role: roleOverride }: { agent: Agent; role?: Agent
 }
 
 function Participant({ agent }: { agent: Agent }) {
+  const resource = agent.resourceSnapshot
+  const cpu = resource?.capabilities?.device?.cpu?.logicalCores
+  const memory = resource?.capabilities?.device?.memory?.totalBytes
+  const resourceLabel = resource?.state === 'available' ? '资源可用' : resource?.state === 'stale' ? '资源陈旧' : resource?.state === 'unavailable' ? '部分不可用' : '资源未知'
+  const modelResourceLabel = resource?.models?.state === 'available' ? '模型可用' : resource?.models?.state === 'stale' ? '模型陈旧' : resource?.models?.state === 'unavailable' ? '模型不可用' : '模型来源待确认'
+  const resourceTitle = resource ? `探测：${formatDate(resource.checkedAt)}${resource.errorSummary ? `；${resource.errorSummary}` : ''}` : '尚未收到统一资源快照'
   return (
     <div className="participant">
       <AgentAvatar agent={agent} />
-      <div><strong>{agent.agentId}</strong><small>{(agent.roles ?? []).map((role) => roleName[role]).join(' / ') || '通用 Agent'} · {agent.deviceId ?? agent.agentId}</small><em>{agent.models?.map((model) => model.label ?? model.id).filter(Boolean).join(' · ') || '默认模型'}</em></div>
+      <div><strong>{agent.agentId}</strong><small>{(agent.roles ?? []).map((role) => roleName[role]).join(' / ') || '通用 Agent'} · {agent.deviceId ?? agent.agentId}</small><em>{agent.models?.map((model) => model.label ?? model.id).filter(Boolean).join(' · ') || '默认模型'}</em><small className={`resource-summary ${resource?.state ?? 'unknown'}`} title={resourceTitle}>{resourceLabel} · {modelResourceLabel}{cpu ? ` · ${cpu} 线程` : ''}{memory ? ` · ${formatBytes(memory)}` : ''}</small></div>
       <span className={agent.busy ? 'busy' : ''}>{agent.status !== 'online' ? '离线' : agent.busy ? '忙碌' : '空闲'}</span>
     </div>
   )
@@ -467,12 +491,12 @@ function Participant({ agent }: { agent: Agent }) {
 
 function QuotaBadge({ quota }: { quota: QuotaSnapshot | null }) {
   const state = quota?.state ?? 'Unknown'
-  return <span className={`quota-badge ${state.toLowerCase()}`}>{state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'}</span>
+  return <span className={`quota-badge ${quota?.stale ? 'stale' : state.toLowerCase()}`}>{quota?.stale ? '陈旧' : state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'}</span>
 }
 
 function QuotaMeter({ quota }: { quota: QuotaSnapshot | null }) {
   const window = quota?.windows?.find((item) => item.usedPercent != null)
-  if (!window || window.usedPercent == null) return <div className="quota-unknown">客户端暂无可读取的额度快照</div>
+  if (!window || window.usedPercent == null) return <div className={`quota-unknown ${quota?.stale ? 'stale' : ''}`}>{quota?.stale ? '最近可信额度已陈旧' : '客户端暂无可读取的额度快照'}<small>来源：{quota?.source ?? 'unavailable'}</small></div>
   return <div className="quota-meter"><div><span>{window.name}</span><b>已用 {Math.round(window.usedPercent)}%</b></div><progress max="100" value={window.usedPercent} /><small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small></div>
 }
 
@@ -534,7 +558,7 @@ function relativeTime(value: string) {
 }
 
 function formatBytes(value: number) {
-  return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : `${(value / 1024 / 1024).toFixed(1)} MB`
+  return value < 1024 ? `${value} B` : value < 1024 * 1024 ? `${(value / 1024).toFixed(1)} KB` : value < 1024 * 1024 * 1024 ? `${(value / 1024 / 1024).toFixed(1)} MB` : `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
 }
 
 export default App

@@ -12,6 +12,7 @@ const required = [
   "src/identity-cli.mjs",
   "migrations/001_persistent_scheduling.sql",
   "migrations/002_artifacts_and_identity.sql",
+  "migrations/003_resource_and_interventions.sql",
   "config/server.example.json",
   "config/worker.example.json",
 ];

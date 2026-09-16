@@ -12,6 +12,12 @@
     "apiUrl": "https://hub.example.com",
     "maxFileBytes": 104857600
   },
+  "capabilityProbe": {
+    "intervalMs": 60000,
+    "timeoutMs": 5000,
+    "tools": [],
+    "services": []
+  },
   "adapter": {
     "type": "mock"
   }

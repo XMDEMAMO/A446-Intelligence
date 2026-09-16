@@ -41,6 +41,18 @@
       "tools": [{ "name": "git", "available": true, "version": "git version 2.x" }]
     },
     "executors": [{ "type": "codex-exec-resume", "health": "Healthy", "quota": "Unknown" }],
+    "resourceSnapshot": {
+      "schemaVersion": 1,
+      "state": "available",
+      "checkedAt": "2026-09-12T00:00:00.000Z",
+      "stale": false,
+      "capabilities": {
+        "source": "local-resource-probe",
+        "device": { "cpu": { "state": "available", "logicalCores": 8 }, "memory": { "state": "available", "totalBytes": 17179869184 } }
+      },
+      "models": { "state": "unknown", "source": "config", "items": [] },
+      "quota": { "state": "Unknown", "source": "unavailable", "windows": [] }
+    },
     "usageTotals": { "inputTokens": 0, "outputTokens": 0, "cachedTokens": 0, "reasoningTokens": 0, "toolTokens": 0, "totalTokens": 0 },
     "quotaSnapshot": { "state": "Unknown", "source": "unavailable", "checkedAt": "2026-09-12T00:00:00.000Z", "windows": [] }
   }
@@ -49,9 +61,22 @@
 
 Hub 返回 `hub.welcome`。同一 `agentId` 的新连接替换旧连接。支持租约的 Hub 会在 `hub.welcome.payload.protocolFeatures` 返回 `attempt-lease-v1`，并同时返回 `leaseTtlMs`。生产 Server Hub 启用租约后，只向在 hello 中声明该特性的 Worker 派发任务。
 
-`worker.heartbeat.payload` 除 `busy`、`paused`、`sessionId` 外，还应携带 `currentTaskId`、`currentAttemptId`、`observedCapabilities`、`executors`、`usageTotals` 和 `quotaSnapshot`。当前 Attempt 存在时，Hub 以 heartbeat 续租。额度状态只允许使用 `Healthy / Low / Exhausted / Unknown`；无法从官方工具可靠读取时必须上报 `Unknown`，不得伪造精确百分比。
+`worker.heartbeat.payload` 除 `busy`、`paused`、`sessionId` 外，还应携带 `currentTaskId`、`currentAttemptId`、`capabilities`、`models`、`observedCapabilities`、`resourceSnapshot`、`executors`、`usageTotals` 和 `quotaSnapshot`。当前 Attempt 存在时，Hub 以 heartbeat 续租。额度状态只允许使用 `Healthy / Low / Exhausted / Unknown`；无法从官方工具可靠读取时必须上报 `Unknown`，不得伪造精确百分比。
 
 `deviceId` 表示物理设备，`account` 表示本地已登录账号，`agentId` 表示该设备上的一个逻辑 Agent。一个账号可以承载多个 Agent；每个 Agent 仍必须使用独立的 `agentId`、工作区、状态文件和 session。`models` 是当前账号实际允许调度的模型清单，不表示模型拥有独立登录授权。
+
+### Resource snapshot
+
+资源探针在 Worker 启动时运行一次，并按 `capabilityProbe.intervalMs` 低频刷新。`resourceSnapshot` 统一包含能力、设备、模型和可信额度区段；旧 Hub 可以忽略该 v1 payload 增量。资源状态只使用：
+
+```text
+available    本次探测确认可用
+unavailable  本次探测确认不可用，且没有可保留的成功值
+unknown      未配置或没有可信机器可读来源
+stale        本次刷新失败，仍保留最后一次可信成功值
+```
+
+每个区段应携带 `source`、`checkedAt`、`lastSuccessAt`、`stale` 和有界的 `errorSummary`。模型探针失败时使用配置清单并标记 `source=config`；已成功探测过的值在后续失败时保留并标为 `stale`。设备信息只包含调度需要的系统、CPU、内存、GPU、Node、Python、浏览器、主要工具和用户配置的服务描述。探针不得读取 Cookie、浏览器 Profile、Refresh Token、系统凭据库或认证数据库。单个探针失败不使 Worker 离线。
 
 ## Reliable delivery
 
@@ -215,6 +240,12 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 
 `task.started`、`task.rejected` 和 `approval.request` 也必须在 payload 中回传当前 `attemptId`。未协商 `attempt-lease-v1` 的旧版本地模式保持 v1 原有行为。
 
+## Human intervention
+
+人工介入是独立持久记录，至少包含 `interventionId`、`rootTaskId`、`taskId`、`kind`、发起角色、发起阶段、`sessionScopeId`、最小上下文、允许动作和继续节点。记录初始状态为 `pending`，只能通过数据库条件更新转换一次为 `resolved`；重复或并发提交返回 HTTP `409`。
+
+`workflow_input` 允许文本 `respond`，并从记录的父任务、角色、阶段和 session 范围创建后续任务。`task_approval`、`worker_approval` 与 `lease_expiry` 默认只允许管理员 `approve` 或 `reject`；批准时继续原任务，拒绝时进入终态。记录只保存恢复需要的目标、验收标准、任务标题和原因，不复制执行 Agent 的完整成果。Hub 重启后必须能继续列出和处理 `pending` 记录。
+
 ## HTTP control plane
 
 - `GET /health`
@@ -225,11 +256,13 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - `GET /v1/attempts?taskId=UUID`
 - `GET /v1/conversations`
 - `GET /v1/messages?rootTaskId=UUID`
+- `GET /v1/interventions?status=pending&rootTaskId=UUID`
 - `GET /v1/usage`
 - `POST /v1/workflows`
 - `POST /v1/messages`
 - `POST /v1/tasks`
 - `POST /v1/commands`
+- `POST /v1/interventions/{interventionId}/resolve`
 - `GET|POST /v1/artifacts`、`PUT|GET /v1/artifacts/{artifactId}/content`
 - 管理员：`GET|POST /v1/admin/workers`、`POST /v1/admin/workers/{credentialId}/rotate`、`DELETE /v1/admin/workers/{credentialId}`、`POST /v1/admin/users`
 

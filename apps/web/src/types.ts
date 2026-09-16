@@ -2,6 +2,7 @@ export type ConnectionMode = 'connecting' | 'live' | 'demo'
 export type AgentRole = 'planner' | 'executor' | 'reviewer'
 export type AgentHealth = 'Healthy' | 'Degraded' | 'Unhealthy' | 'Unknown'
 export type QuotaState = 'Healthy' | 'Low' | 'Exhausted' | 'Unknown'
+export type ResourceState = 'available' | 'unavailable' | 'unknown' | 'stale'
 
 export interface TokenUsage {
   inputTokens: number
@@ -24,6 +25,9 @@ export interface QuotaSnapshot {
   checkedAt: string
   source: string
   windows: QuotaWindow[]
+  lastSuccessAt?: string | null
+  stale?: boolean
+  errorSummary?: string | null
 }
 
 export interface AccountProfile {
@@ -40,6 +44,12 @@ export interface ModelProfile {
   capabilities?: string[]
   reasoningEfforts?: string[]
   quota?: QuotaSnapshot | null
+  availability?: ResourceState
+  source?: string
+  checkedAt?: string
+  lastSuccessAt?: string | null
+  stale?: boolean
+  errorSummary?: string | null
 }
 
 export interface ExecutorState {
@@ -51,8 +61,58 @@ export interface ExecutorState {
 }
 
 export interface ObservedCapabilities {
-  adapter?: { name?: string; available?: boolean; ready?: boolean; version?: string }
-  tools?: Array<{ name: string; available: boolean; version?: string }>
+  state?: ResourceState
+  source?: string
+  checkedAt?: string
+  lastSuccessAt?: string | null
+  stale?: boolean
+  errorSummary?: string | null
+  adapter?: ResourceProbe
+  tools?: ResourceProbe[]
+  services?: ResourceProbe[]
+  device?: {
+    system?: ResourceProbe & { platform?: string; arch?: string; release?: string }
+    cpu?: ResourceProbe & { model?: string | null; logicalCores?: number }
+    memory?: ResourceProbe & { totalBytes?: number; freeBytes?: number }
+    node?: ResourceProbe
+    python?: ResourceProbe
+    gpu?: ResourceProbe
+    browsers?: ResourceProbe[]
+  }
+}
+
+export interface ResourceProbe {
+  name?: string
+  state?: ResourceState
+  source?: string
+  checkedAt?: string
+  lastSuccessAt?: string | null
+  stale?: boolean
+  errorSummary?: string | null
+  available?: boolean | null
+  ready?: boolean
+  version?: string | null
+  description?: string
+  capabilities?: string[]
+}
+
+export interface ResourceSnapshot {
+  schemaVersion: number
+  state: ResourceState
+  checkedAt: string
+  stale: boolean
+  errorSummary?: string | null
+  capabilities?: ObservedCapabilities
+  models?: {
+    state: ResourceState
+    source: string
+    checkedAt: string
+    lastSuccessAt?: string | null
+    stale?: boolean
+    errorSummary?: string | null
+    items: ModelProfile[]
+  }
+  quota?: QuotaSnapshot | null
 }
 
 export interface Agent {
@@ -73,6 +133,7 @@ export interface Agent {
   disconnectedAt?: string
   lastSeenAt?: string
   observedCapabilities?: ObservedCapabilities
+  resourceSnapshot?: ResourceSnapshot | null
   executors?: ExecutorState[]
   usageTotals?: TokenUsage | null
   quotaSnapshot?: QuotaSnapshot | null
@@ -117,12 +178,25 @@ export interface RoleSubmission {
 }
 
 export interface HumanIntervention {
-  status: 'required' | 'resolved'
+  interventionId?: string
+  rootTaskId?: string
+  taskId?: string
+  kind?: 'workflow_input' | 'task_approval' | 'worker_approval' | 'lease_expiry' | string
+  status: 'pending' | 'required' | 'resolved'
+  recordStatus?: 'pending' | 'resolved'
   question: string
   requestedBy?: string
+  requesterRole?: string
+  requesterStage?: string | null
+  sessionScopeId?: string | null
+  allowedActions?: Array<'approve' | 'reject' | 'respond'>
+  context?: Record<string, unknown>
+  resume?: { type?: string; role?: string | null; stage?: string | null; sessionScopeId?: string | null } | null
   requestedAt?: string
+  decision?: 'approve' | 'reject' | 'respond'
   response?: string
   resolvedAt?: string
+  resolvedBy?: string
 }
 
 export interface HubTask {
@@ -219,6 +293,7 @@ export interface HubSnapshot {
   tasks: HubTask[]
   conversations: Conversation[]
   messages: HubMessage[]
+  interventions: HumanIntervention[]
   usage: { totals: TokenUsage | null; byAgent: UsageAgentSummary[] }
   events: HubEvent[]
 }
