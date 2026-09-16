@@ -1,6 +1,6 @@
 # A446 Server Hub
 
-This package is the PostgreSQL-backed single-process control plane for v0.5 Server Ready. The current `0.5.0-alpha.2` build includes durable scheduling, Attempt/Lease recovery, independent Worker and Web identities, minimal RBAC, and a local central Artifact Store.
+This package is the PostgreSQL-backed single-process control plane for v0.5 Server Ready. The current `0.5.0-alpha.3` build includes durable scheduling, Attempt/Lease recovery, independent Worker and Web identities, minimal RBAC, a local central Artifact Store, refreshable resource snapshots, and restart-safe human interventions.
 
 ## Server configuration
 
@@ -60,6 +60,12 @@ Web users sign in through `POST /v1/auth/login`. The server uses an opaque serve
 
 Workers stream declared outputs to the server. The server writes a temporary file, verifies declared size and SHA-256, and atomically moves valid content into the Artifact Store. A result is accepted only when every Task Spec output points to matching `ready` metadata. Review Workers stream authorized references into their own allowed workspace and verify size and SHA-256 before execution.
 
+## Resource refresh and human recovery
+
+Workers run their adapter, configured tool, device, model, and trusted quota probes at startup and then at the low-frequency interval configured by `capabilityProbe.intervalMs`. Each section reports its source, probe time, last successful time, stale state, and a bounded error summary. A failed refresh keeps the last trusted value marked `stale`; it does not take the Worker offline. Model discovery can use a configured machine-readable `modelProbe`; otherwise the configured model list remains visible with `source=config` and unknown availability. Numeric quota data is accepted only from `quotaProbe` JSON, and remains `Unknown` when no trusted source exists.
+
+Human requests are stored independently in `human_interventions`, not only inside a task document. `GET /v1/interventions?status=pending` lists pending work. `POST /v1/interventions/{id}/resolve` accepts one `approve`, `reject`, or `respond` decision as allowed by the record. PostgreSQL conditionally updates only a pending record, so repeat or concurrent submissions return `409`. Workflow replies resume from the recorded role, stage, parent task, and `sessionScopeId`; retry approval remains administrator-only.
+
 ## PostgreSQL integration test
 
 Use a dedicated disposable database:
@@ -70,3 +76,7 @@ npm.cmd run test:postgres
 ```
 
 The tests truncate all A446 tables in that database. Never point them at a database containing data that must be preserved.
+
+## Operations and release preparation
+
+See [OPERATIONS.md](OPERATIONS.md) for the minimal startup order, environment-variable boundary, TLS/WSS reverse-proxy requirements, coordinated PostgreSQL/Artifact backup and recovery, and release-package checklist. The non-secret variable names are collected in [.env.example](.env.example); it is documentation only and is not loaded automatically.

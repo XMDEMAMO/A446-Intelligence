@@ -9,7 +9,7 @@ export function normalizeRoles(value) {
 export function normalizeModels(value, adapter = {}) {
   const models = Array.isArray(value) ? value : [];
   const normalized = models.map((model) => {
-    if (typeof model === "string") return { id: model, enabled: true, capabilities: [] };
+    if (typeof model === "string") return { id: model, enabled: true, capabilities: [], availability: "unknown", source: "config" };
     return {
       id: String(model.id ?? model.name ?? ""),
       label: model.label ? String(model.label) : undefined,
@@ -17,10 +17,26 @@ export function normalizeModels(value, adapter = {}) {
       capabilities: Array.isArray(model.capabilities) ? model.capabilities.map(String) : [],
       reasoningEfforts: Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts.map(String) : [],
       quota: normalizeQuotaSnapshot(model.quota),
+      availability: ["available", "unavailable", "unknown", "stale"].includes(model.availability) ? model.availability : "unknown",
+      source: model.source ? String(model.source) : "config",
+      checkedAt: model.checkedAt ? String(model.checkedAt) : undefined,
+      lastSuccessAt: model.lastSuccessAt ? String(model.lastSuccessAt) : undefined,
+      stale: Boolean(model.stale),
+      errorSummary: model.errorSummary ? String(model.errorSummary).slice(0, 500) : null,
     };
   }).filter((model) => model.id);
   if (normalized.length === 0 && adapter.model) {
-    normalized.push({ id: String(adapter.model), enabled: true, capabilities: [], reasoningEfforts: [], quota: null });
+    normalized.push({
+      id: String(adapter.model),
+      enabled: true,
+      capabilities: [],
+      reasoningEfforts: [],
+      quota: null,
+      availability: "unknown",
+      source: "adapter-config",
+      stale: false,
+      errorSummary: null,
+    });
   }
   return normalized;
 }
@@ -38,6 +54,9 @@ export function normalizeQuotaSnapshot(value) {
     checkedAt: value.checkedAt ? String(value.checkedAt) : new Date().toISOString(),
     source: value.source ? String(value.source) : "client",
     windows,
+    lastSuccessAt: value.lastSuccessAt ? String(value.lastSuccessAt) : undefined,
+    stale: Boolean(value.stale),
+    errorSummary: value.errorSummary ? String(value.errorSummary).slice(0, 500) : null,
   };
 }
 

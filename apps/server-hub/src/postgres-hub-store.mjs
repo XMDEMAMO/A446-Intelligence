@@ -63,6 +63,12 @@ export class PostgresHubStore {
       const agents = await client.query("SELECT document FROM worker_registrations ORDER BY agent_id");
       const attempts = await client.query("SELECT document FROM task_attempts ORDER BY created_at, attempt_id");
       const artifacts = await client.query("SELECT document FROM artifacts ORDER BY created_at, artifact_id");
+      const interventions = await client.query(`
+        SELECT intervention_id, root_task_id, task_id, status, kind, requester_role,
+               requester_stage, session_scope_id, decision, resolved_by, resolved_at,
+               created_at, updated_at, document
+        FROM human_interventions ORDER BY created_at, intervention_id
+      `);
       const deliveries = await client.query("SELECT document FROM outbound_deliveries ORDER BY created_at, message_id");
       const inbound = await client.query("SELECT document FROM inbound_messages ORDER BY received_at, message_id");
       const events = await client.query("SELECT document FROM audit_events ORDER BY sequence");
@@ -74,6 +80,7 @@ export class PostgresHubStore {
         agents: agents.rows.map((row) => row.document),
         attempts: attempts.rows.map((row) => row.document),
         artifacts: artifacts.rows.map((row) => row.document),
+        interventions: interventions.rows.map(interventionFromRow),
         deliveries: deliveries.rows.map((row) => row.document),
         inboundMessages: inbound.rows.map((row) => row.document),
         auditEvents: events.rows.map((row) => row.document),
@@ -96,6 +103,9 @@ export class PostgresHubStore {
       for (const agent of changes.agents ?? []) await upsertAgent(client, agent);
       for (const attempt of changes.attempts ?? []) await upsertAttempt(client, attempt);
       for (const artifact of changes.artifacts ?? []) await upsertArtifact(client, artifact);
+      for (const intervention of changes.interventions ?? []) {
+        await upsertIntervention(client, intervention, changes.interventionGuards?.[intervention.interventionId]);
+      }
       for (const delivery of changes.deliveries ?? []) await upsertDelivery(client, delivery);
       for (const delivery of changes.deletedDeliveries ?? []) {
         await client.query("DELETE FROM outbound_deliveries WHERE agent_id = $1 AND message_id = $2", [delivery.agentId, delivery.messageId]);
@@ -169,14 +179,6 @@ async function upsertTask(client, task, guard) {
       JSON.stringify(task),
       task.createdAt,
     ]);
-  }
-
-  if (task.humanIntervention) {
-    await client.query(`
-      INSERT INTO human_interventions (intervention_id, root_task_id, status, document, updated_at)
-      VALUES ($1, $2, $3, $4::jsonb, now())
-      ON CONFLICT (intervention_id) DO UPDATE SET status = EXCLUDED.status, document = EXCLUDED.document, updated_at = now()
-    `, [`${task.rootTaskId}:current`, task.rootTaskId, task.humanIntervention.status ?? "unknown", JSON.stringify(task.humanIntervention)]);
   }
 }
 
@@ -271,6 +273,70 @@ async function upsertArtifact(client, artifact) {
   ]);
 }
 
+async function upsertIntervention(client, intervention, guard) {
+  const values = [
+    intervention.interventionId,
+    intervention.rootTaskId,
+    intervention.taskId ?? null,
+    intervention.status,
+    intervention.kind ?? null,
+    intervention.requesterRole ?? null,
+    intervention.requesterStage ?? null,
+    intervention.sessionScopeId ?? null,
+    intervention.decision ?? null,
+    intervention.resolvedBy ?? null,
+    intervention.resolvedAt ?? null,
+    JSON.stringify(intervention),
+    intervention.requestedAt ?? intervention.createdAt ?? new Date().toISOString(),
+  ];
+  if (guard) {
+    const result = await client.query(`
+      UPDATE human_interventions SET
+        root_task_id = $2,
+        task_id = $3,
+        status = $4,
+        kind = $5,
+        requester_role = $6,
+        requester_stage = $7,
+        session_scope_id = $8,
+        decision = $9,
+        resolved_by = $10,
+        resolved_at = $11,
+        document = $12::jsonb,
+        created_at = LEAST(created_at, $13::timestamptz),
+        updated_at = now()
+      WHERE intervention_id = $1 AND status = ANY($14::text[])
+    `, [...values, guard.allowedStatuses ?? []]);
+    if (result.rowCount !== 1) {
+      throw Object.assign(new Error(`Intervention ${intervention.interventionId} is no longer pending`), {
+        code: "INTERVENTION_CONFLICT",
+        statusCode: 409,
+      });
+    }
+    return;
+  }
+  await client.query(`
+    INSERT INTO human_interventions (
+      intervention_id, root_task_id, task_id, status, kind, requester_role,
+      requester_stage, session_scope_id, decision, resolved_by, resolved_at,
+      document, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::jsonb, $13, now())
+    ON CONFLICT (intervention_id) DO UPDATE SET
+      root_task_id = EXCLUDED.root_task_id,
+      task_id = EXCLUDED.task_id,
+      status = EXCLUDED.status,
+      kind = EXCLUDED.kind,
+      requester_role = EXCLUDED.requester_role,
+      requester_stage = EXCLUDED.requester_stage,
+      session_scope_id = EXCLUDED.session_scope_id,
+      decision = EXCLUDED.decision,
+      resolved_by = EXCLUDED.resolved_by,
+      resolved_at = EXCLUDED.resolved_at,
+      document = EXCLUDED.document,
+      updated_at = now()
+  `, values);
+}
+
 async function upsertInboundMessage(client, message) {
   await client.query(`
     INSERT INTO inbound_messages (message_id, agent_id, message_type, task_id, document, received_at)
@@ -285,4 +351,23 @@ async function upsertAuditEvent(client, event) {
     VALUES ($1, $2, $3::jsonb, $4)
     ON CONFLICT (sequence) DO UPDATE SET event_type = EXCLUDED.event_type, document = EXCLUDED.document, created_at = EXCLUDED.created_at
   `, [event.seq, event.type, JSON.stringify(event), event.ts]);
+}
+
+function interventionFromRow(row) {
+  return {
+    ...(row.document ?? {}),
+    interventionId: row.document?.interventionId ?? row.intervention_id,
+    rootTaskId: row.document?.rootTaskId ?? row.root_task_id,
+    taskId: row.document?.taskId ?? row.task_id,
+    status: row.status,
+    kind: row.document?.kind ?? row.kind,
+    requesterRole: row.document?.requesterRole ?? row.requester_role,
+    requesterStage: row.document?.requesterStage ?? row.requester_stage,
+    sessionScopeId: row.document?.sessionScopeId ?? row.session_scope_id,
+    decision: row.document?.decision ?? row.decision,
+    resolvedBy: row.document?.resolvedBy ?? row.resolved_by,
+    resolvedAt: row.document?.resolvedAt ?? row.resolved_at,
+    requestedAt: row.document?.requestedAt ?? row.created_at,
+    updatedAt: row.document?.updatedAt ?? row.updated_at,
+  };
 }

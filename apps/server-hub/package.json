@@ -1,6 +1,6 @@
 {
   "name": "a446-server-hub",
-  "version": "0.5.0-alpha.2",
+  "version": "0.5.0-alpha.3",
   "private": true,
   "type": "module",
   "description": "PostgreSQL-backed A446 Server Hub control plane.",
