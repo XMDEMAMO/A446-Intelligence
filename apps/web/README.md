@@ -19,7 +19,7 @@ npm.cmd ci
 npm.cmd run dev
 ```
 
-默认通过 Vite 的同源 `/api` 代理连接 `http://127.0.0.1:8787`。Hub 不可用时自动显示演示数据，恢复后每 3 秒同步真实数据。
+默认通过 Vite 的同源 `/api` 代理连接 `http://127.0.0.1:8787`。正式 Server Hub 返回 401 时显示登录页，并通过服务端 Session Cookie 与 CSRF Token 鉴权；其他连接故障才回退到演示数据，恢复后每 3 秒同步真实数据。
 
 ## 验证
 
@@ -28,4 +28,4 @@ npm.cmd run lint
 npm.cmd run build
 ```
 
-不要使用 `VITE_` 环境变量保存 Hub Token；这类变量会进入浏览器包。需要认证时，由开发代理或正式后端在服务端附加凭据。
+不要使用 `VITE_` 环境变量保存任何凭据；这类变量会进入浏览器包。正式 Web 身份只使用登录 Session，Vite 代理不再附加共享 Hub Token。

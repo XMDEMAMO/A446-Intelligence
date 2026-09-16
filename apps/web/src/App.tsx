@@ -1,7 +1,7 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import { createDemoSnapshot } from './demo-data'
-import { createWorkflow, getHubSnapshot, sendConversationMessage, sendHubCommand } from './hub-api'
+import { artifactDownloadUrl, createWorkflow, getHubSnapshot, HubApiError, login as loginToHub, sendConversationMessage, sendHubCommand } from './hub-api'
 import type {
   Agent,
   AgentRole,
@@ -70,6 +70,9 @@ function App() {
   const [submitting, setSubmitting] = useState(false)
   const [notice, setNotice] = useState('')
   const [lastError, setLastError] = useState('')
+  const [authRequired, setAuthRequired] = useState(false)
+  const [loginName, setLoginName] = useState('')
+  const [loginPassword, setLoginPassword] = useState('')
   const chatEndRef = useRef<HTMLDivElement | null>(null)
 
   const refresh = useCallback(async () => {
@@ -77,8 +80,14 @@ function App() {
       const next = await getHubSnapshot()
       setSnapshot(next)
       setConnectionMode('live')
+      setAuthRequired(false)
       setLastError('')
     } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) {
+        setAuthRequired(true)
+        setLastError('')
+        return
+      }
       setLastError(error instanceof Error ? error.message : 'Hub 暂时不可用')
       setConnectionMode((current) => (current === 'live' ? 'live' : 'demo'))
     }
@@ -249,6 +258,37 @@ function App() {
     }
   }
 
+  async function submitLogin(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setSubmitting(true)
+    setLastError('')
+    try {
+      await loginToHub(loginName, loginPassword)
+      setLoginPassword('')
+      setAuthRequired(false)
+      await refresh()
+    } catch (error) {
+      setLastError(error instanceof Error ? error.message : '登录失败')
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  if (authRequired) {
+    return (
+      <main className="login-shell">
+        <form className="login-card" onSubmit={submitLogin}>
+          <div className="brand-mark">A4</div>
+          <div><span>Server Hub</span><h1>登录 A446 协作台</h1><p>使用管理员或操作者账号继续。</p></div>
+          <label>用户名<input autoComplete="username" autoFocus value={loginName} onChange={(event) => setLoginName(event.target.value)} /></label>
+          <label>密码<input autoComplete="current-password" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} /></label>
+          {lastError && <div className="login-error">{lastError}</div>}
+          <button type="submit" disabled={submitting || !loginName || !loginPassword}>{submitting ? '登录中…' : '登录'}</button>
+        </form>
+      </main>
+    )
+  }
+
   return (
     <div className="app-shell">
       <aside className="room-sidebar">
@@ -401,7 +441,7 @@ function MessageBubble({ message, task, agents }: { message: HubMessage; task?: 
           <details className="attachment" key={`${attachment.taskId ?? message.taskId}-${index}`}>
             <summary><span>▧</span><div><strong>{attachment.label}</strong><small>{attachment.version ?? '成果附件'} · 点击查看</small></div><i>⌄</i></summary>
             {attachment.content && <pre>{attachment.content}</pre>}
-            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}><span>{file.path}</span><small>{file.status} · {formatBytes(file.size)}</small></div>)}
+            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}>{file.status === 'ready' && file.downloadUrl ? <a href={artifactDownloadUrl(file.downloadUrl)}>{file.path}</a> : <span>{file.path}</span>}<small>{file.status} · {formatBytes(file.size)}</small></div>)}
           </details>
         ))}
         {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage) && <div className="message-metrics"><span>{task.model ?? task.execution?.model ?? '默认模型'}</span>{task.usage && <><span>输入 {formatTokens(task.usage.inputTokens)}</span><span>输出 {formatTokens(task.usage.outputTokens)}</span><b>共 {formatTokens(task.usage.totalTokens)} tokens</b></>}</div>}

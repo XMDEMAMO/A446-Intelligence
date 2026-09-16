@@ -12,18 +12,55 @@ import type {
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_HUB_API_BASE ?? '/api').replace(/\/$/, '')
+let csrfToken = readCookie('a446_csrf') || window.sessionStorage.getItem('a446.csrf') || ''
+
+export class HubApiError extends Error {
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.status = status
+  }
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, {
     ...init,
+    credentials: 'include',
     headers: {
       ...(init?.body ? { 'content-type': 'application/json' } : {}),
+      ...(!['GET', 'HEAD'].includes(init?.method ?? 'GET') && csrfToken ? { 'x-csrf-token': csrfToken } : {}),
       ...init?.headers,
     },
   })
   const body = (await response.json()) as T & { error?: string }
-  if (!response.ok) throw new Error(body.error ?? `Hub request failed (${response.status})`)
+  if (!response.ok) throw new HubApiError(body.error ?? `Hub request failed (${response.status})`, response.status)
   return body
+}
+
+export async function login(username: string, password: string) {
+  const result = await request<{ user: { id: string; username: string; role: 'admin' | 'operator' }; csrfToken: string }>('/v1/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ username, password }),
+  })
+  csrfToken = result.csrfToken
+  window.sessionStorage.setItem('a446.csrf', csrfToken)
+  return result.user
+}
+
+export async function logout() {
+  await request<{ ok: boolean }>('/v1/auth/logout', { method: 'POST' })
+  csrfToken = ''
+  window.sessionStorage.removeItem('a446.csrf')
+}
+
+export function artifactDownloadUrl(downloadUrl: string) {
+  return `${API_BASE}${downloadUrl}`
+}
+
+function readCookie(name: string) {
+  const prefix = `${name}=`
+  return document.cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith(prefix))?.slice(prefix.length) ?? ''
 }
 
 export async function getHubSnapshot(): Promise<HubSnapshot> {

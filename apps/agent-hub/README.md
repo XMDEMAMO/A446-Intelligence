@@ -201,6 +201,22 @@ $env:HUB_TOKEN = '<server-issued-token>'
 
 Task Spec 中的路径以该 Agent 的 `workspace` 为基准。Checkpoint 默认保存在 `workspace/.agent-hub/checkpoints/<taskId>/`；服务端只收到相对路径、阶段和 ID，不接收本机绝对路径。
 
+连接正式 Server Hub 时，为 Worker 配置独立的 `authTokenEnv`，并启用中央制品传输：
+
+```json
+{
+  "authTokenEnv": "A446_WORKER_TOKEN",
+  "authRequired": true,
+  "artifacts": {
+    "centralStore": true,
+    "apiUrl": "https://hub.example.com",
+    "maxFileBytes": 104857600
+  }
+}
+```
+
+Worker 只上传 Task Spec 的 `expected_outputs`/`artifacts` 声明项。下游任务获得授权引用时，Worker 会在 Adapter 运行前流式下载到允许工作区并复核大小与 SHA-256。本地 Mock 模式未启用 `centralStore` 时仍只生成本地清单。
+
 ## Antigravity 接口边界
 
 Antigravity 使用专用的 `antigravity` 适配器，直接实现官方持续进程协议：
@@ -236,6 +252,7 @@ node scripts/smoke-antigravity.mjs --model gemini-3.8-flash-low
 - `src/quota-probe.mjs`：可选的机器可读客户端额度快照
 - `src/collaboration.mjs`：角色契约、动态调度和 Token 归一化
 - `src/artifact-manifest.mjs`：成果文件 SHA-256 清单
+- `src/artifact-client.mjs`：中央 Artifact 流式上传、下载和本地复核
 - `src/hubctl.mjs`：人工控制 CLI
 - `scripts/check-env.mjs`：四台机器统一环境检查
 - `test/integration.test.mjs`：双 Agent、会话、路由、暂停和审批测试

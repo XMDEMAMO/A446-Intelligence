@@ -5,6 +5,8 @@ import { WebSocket, WebSocketServer } from "ws";
 import { AgentHub } from "../../agent-hub/src/hub.mjs";
 import { loadJsonConfig, parseArgs, resolveFrom } from "../../agent-hub/src/common.mjs";
 import { PostgresHubStore } from "./postgres-hub-store.mjs";
+import { IdentityService } from "./identity-service.mjs";
+import { LocalArtifactStore } from "./local-artifact-store.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.config) {
@@ -30,8 +32,26 @@ const store = new PostgresHubStore({
   ssl: config.storage.ssl,
   migrationsDirectory: path.join(packageRoot, "migrations"),
 });
+if (config.auth?.mode !== "identity") throw new Error("Server Hub requires auth.mode=identity");
+const artifactRootEnv = config.artifacts?.rootDirectoryEnv ?? "A446_ARTIFACT_ROOT";
+const artifactRoot = process.env[artifactRootEnv];
+if (!artifactRoot) throw new Error(`Server Hub artifact root is missing from ${artifactRootEnv}`);
+const authService = new IdentityService({
+  pool: store.pool,
+  sessionTtlMs: config.auth.sessionTtlMs,
+  cookieName: config.auth.cookieName,
+  secureCookies: config.auth.secureCookies !== false,
+  allowedOrigins: config.auth.allowedOrigins,
+});
+const artifactStore = new LocalArtifactStore({
+  rootDirectory: path.resolve(artifactRoot),
+  repositoryRoot: path.resolve(packageRoot, "..", ".."),
+  maxFileBytes: config.artifacts?.maxFileBytes,
+});
 const hub = await new AgentHub(config, {
   store,
+  authService,
+  artifactStore,
   webSocketModule: { WebSocket, WebSocketServer },
 }).start();
 console.log(`Server Hub listening at ${hub.url()} (worker endpoint: ${hub.url().replace(/^http/, "ws")}/worker)`);

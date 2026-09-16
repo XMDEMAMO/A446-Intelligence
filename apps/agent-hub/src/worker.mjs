@@ -9,6 +9,7 @@ import { CodexAdapter } from "./adapters/codex.mjs";
 import { StdioJsonAdapter } from "./adapters/stdio-json.mjs";
 import { AntigravityAdapter } from "./adapters/antigravity.mjs";
 import { buildArtifactManifest } from "./artifact-manifest.mjs";
+import { ArtifactClient } from "./artifact-client.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
 import { initialExecutorStatus, probeLocalCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
@@ -42,6 +43,7 @@ export class AgentWorker {
       sessions: {},
     };
     this.policy = normalizePolicy(config.policy, config.workspace);
+    this.artifactClient = new ArtifactClient(config, this.policy);
     this.checkpoints = new CheckpointStore({
       directory: config.checkpoints?.directory ?? path.join(config.workspace, ".agent-hub", "checkpoints"),
       workspace: config.workspace,
@@ -167,7 +169,7 @@ export class AgentWorker {
           payload: {
             adapter: this.adapter.type,
             capabilities: this.config.capabilities ?? ["task.execute", "pause", "resume", "cancel"],
-            protocolFeatures: ["attempt-lease-v1"],
+            protocolFeatures: ["attempt-lease-v1", ...(this.artifactClient.enabled ? ["artifact-transfer-v1"] : [])],
             sessionId: this.state.sessionId,
             paused: this.state.paused,
             platform: process.platform,
@@ -360,6 +362,7 @@ export class AgentWorker {
     try {
       const role = String(message.payload?.role ?? "").toLowerCase();
       const execution = message.payload?.execution ?? {};
+      await this.artifactClient.downloadReferences(message.payload);
       const sessionKey = String(message.payload?.sessionScopeId ?? "legacy");
       const scopedSessionId = this.state.sessions[sessionKey] ?? (sessionKey === "legacy" ? this.state.sessionId : null);
       const prompt = buildRolePrompt(role, message.payload?.input ?? "", message.payload ?? {});
@@ -380,8 +383,12 @@ export class AgentWorker {
         this.state.sessionId = result.sessionId;
       }
       const taskSpec = message.payload?.taskSpec ?? message.payload?.metadata?.taskSpec;
-      const artifacts = await buildArtifactManifest(taskSpec, this.policy, {
+      const localArtifacts = await buildArtifactManifest(taskSpec, this.policy, {
         maxFileBytes: this.config.artifacts?.maxFileBytes,
+      });
+      const artifacts = await this.artifactClient.uploadManifest(localArtifacts, {
+        taskId: message.taskId,
+        attemptId: message.payload?.attemptId ?? null,
       });
       this.state.executorStatus = statusAfterSuccess(this.state.executorStatus);
       const usage = normalizeUsage(result.usage);

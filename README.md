@@ -7,8 +7,8 @@ A446 Intelligence 是一个通用的本地与分布式 AI Agent 任务控制平�
 当前仓库已经包含可运行的最小原型：
 
 - apps/web：React + TypeScript 的 Agent 群聊控制台；一个任务对应一个群聊，显示角色简报、成果附件和账号用量。
-- apps/agent-hub：local-agent-hub v0.5.0-alpha.1，共享编排核心负责规划/执行/审核闭环、Attempt/Lease、动态 Agent/模型调度、Token/额度统计和本地 Worker 通信。
-- apps/server-hub：PostgreSQL 支持的单进程 Server Hub alpha，提供持久任务、消息、可靠投递、Attempt 和重启恢复。
+- apps/agent-hub：local-agent-hub v0.5.0-alpha.2，共享编排核心负责规划/执行/审核闭环、Attempt/Lease、中央制品传输、动态 Agent/模型调度、Token/额度统计和本地 Worker 通信。
+- apps/server-hub：PostgreSQL 支持的单进程 Server Hub alpha，提供持久调度、独立 Worker/Web 身份、最小 RBAC 和重启可恢复的中央 Artifact Store。
 
 当前发布说明见 [v0.4.0-r8 阶段总结](docs/RELEASE_SUMMARY_v0.4.0-r8.md)。
 
@@ -34,6 +34,7 @@ cd "E:\GitHub\A446 Intelligence"
 - [MVP 原型说明](docs/MVP_PROTOTYPE.md)
 - [v0.5 Server Ready 实施计划](docs/SERVER_READY_V0.5_IMPLEMENTATION_PLAN.md)
 - [v0.5 批次一设计与验收记录](docs/SERVER_READY_V0.5_BATCH1_DESIGN.md)
+- [v0.5 批次二设计与验收记录](docs/SERVER_READY_V0.5_BATCH2_DESIGN.md)
 
 ## 一次完成全部检查
 

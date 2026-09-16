@@ -9,12 +9,6 @@ export default defineConfig({
         target: process.env.HUB_HTTP_URL ?? 'http://127.0.0.1:8787',
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, ''),
-        configure(proxy) {
-          proxy.on('proxyReq', (proxyRequest) => {
-            const token = process.env.HUB_TOKEN
-            if (token) proxyRequest.setHeader('Authorization', 'Bearer ' + token)
-          })
-        },
       },
     },
   },

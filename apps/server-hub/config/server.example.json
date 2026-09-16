@@ -3,8 +3,12 @@
   "port": 8787,
   "heartbeatMs": 5000,
   "auth": {
+    "mode": "identity",
     "required": true,
-    "tokenEnv": "HUB_TOKEN"
+    "sessionTtlMs": 43200000,
+    "cookieName": "a446_session",
+    "secureCookies": true,
+    "allowedOrigins": ["https://hub.example.com"]
   },
   "tls": {
     "enabled": false
@@ -13,6 +17,10 @@
     "driver": "postgres",
     "connectionStringEnv": "A446_DATABASE_URL",
     "maxConnections": 10
+  },
+  "artifacts": {
+    "rootDirectoryEnv": "A446_ARTIFACT_ROOT",
+    "maxFileBytes": 104857600
   },
   "leases": {
     "enabled": true,
