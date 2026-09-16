@@ -36,6 +36,8 @@ cd "E:\GitHub\A446 Intelligence"
 - [v0.5 批次一设计与验收记录](docs/SERVER_READY_V0.5_BATCH1_DESIGN.md)
 - [v0.5 批次二设计与验收记录](docs/SERVER_READY_V0.5_BATCH2_DESIGN.md)
 - [v0.5 批次三设计与实施记录](docs/SERVER_READY_V0.5_BATCH3_DESIGN.md)
+- [v0.5 批次四验证与发布准备记录](docs/SERVER_READY_V0.5_BATCH4_DESIGN.md)
+- [单台预发布服务器配置教程（Ubuntu/Debian）](docs/STAGING_SERVER_SETUP_GUIDE.md)
 
 ## 一次完成全部检查
 

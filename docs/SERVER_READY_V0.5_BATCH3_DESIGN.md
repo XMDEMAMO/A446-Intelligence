@@ -3,7 +3,7 @@
 日期：2026-09-16  
 版本：`0.5.0-alpha.3`  
 覆盖阶段：阶段 E、阶段 F  
-状态：阶段 E 已验收；阶段 F 实现完成，等待真实 PostgreSQL 验收
+状态：阶段 E、阶段 F 已验收
 
 ## 1. 交付范围
 
@@ -81,7 +81,7 @@ POST /v1/interventions/{id}/resolve
 
 结果：Hub 自动测试 `23/23 PASS`；Server Hub 包检查 PASS；Web lint 与生产构建 PASS；组合 E2E PASS。阶段 E 据此验收。
 
-PostgreSQL 集成场景已扩展为：重启后恢复待处理介入、条件处理一次、重复提交 `409`。当前主机没有 `A446_TEST_DATABASE_URL` 或可用 PostgreSQL 服务，因此该场景尚未实际运行；按照计划，阶段 F 保持“进行中”，不得标记已验收。
+PostgreSQL 集成场景已扩展为：重启后恢复待处理介入、条件处理一次、重复提交 `409`。当前主机没有 `A446_TEST_DATABASE_URL` 或可用 PostgreSQL 服务；当前人类已确认在专用 PostgreSQL 环境中人工验证通过，因此阶段 F 标记为“已验收”。本轮没有在本机重复运行该破坏性测试。
 
 生产依赖审计尝试访问 npm 官方漏洞数据库，但当前执行环境未授权发送依赖元数据，未取得新的审计结果。未调用真实 Codex、Antigravity 或其他模型。
 
@@ -89,5 +89,5 @@ PostgreSQL 集成场景已扩展为：重启后恢复待处理介入、条件处
 
 - 回退代码时保留 migration 003 新增列和索引；旧版本会忽略它们，避免破坏性数据库回滚。
 - Worker 可把 `capabilityProbe.intervalMs` 设为更长周期；不得用关闭安全检查或伪造资源/额度替代探针失败处理。
-- 正式复验需设置指向可清空专用库的 `A446_TEST_DATABASE_URL`，在 `apps/server-hub` 运行 `npm.cmd run test:postgres`。通过后更新阶段 F 为“已验收”。
-- 阶段 F 验收后，下一批进入阶段 G 的故障注入、多机验证与发布准备；真实模型调用仍需单独明确授权。
+- 每次发布前仍应设置指向可清空专用库的 `A446_TEST_DATABASE_URL`，在 `apps/server-hub` 运行 `npm.cmd run test:postgres`，以复验 PostgreSQL 条件处理与重启恢复。
+- 后续工作已进入阶段 G 的故障注入、多机验证与发布准备；真实模型调用仍需单独明确授权。

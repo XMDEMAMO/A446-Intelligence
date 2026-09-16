@@ -1,6 +1,6 @@
 # A446 Intelligence 用户手册
 
-适用版本：v0.4.0 本地协作原型
+适用版本：v0.5.0-alpha.3 Server Hub alpha（阶段 G 验证与发布准备中）
 适用对象：普通使用者、演示人员、项目维护者
 
 ## 1. 系统现在怎样工作
@@ -125,7 +125,7 @@ cd "C:\path\to\A446-Intelligence"
 - 同一台设备上的 Agent 使用相同 `deviceId`。
 - 同一登录账号下的 Agent 使用相同的非敏感账号标识。
 - `models` 只列出该账号实际可用的模型。
-- 远端 Hub 提供 WSS 地址和独立 Token。
+- 远端 Server Hub 提供 WSS 地址和绑定 `agentId`/`deviceId` 的独立 Worker 凭据。
 
 不要把密码、Cookie、浏览器资料、验证码或模型账号凭据放进配置、群聊或 Hub。真实模型测试会消耗账号额度，默认测试不会运行。
 
@@ -148,7 +148,9 @@ cd "C:\path\to\A446-Intelligence"
 .\scripts\check-all.ps1
 ```
 
-检查内容包括角色闭环、最小上下文、上游错误裁定、动态模型选择、资源刷新与陈旧降级、人工介入单次恢复、Token/额度解析、Worker 通信、暂停/恢复、审批、取消、网页检查和生产构建。
+检查内容包括角色闭环、最小上下文、上游错误裁定、动态模型选择、资源刷新与陈旧降级、人工介入单次恢复、Token/额度解析、Worker 通信、暂停/恢复、审批、取消、Hub 重启、Executor/Reviewer 断线故障注入、网页检查和生产构建。
+
+涉及正式 Server Hub 的 PostgreSQL、身份或中央 Artifact Store 时，还要对可清空的专用数据库执行 `apps/server-hub` 中的 `npm.cmd run test:postgres`。该命令会清空 A446 表，绝不能指向生产库。
 
 常见问题：
 
@@ -160,9 +162,10 @@ cd "C:\path\to\A446-Intelligence"
 
 ## 10. 当前边界
 
-- 本地 Mock Hub 用于开发；正式 Server Hub alpha 使用 PostgreSQL、独立身份、Artifact Store 和可靠租约，但仍是单进程，不具备多副本高可用或多租户 RBAC。
-- 群聊消息暂存在 Hub 内存中，Hub 重启后不会保留。
-- 跨设备成果存储和下载服务尚未实现；当前附件正文来自任务回传，文件清单仍指向 Worker 本地工作区。
+- 本地 Mock Hub 用于开发；正式 Server Hub alpha 使用 PostgreSQL 持久保存任务、Attempt、群聊消息、可靠投递、人工介入和 Artifact 元数据，并提供独立 Worker/Web 身份、中央 Artifact Store 和可靠租约。
+- 正式 Server Hub 仍是单进程，不具备多副本高可用、自动故障切换、多租户或复杂 RBAC。
+- 跨设备 Artifact 上传、下载和 SHA-256 复核已实现；Mock 模式仍只返回本地 Artifact 清单。
+- 阶段 G 尚在进行：真实 Codex 与 Antigravity 多机流程、目标服务器部署/恢复演练和可联网的生产依赖审计尚未完成。真实模型调用必须由当前人类另行明确授权。
 - QQ 群机器人按当前决定暂不实现。
 
 维护与协议细节见：

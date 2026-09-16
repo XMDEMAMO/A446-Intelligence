@@ -76,3 +76,7 @@ npm.cmd run test:postgres
 ```
 
 The tests truncate all A446 tables in that database. Never point them at a database containing data that must be preserved.
+
+## Operations and release preparation
+
+See [OPERATIONS.md](OPERATIONS.md) for the minimal startup order, environment-variable boundary, TLS/WSS reverse-proxy requirements, coordinated PostgreSQL/Artifact backup and recovery, and release-package checklist. The non-secret variable names are collected in [.env.example](.env.example); it is documentation only and is not loaded automatically.
