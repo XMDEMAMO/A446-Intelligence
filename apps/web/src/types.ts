@@ -90,10 +90,12 @@ export interface TaskSpec {
 }
 
 export interface ArtifactFile {
+  artifactId?: string
   path: string
   size: number
   sha256: string | null
   status: string
+  downloadUrl?: string
 }
 
 export interface ArtifactManifest {

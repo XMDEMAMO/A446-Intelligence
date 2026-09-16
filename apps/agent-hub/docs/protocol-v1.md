@@ -8,8 +8,8 @@
 - 本机测试：`ws://127.0.0.1:8787/worker`
 - 每个 WebSocket text frame 包含一个完整 envelope。
 - Worker 必须主动连接 Hub；Hub 不连接笔记本。
-- 认证头：`Authorization: Bearer <token>`。
-- 正式服务器应从 token 得到允许的 `agentId`，不能只相信 hello 中的声明。
+- Worker 认证头：`Authorization: Bearer <worker-credential>`。正式服务器为每个逻辑 Worker 单独签发高熵凭据，只保存哈希，并从凭据得到允许的 `agentId` 与 `deviceId`，不能相信 hello 中的自报字段。
+- Web 使用服务端 Session Cookie，不与 Worker 共用凭据。共享 Token 仅保留给回环或受信的本地开发 Hub，正式 Server Hub 禁止使用。
 
 ## Handshake
 
@@ -31,7 +31,7 @@
       { "id": "configured-model-a", "capabilities": ["coding"], "quota": { "state": "Unknown", "source": "unavailable", "windows": [] } }
     ],
     "capabilities": ["task.execute", "coding", "pause", "resume", "cancel"],
-    "protocolFeatures": ["attempt-lease-v1"],
+    "protocolFeatures": ["attempt-lease-v1", "artifact-transfer-v1"],
     "sessionId": null,
     "paused": false,
     "platform": "win32",
@@ -148,7 +148,7 @@ Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会�
   "sessionId": "local durable session id",
   "artifacts": {
     "algorithm": "sha256",
-    "files": [{ "path": "artifact.txt", "size": 123, "sha256": "hex", "status": "ready" }],
+    "files": [{ "artifactId": "uuid", "path": "artifact.txt", "size": 123, "sha256": "hex", "status": "ready", "downloadUrl": "/v1/artifacts/uuid/content" }],
     "missing": []
   },
   "checkpoint": { "checkpointId": "id", "stage": "COMPLETED", "path": ".agent-hub/checkpoints/task-id" },
@@ -157,6 +157,14 @@ Task Spec 的 JSON Schema 位于 `protocol/task-spec.schema.json`。Worker 会�
 ```
 
 本地 Policy 拒绝任务时，Worker 返回 `task.rejected`，其中 `payload.code` 为 `POLICY_DENIED`，`payload.reasons` 为拒绝原因列表，并附带 `checkpoint`。服务器必须把它视为终态，不得自动放宽权限后重发。
+
+启用 `artifact-transfer-v1` 时，Worker 在发送 `task.result` 前完成中央制品登记与上传：
+
+1. `POST /v1/artifacts` 登记 Task Spec 已声明的相对输出路径、当前 `taskId`、`attemptId`、字节数和 SHA-256；服务器返回 Artifact ID。
+2. `PUT /v1/artifacts/{artifactId}/content` 流式上传内容。服务器先写临时文件，核对大小与 SHA-256，成功后原子移动并把状态改为 `ready`。
+3. 缺失输出以 `status=missing` 登记；超限、哈希错误、未声明路径和路径逃逸均不能成为 `ready`。
+4. 后续任务从 `contextBundle.artifactReferences` 取得 Artifact ID、受控目标相对路径、大小和哈希，通过 `GET /v1/artifacts/{artifactId}/content` 流式下载；Worker 必须在允许工作区内落盘并再次校验后才能交给 Adapter。
+5. Server Hub 只在全部声明输出都对应当前 Attempt 的 `ready` 记录时接受结果。HTTP 响应不暴露服务器 `storageKey` 或绝对路径。
 
 Worker 至少在 `ACCEPTED / RUNNING / COMPLETED / FAILED / CANCELLED / REJECTED` 阶段保存本地 Checkpoint。Checkpoint 目录包含 `state.json`、`task_spec.json`、`files_manifest.json`、`continuation.md`，有输出时还包含 `partial_output.txt`。
 
@@ -210,6 +218,7 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 ## HTTP control plane
 
 - `GET /health`
+- `POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me`
 - `GET /v1/agents`
 - `GET /v1/events?limit=N`
 - `GET /v1/tasks?rootTaskId=UUID`
@@ -221,5 +230,9 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - `POST /v1/messages`
 - `POST /v1/tasks`
 - `POST /v1/commands`
+- `GET|POST /v1/artifacts`、`PUT|GET /v1/artifacts/{artifactId}/content`
+- 管理员：`GET|POST /v1/admin/workers`、`POST /v1/admin/workers/{credentialId}/rotate`、`DELETE /v1/admin/workers/{credentialId}`、`POST /v1/admin/users`
 
-开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL，并保持相同的 HTTP 与 WebSocket 契约。
+除 `/health` 和登录外，正式服务器的控制面均要求 Web Session。修改请求还必须通过 CSRF 与同源校验；请求体中的 `by`、`senderId` 或其他自报身份不参与授权。管理员可管理身份、批准/取消任务和控制 Worker，普通操作者可创建任务、交流和读取已授权成果。
+
+开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。

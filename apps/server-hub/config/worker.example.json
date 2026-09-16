@@ -1,0 +1,18 @@
+{
+  "agentId": "worker-01",
+  "deviceId": "device-01",
+  "roles": ["executor", "reviewer"],
+  "hubUrl": "wss://hub.example.com/worker",
+  "authTokenEnv": "A446_WORKER_TOKEN",
+  "authRequired": true,
+  "stateFile": "../var/state/worker-01.json",
+  "workspace": "../workspaces/worker-01",
+  "artifacts": {
+    "centralStore": true,
+    "apiUrl": "https://hub.example.com",
+    "maxFileBytes": 104857600
+  },
+  "adapter": {
+    "type": "mock"
+  }
+}

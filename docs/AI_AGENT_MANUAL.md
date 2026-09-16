@@ -110,7 +110,7 @@ Local Hub
   └── 其他兼容 Worker
 ~~~
 
-浏览器不得直接持有 Hub Token。Vite 代理只从服务端进程的 HUB_TOKEN 环境变量读取 Token，并添加 Authorization 请求头。
+本地 Mock Hub 可在回环或受信开发环境使用 Legacy `HUB_TOKEN`。正式 Server Hub 必须使用独立身份：浏览器通过 HttpOnly Session Cookie 登录，Vite 代理不附加共享 Token；每个 Worker 使用绑定 `agentId/deviceId` 的独立凭据。
 
 ## 5. HTTP 控制面
 
@@ -130,6 +130,8 @@ Local Hub
 | POST | /v1/messages | 发送人工群聊旁注 |
 | POST | /v1/tasks | 创建任务 |
 | POST | /v1/commands | 审批、取消、暂停、恢复 |
+
+正式 Server Hub 另提供 `/v1/auth/*`、`/v1/artifacts*` 和管理员身份接口。Artifact 上传下载必须使用认证 Actor，修改型 Web 请求必须携带 CSRF Token；请求体自报的 `by`、`senderId` 或 `agentId` 不能作为授权依据。完整契约见 `apps/agent-hub/docs/protocol-v1.md`。
 
 命令类型：
 
@@ -404,7 +406,7 @@ Antigravity：
 
 不要在测试失败、跳过或只验证 Mock 输出时声称真实模型适配已经通过。
 
-涉及 `apps/server-hub` 持久化或 Lease 行为时，还必须对专用测试库运行：
+涉及 `apps/server-hub` 持久化、Lease、身份或 Artifact Store 行为时，还必须对专用测试库运行：
 
 ~~~powershell
 cd apps\server-hub
@@ -412,7 +414,7 @@ $env:A446_TEST_DATABASE_URL = 'postgresql://USER:PASSWORD@127.0.0.1:5432/a446_te
 npm.cmd run test:postgres
 ~~~
 
-该测试会清空目标数据库中的 A446 表，禁止指向生产库或含有需保留数据的数据库。没有真实 PostgreSQL 结果时，不得宣布持久化或 Lease 阶段通过。
+该测试会清空目标数据库中的 A446 表，禁止指向生产库或含有需保留数据的数据库。没有真实 PostgreSQL 与真实文件流结果时，不得宣布持久化、Lease、身份或 Artifact 阶段通过。
 
 ## 13. 真实 Adapter 检查
 

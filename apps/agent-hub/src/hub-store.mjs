@@ -4,6 +4,7 @@ function emptyState() {
     messages: [],
     agents: [],
     attempts: [],
+    artifacts: [],
     deliveries: [],
     inboundMessages: [],
     auditEvents: [],
@@ -33,6 +34,7 @@ export class MemoryHubStore {
     for (const message of changes.messages ?? []) upsert(this.state.messages, message, (item) => item.messageId);
     for (const agent of changes.agents ?? []) upsert(this.state.agents, agent, (item) => item.agentId);
     for (const attempt of changes.attempts ?? []) upsert(this.state.attempts, attempt, (item) => item.attemptId);
+    for (const artifact of changes.artifacts ?? []) upsert(this.state.artifacts, artifact, (item) => item.artifactId);
     for (const delivery of changes.deliveries ?? []) {
       upsert(this.state.deliveries, delivery, deliveryKey);
     }
@@ -59,7 +61,7 @@ export function createEmptyHubState() {
 
 function normalizeState(seed) {
   const state = emptyState();
-  for (const key of ["tasks", "messages", "agents", "attempts", "deliveries", "inboundMessages", "auditEvents"]) {
+  for (const key of ["tasks", "messages", "agents", "attempts", "artifacts", "deliveries", "inboundMessages", "auditEvents"]) {
     state[key] = Array.isArray(seed[key]) ? structuredClone(seed[key]) : [];
   }
   state.metadata = {

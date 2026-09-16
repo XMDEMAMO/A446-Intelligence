@@ -62,6 +62,7 @@ export class PostgresHubStore {
       const messages = await client.query("SELECT document FROM task_messages ORDER BY sequence");
       const agents = await client.query("SELECT document FROM worker_registrations ORDER BY agent_id");
       const attempts = await client.query("SELECT document FROM task_attempts ORDER BY created_at, attempt_id");
+      const artifacts = await client.query("SELECT document FROM artifacts ORDER BY created_at, artifact_id");
       const deliveries = await client.query("SELECT document FROM outbound_deliveries ORDER BY created_at, message_id");
       const inbound = await client.query("SELECT document FROM inbound_messages ORDER BY received_at, message_id");
       const events = await client.query("SELECT document FROM audit_events ORDER BY sequence");
@@ -72,6 +73,7 @@ export class PostgresHubStore {
         messages: messages.rows.map((row) => row.document),
         agents: agents.rows.map((row) => row.document),
         attempts: attempts.rows.map((row) => row.document),
+        artifacts: artifacts.rows.map((row) => row.document),
         deliveries: deliveries.rows.map((row) => row.document),
         inboundMessages: inbound.rows.map((row) => row.document),
         auditEvents: events.rows.map((row) => row.document),
@@ -93,6 +95,7 @@ export class PostgresHubStore {
       for (const message of changes.messages ?? []) await upsertMessage(client, message);
       for (const agent of changes.agents ?? []) await upsertAgent(client, agent);
       for (const attempt of changes.attempts ?? []) await upsertAttempt(client, attempt);
+      for (const artifact of changes.artifacts ?? []) await upsertArtifact(client, artifact);
       for (const delivery of changes.deliveries ?? []) await upsertDelivery(client, delivery);
       for (const delivery of changes.deletedDeliveries ?? []) {
         await client.query("DELETE FROM outbound_deliveries WHERE agent_id = $1 AND message_id = $2", [delivery.agentId, delivery.messageId]);
@@ -236,6 +239,35 @@ async function upsertDelivery(client, delivery) {
     delivery.envelope.taskId ?? null,
     JSON.stringify(delivery),
     delivery.createdAt ?? delivery.envelope.ts,
+  ]);
+}
+
+async function upsertArtifact(client, artifact) {
+  await client.query(`
+    INSERT INTO artifacts (
+      artifact_id, task_id, root_task_id, attempt_id, status, expected_path,
+      original_name, byte_size, sha256, storage_key, document, created_at, updated_at
+    ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, now())
+    ON CONFLICT (artifact_id) DO UPDATE SET
+      status = EXCLUDED.status,
+      byte_size = EXCLUDED.byte_size,
+      sha256 = EXCLUDED.sha256,
+      storage_key = EXCLUDED.storage_key,
+      document = EXCLUDED.document,
+      updated_at = now()
+  `, [
+    artifact.artifactId,
+    artifact.taskId,
+    artifact.rootTaskId,
+    artifact.attemptId ?? null,
+    artifact.status,
+    artifact.path,
+    artifact.originalName,
+    artifact.size ?? null,
+    artifact.sha256 ?? null,
+    artifact.storageKey ?? null,
+    JSON.stringify(artifact),
+    artifact.createdAt,
   ]);
 }
 

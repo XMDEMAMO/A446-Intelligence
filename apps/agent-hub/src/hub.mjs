@@ -6,6 +6,7 @@ import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
 import { addUsage, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
+import { extractArtifactPaths } from "./local-policy.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
 const ACTIVE_SLOT_STATUSES = new Set(["dispatched", "running", "processing_result"]);
@@ -13,6 +14,7 @@ const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "rej
 const ACTIVE_ATTEMPT_STATUSES = new Set(["assigned", "running"]);
 const RELIABLE_WORKER_MESSAGES = new Set(["task.started", "task.result", "task.error", "task.rejected", "approval.request"]);
 const LEASE_PROTOCOL_FEATURE = "attempt-lease-v1";
+const ARTIFACT_PROTOCOL_FEATURE = "artifact-transfer-v1";
 
 export class AgentHub {
   constructor(config, services = {}) {
@@ -28,8 +30,11 @@ export class AgentHub {
     this.usageTotals = null;
     this.pendingDeliveries = new Map();
     this.attempts = new Map();
+    this.artifacts = new Map();
     this.processedInbound = new Set();
     this.store = services.store ?? new MemoryHubStore();
+    this.authService = services.authService ?? null;
+    this.artifactStore = services.artifactStore ?? null;
     this.webSocketModule = services.webSocketModule ?? null;
     this.WebSocket = null;
     this.persistenceReady = false;
@@ -64,6 +69,7 @@ export class AgentHub {
       return [deliveryKey(restored.agentId, restored.envelope.id), restored];
     }));
     this.attempts = new Map((state.attempts ?? []).map((attempt) => [attempt.attemptId, attempt]));
+    this.artifacts = new Map((state.artifacts ?? []).map((artifact) => [artifact.artifactId, artifact]));
     this.processedInbound = new Set((state.inboundMessages ?? []).map((message) => message.messageId));
     this.log.restore(state.auditEvents ?? []);
 
@@ -108,6 +114,10 @@ export class AgentHub {
 
   markAttempt(attempt) {
     if (attempt?.attemptId) this.dirty.attempts.set(attempt.attemptId, attempt);
+  }
+
+  markArtifact(artifact) {
+    if (artifact?.artifactId) this.dirty.artifacts.set(artifact.artifactId, artifact);
   }
 
   markDelivery(delivery) {
@@ -199,6 +209,8 @@ export class AgentHub {
     this.WebSocket = webSocketModule.WebSocket;
     await this.log.init();
     await this.store.init();
+    await this.authService?.init?.();
+    await this.artifactStore?.init?.();
     this.persistenceReady = true;
     await this.restorePersistedState();
     const requestHandler = this.handleHttp.bind(this);
@@ -214,13 +226,12 @@ export class AgentHub {
 
     this.wss = new webSocketModule.WebSocketServer({ noServer: true });
     this.server.on("upgrade", (request, socket, head) => {
-      const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
-      if (url.pathname !== "/worker" || !this.authorized(request.headers.authorization)) {
-        socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
-        socket.destroy();
-        return;
-      }
-      this.wss.handleUpgrade(request, socket, head, (ws) => this.acceptWorker(ws, request));
+      void this.handleUpgrade(request, socket, head).catch(() => {
+        if (!socket.destroyed) {
+          socket.write("HTTP/1.1 500 Internal Server Error\r\nConnection: close\r\n\r\n");
+          socket.destroy();
+        }
+      });
     });
 
     await new Promise((resolve, reject) => {
@@ -248,10 +259,13 @@ export class AgentHub {
 
   validateSecurity() {
     const remote = !isLoopbackHost(this.host);
-    if (this.config.auth?.required && !this.token) {
+    if (this.config.auth?.mode === "identity") {
+      if (!this.authService) throw new Error("Identity auth mode requires an authService");
+      if (this.config.auth?.tokenEnv) throw new Error("Identity auth mode cannot use a shared Hub token");
+    } else if (this.config.auth?.required && !this.token) {
       throw new Error(`Required Hub token is missing from environment variable ${this.config.auth.tokenEnv}`);
     }
-    if (remote && !this.token) throw new Error("Non-loopback Hub listeners require bearer-token authentication");
+    if (remote && !this.authService && !this.token) throw new Error("Non-loopback Hub listeners require bearer-token authentication");
     if (remote && !this.config.tls?.enabled && !this.config.allowPlaintextRemote) {
       throw new Error("Non-loopback Hub listeners require TLS unless allowPlaintextRemote is explicitly enabled for a trusted tunnel");
     }
@@ -290,7 +304,35 @@ export class AgentHub {
     return supplied.length === expected.length && timingSafeEqual(supplied, expected);
   }
 
-  acceptWorker(ws) {
+  async handleUpgrade(request, socket, head) {
+    const url = new URL(request.url ?? "/", `http://${request.headers.host ?? "localhost"}`);
+    const actor = url.pathname === "/worker" ? await this.authenticateWorkerRequest(request) : null;
+    if (!actor) {
+      socket.write("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
+      socket.destroy();
+      return;
+    }
+    request.a446Actor = actor;
+    this.wss.handleUpgrade(request, socket, head, (ws) => this.acceptWorker(ws, request));
+  }
+
+  async authenticateWorkerRequest(request) {
+    if (this.authService) return this.authService.authenticateWorker(request.headers.authorization);
+    return this.authorized(request.headers.authorization)
+      ? { kind: "worker", id: "legacy-worker", role: "worker", legacy: true }
+      : null;
+  }
+
+  async authenticateHttpRequest(request) {
+    if (this.authService) return this.authService.authenticateWeb(request);
+    return this.authorized(request.headers.authorization)
+      ? { kind: "web", id: "human", username: "human", role: "admin", legacy: true }
+      : null;
+  }
+
+  acceptWorker(ws, request = {}) {
+    const authenticatedActor = request.a446Actor;
+    ws.a446Actor = authenticatedActor;
     let registeredAgentId;
     const helloDeadline = setTimeout(() => ws.close(1008, "worker.hello required"), 5000);
     ws.on("message", async (raw) => {
@@ -299,7 +341,12 @@ export class AgentHub {
         const message = parseEnvelope(raw);
         if (!registeredAgentId) {
           if (message.type !== "worker.hello" || !message.agentId) throw new Error("First message must be worker.hello with agentId");
-          registeredAgentId = message.agentId;
+          if (authenticatedActor && !authenticatedActor.legacy) {
+            if (message.agentId !== authenticatedActor.agentId) throw new Error("Credential is not valid for the claimed agentId");
+            const claimedDeviceId = message.payload?.deviceId ?? message.agentId;
+            if (claimedDeviceId !== authenticatedActor.deviceId) throw new Error("Credential is not valid for the claimed deviceId");
+          }
+          registeredAgentId = authenticatedActor?.agentId ?? message.agentId;
           clearTimeout(helloDeadline);
           const existing = this.connections.get(registeredAgentId);
           if (existing && existing !== ws) existing.close(4001, "Replaced by newer connection");
@@ -317,7 +364,7 @@ export class AgentHub {
             sessionId: message.payload?.sessionId,
             observedCapabilities: message.payload?.observedCapabilities,
             executors: message.payload?.executors ?? [],
-            deviceId: message.payload?.deviceId ?? registeredAgentId,
+            deviceId: authenticatedActor?.deviceId ?? message.payload?.deviceId ?? registeredAgentId,
             account: message.payload?.account ?? null,
             roles: normalizeRoles(message.payload?.roles),
             models: normalizeModels(message.payload?.models, { model: message.payload?.model }),
@@ -344,7 +391,10 @@ export class AgentHub {
             replyTo: message.id,
             payload: {
               heartbeatMs: this.config.heartbeatMs ?? 10000,
-              protocolFeatures: this.leasesEnabled() ? [LEASE_PROTOCOL_FEATURE] : [],
+              protocolFeatures: [
+                ...(this.leasesEnabled() ? [LEASE_PROTOCOL_FEATURE] : []),
+                ...(this.artifactStore ? [ARTIFACT_PROTOCOL_FEATURE] : []),
+              ],
               ...(this.leasesEnabled() ? {
                 leaseTtlMs: this.leaseTtlMs(),
                 lease: { feature: LEASE_PROTOCOL_FEATURE, ttlMs: this.leaseTtlMs() },
@@ -480,11 +530,13 @@ export class AgentHub {
       if (TERMINAL_TASK_STATUSES.has(task.status)) {
         await this.recordLateAttemptMessage(task, agentId, message);
       } else {
-      const terminalStatus = message.type === "task.result" ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
+      const artifactError = this.validateTaskArtifacts(task, message);
+      const acceptedResult = message.type === "task.result" && !artifactError;
+      const terminalStatus = acceptedResult ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
       task.status = "processing_result";
       task.completedAt = new Date().toISOString();
       task.output = message.payload?.output;
-      task.error = message.payload?.error;
+      task.error = artifactError ?? message.payload?.error;
       task.sessionId = message.payload?.sessionId;
       task.artifacts = message.payload?.artifacts;
       task.checkpoint = message.payload?.checkpoint;
@@ -503,13 +555,16 @@ export class AgentHub {
       if (agentRecord) this.markAgent(agentRecord);
       this.completeAttempt(task, terminalStatus, message);
       await this.recordEvent(message.type, { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, payload: message.payload });
-      if (message.type === "task.result") {
+      if (artifactError) {
+        await this.recordEvent("artifact.result_rejected", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, error: artifactError });
+      }
+      if (acceptedResult) {
         this.recordResultMessage(task);
       }
       try {
-        if (message.type === "task.result" && task.workflow?.enabled) {
+        if (acceptedResult && task.workflow?.enabled) {
           await this.advanceWorkflow(task);
-        } else if (message.type === "task.result" && task.route.length > 0) {
+        } else if (acceptedResult && task.route.length > 0) {
           const [nextAgentId, ...rest] = task.route;
           const child = this.createTask({
             targetAgentId: nextAgentId,
@@ -655,7 +710,7 @@ export class AgentHub {
     };
     this.tasks.set(taskId, task);
     this.markTask(task);
-    const sourceRole = task.sourceAgentId === "human"
+    const sourceRole = task.sourceAgentId === "human" || task.sourceAgentId.startsWith("user:")
       ? "human"
       : input.sourceRole ?? this.tasks.get(task.parentTaskId)?.role ?? "agent";
     this.addMessage(task, {
@@ -679,7 +734,7 @@ export class AgentHub {
     };
     const task = this.createTask({
       targetAgentId: workflow.plannerAgentId,
-      sourceAgentId: "human",
+      sourceAgentId: input.sourceAgentId ?? "human",
       input: input.objective.trim(),
       role: "planner",
       stage: "planning",
@@ -778,7 +833,7 @@ export class AgentHub {
             type: "collaboration_execution",
             priority: task.taskSpec?.priority ?? "P1",
             inputs: [],
-            expected_outputs: [],
+            expected_outputs: assignment.expectedOutputs ?? [],
             permissions_required: task.taskSpec?.permissions_required ?? { project_workspace: true },
             checkpoint_policy: { mode: "stage" },
             acceptance: assignment.acceptance?.length ? assignment.acceptance : task.taskSpec?.acceptance ?? [],
@@ -826,7 +881,7 @@ export class AgentHub {
           acceptance: task.taskSpec?.acceptance ?? [],
           executorBrief: submission.brief,
           fullResult: submission.fullResult ?? task.output,
-          artifactReferences: (task.artifacts?.files ?? []).map((file) => ({ path: file.path, sha256: file.sha256, status: file.status })),
+          artifactReferences: (task.artifacts?.files ?? []).map(toArtifactReference),
           resultVersion: `v${task.reviewCycle + 1}`,
         },
       });
@@ -851,7 +906,7 @@ export class AgentHub {
         approved: true,
         executorBrief: reviewed.submission?.brief,
         reviewBrief: submission.brief,
-        artifactReferences: (reviewed.artifacts?.files ?? []).map((file) => ({ path: file.path, sha256: file.sha256, status: file.status })),
+        artifactReferences: (reviewed.artifacts?.files ?? []).map(toArtifactReference),
       });
       return;
     }
@@ -978,9 +1033,11 @@ export class AgentHub {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
     let selection;
     try {
-      const candidates = this.leasesEnabled()
-        ? new Map([...this.agents].filter(([, agent]) => agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE)))
-        : this.agents;
+      const requiresArtifacts = Boolean(this.artifactStore && extractArtifactPaths(task.taskSpec).length);
+      const candidates = new Map([...this.agents].filter(([, agent]) => (
+        (!this.leasesEnabled() || agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
+        && (!requiresArtifacts || agent.protocolFeatures?.includes(ARTIFACT_PROTOCOL_FEATURE))
+      )));
       selection = chooseAgent(candidates, {
         targetAgentId: task.targetAgentId,
         role: task.role,
@@ -1210,7 +1267,153 @@ export class AgentHub {
     return sideEffects === "none" || sideEffects === "idempotent";
   }
 
+  async registerArtifact(body, actor) {
+    if (!this.artifactStore) throw httpError(404, "Artifact Store is not enabled");
+    if (actor?.kind !== "worker") throw httpError(403, "Worker identity required");
+    const task = this.tasks.get(String(body.taskId ?? ""));
+    if (!task) throw httpError(404, "Unknown artifact task");
+    const attemptId = String(body.attemptId ?? "");
+    const attempt = this.attempts.get(attemptId);
+    if (!attempt || task.currentAttemptId !== attemptId || attempt.taskId !== task.taskId) throw httpError(409, "Artifact attempt is not current");
+    if (attempt.workerId !== actor.agentId || task.targetAgentId !== actor.agentId) throw httpError(403, "Worker does not own this task attempt");
+
+    const expectedPath = normalizeArtifactPath(body.path);
+    const declared = [...new Set(extractArtifactPaths(task.taskSpec).map(normalizeArtifactPath))];
+    if (!declared.some((item) => isDeclaredArtifactPath(expectedPath, item))) throw httpError(403, "Artifact path is not declared by the Task Spec");
+    const requestedStatus = body.status === "missing" ? "missing" : "uploading";
+    const size = requestedStatus === "missing" ? null : Number(body.size);
+    const sha256 = requestedStatus === "missing" ? null : String(body.sha256 ?? "").toLowerCase();
+    if (requestedStatus === "uploading") {
+      if (!Number.isSafeInteger(size) || size < 0) throw httpError(400, "Artifact size must be a non-negative integer");
+      if (size > this.artifactStore.maxFileBytes) throw httpError(413, "Artifact exceeds the configured size limit");
+      if (!/^[a-f0-9]{64}$/.test(sha256)) throw httpError(400, "Artifact SHA-256 is invalid");
+    }
+
+    const existing = [...this.artifacts.values()].find((item) => item.attemptId === attemptId && item.path === expectedPath);
+    if (existing) {
+      if (existing.size !== size || existing.sha256 !== sha256) {
+        throw httpError(409, "Artifact metadata conflicts with an existing upload");
+      }
+      if (existing.status === "invalid" && requestedStatus === "uploading") {
+        existing.status = "uploading";
+        existing.storageKey = this.artifactStore.createStorageKey();
+        existing.invalidReason = null;
+        existing.updatedAt = new Date().toISOString();
+        this.markArtifact(existing);
+        await this.recordEvent("artifact.upload_retried", { actor: actor.id, artifactId: existing.artifactId, taskId: task.taskId });
+        await this.flushState();
+      } else if (existing.status !== requestedStatus && existing.status !== "ready") {
+        throw httpError(409, "Artifact metadata conflicts with an existing upload");
+      }
+      return this.publicArtifact(existing);
+    }
+
+    const artifact = {
+      artifactId: randomUUID(),
+      taskId: task.taskId,
+      rootTaskId: task.rootTaskId,
+      attemptId,
+      workerId: actor.agentId,
+      path: expectedPath,
+      originalName: expectedPath.split("/").at(-1),
+      size,
+      sha256,
+      status: requestedStatus,
+      storageKey: requestedStatus === "uploading" ? this.artifactStore.createStorageKey() : null,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    this.artifacts.set(artifact.artifactId, artifact);
+    this.markArtifact(artifact);
+    await this.recordEvent("artifact.registered", {
+      actor: actor.id,
+      artifactId: artifact.artifactId,
+      taskId: task.taskId,
+      attemptId,
+      path: expectedPath,
+      status: artifact.status,
+    });
+    await this.flushState();
+    return this.publicArtifact(artifact);
+  }
+
+  async receiveArtifact(request, artifactId, actor) {
+    const artifact = this.artifacts.get(artifactId);
+    if (!artifact) throw httpError(404, "Unknown artifact");
+    if (actor?.kind !== "worker" || artifact.workerId !== actor.agentId) throw httpError(403, "Artifact upload is not authorized");
+    const attempt = this.attempts.get(artifact.attemptId);
+    const task = this.tasks.get(artifact.taskId);
+    if (!attempt || !task || task.currentAttemptId !== attempt.attemptId || attempt.workerId !== actor.agentId) {
+      throw httpError(409, "Artifact attempt is no longer current");
+    }
+    if (artifact.status === "ready") {
+      request.resume();
+      return this.publicArtifact(artifact);
+    }
+    if (artifact.status !== "uploading") throw httpError(409, `Artifact cannot be uploaded from status ${artifact.status}`);
+    try {
+      await this.artifactStore.receive(request, artifact);
+      artifact.status = "ready";
+      artifact.readyAt = new Date().toISOString();
+      artifact.updatedAt = artifact.readyAt;
+    } catch (error) {
+      artifact.status = "invalid";
+      artifact.invalidReason = String(error.message ?? error).slice(0, 500);
+      artifact.updatedAt = new Date().toISOString();
+      this.markArtifact(artifact);
+      await this.recordEvent("artifact.invalid", { actor: actor.id, artifactId, taskId: artifact.taskId, reason: artifact.invalidReason });
+      await this.flushState();
+      throw error;
+    }
+    this.markArtifact(artifact);
+    await this.recordEvent("artifact.ready", { actor: actor.id, artifactId, taskId: artifact.taskId, size: artifact.size, sha256: artifact.sha256 });
+    await this.flushState();
+    return this.publicArtifact(artifact);
+  }
+
+  publicArtifact(artifact) {
+    const { storageKey: _storageKey, workerId: _workerId, invalidReason: _invalidReason, ...safe } = artifact;
+    return {
+      ...safe,
+      ...(artifact.status === "ready" ? { downloadUrl: `/v1/artifacts/${artifact.artifactId}/content` } : {}),
+    };
+  }
+
+  canReadArtifact(actor, artifact) {
+    if (actor?.kind === "web") return actor.role === "admin" || actor.role === "operator";
+    if (actor?.kind !== "worker") return false;
+    if (artifact.workerId === actor.agentId) return true;
+    return [...this.tasks.values()].some((task) => task.rootTaskId === artifact.rootTaskId
+      && task.targetAgentId === actor.agentId
+      && task.contextBundle?.artifactReferences?.some((item) => item.artifactId === artifact.artifactId));
+  }
+
+  validateTaskArtifacts(task, message) {
+    if (!this.artifactStore || message.type !== "task.result") return null;
+    const declared = [...new Set(extractArtifactPaths(task.taskSpec).map(normalizeArtifactPath))];
+    const files = message.payload?.artifacts?.files ?? [];
+    const normalizedFiles = files.map((file) => ({ file, path: normalizeArtifactPath(file.path) }));
+    for (const expectedPath of declared) {
+      if (!normalizedFiles.some((item) => isDeclaredArtifactPath(item.path, expectedPath))) {
+        return { name: "ArtifactValidationError", message: `Required artifact is not ready: ${expectedPath}` };
+      }
+    }
+    for (const item of normalizedFiles) {
+      if (!declared.some((expectedPath) => isDeclaredArtifactPath(item.path, expectedPath))) {
+        return { name: "ArtifactValidationError", message: `Undeclared artifact in task result: ${item.file.path}` };
+      }
+      const stored = item.file.artifactId ? this.artifacts.get(item.file.artifactId) : null;
+      if (item.file.status !== "ready" || !stored || stored.status !== "ready"
+        || stored.taskId !== task.taskId || stored.attemptId !== message.payload?.attemptId
+        || stored.path !== item.path || stored.sha256 !== item.file.sha256 || stored.size !== item.file.size) {
+        return { name: "ArtifactValidationError", message: `Required artifact is not ready: ${item.path}` };
+      }
+    }
+    return null;
+  }
+
   async handleHttp(request, response) {
+    let requestActor = null;
     try {
       const url = new URL(request.url ?? "/", this.url());
       if (request.method === "GET" && url.pathname === "/health") {
@@ -1230,7 +1433,119 @@ export class AgentHub {
         });
       }
       if (this.storageFault) return json(response, 503, { error: this.storageFault.message });
-      if (!this.authorized(request.headers.authorization)) return json(response, 401, { error: "Unauthorized" });
+      if (request.method === "POST" && url.pathname === "/v1/auth/login") {
+        if (!this.authService) return json(response, 404, { error: "Identity authentication is not enabled" });
+        const body = await readBody(request);
+        const login = await this.authService.login(body.username, body.password);
+        requestActor = login.actor;
+        await this.recordEvent("auth.login", { actor: login.actor.id, result: "success" });
+        await this.flushState();
+        return json(response, 200, {
+          user: publicActor(login.actor),
+          csrfToken: login.csrfToken,
+          expiresAt: login.expiresAt,
+        }, { "set-cookie": [login.cookie, login.csrfCookie] });
+      }
+
+      const artifactRoute = url.pathname.match(/^\/v1\/artifacts\/([0-9a-f-]{36})(?:\/(content))?$/i);
+      const artifactRequest = url.pathname === "/v1/artifacts" || Boolean(artifactRoute);
+      let actor = await this.authenticateHttpRequest(request);
+      if (!actor && artifactRequest && this.authService) actor = await this.authService.authenticateWorker(request.headers.authorization);
+      if (!actor) return json(response, 401, { error: "Unauthorized" });
+      requestActor = actor;
+
+      if (request.method === "GET" && url.pathname === "/v1/auth/me") {
+        if (actor.kind !== "web") return json(response, 403, { error: "Web user session required" });
+        return json(response, 200, { user: publicActor(actor) });
+      }
+      if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
+        this.requireWebMutation(request, actor);
+        const cookies = await this.authService.logout(actor);
+        await this.recordEvent("auth.logout", { actor: actor.id, result: "success" });
+        await this.flushState();
+        return json(response, 200, { ok: true }, { "set-cookie": [cookies.sessionCookie, cookies.csrfCookie] });
+      }
+
+      if (request.method === "POST" && url.pathname === "/v1/artifacts") {
+        const artifact = await this.registerArtifact(await readBody(request), actor);
+        return json(response, 201, { artifact });
+      }
+      if (request.method === "PUT" && artifactRoute?.[2] === "content") {
+        const artifact = await this.receiveArtifact(request, artifactRoute[1], actor);
+        return json(response, 200, { artifact });
+      }
+      if (request.method === "GET" && artifactRoute?.[2] === "content") {
+        const artifact = this.artifacts.get(artifactRoute[1]);
+        if (!artifact) return json(response, 404, { error: "Unknown artifact" });
+        if (!this.canReadArtifact(actor, artifact)) return json(response, 403, { error: "Artifact download is not authorized" });
+        if (artifact.status !== "ready") return json(response, 409, { error: `Artifact is ${artifact.status}` });
+        try {
+          const object = await this.artifactStore.open(artifact);
+          response.writeHead(200, {
+            "content-type": "application/octet-stream",
+            "content-length": object.size,
+            "content-disposition": contentDisposition(artifact.originalName),
+            "x-artifact-sha256": artifact.sha256,
+            "cache-control": "private, no-store",
+          });
+          object.stream.pipe(response);
+          return;
+        } catch (error) {
+          if (error.code !== "ENOENT") throw error;
+          artifact.status = "missing";
+          artifact.updatedAt = new Date().toISOString();
+          this.markArtifact(artifact);
+          await this.recordEvent("artifact.missing", { actor: actor.id, artifactId: artifact.artifactId, taskId: artifact.taskId });
+          await this.flushState();
+          return json(response, 404, { error: "Artifact object is missing" });
+        }
+      }
+      if (request.method === "GET" && url.pathname === "/v1/artifacts") {
+        const taskId = url.searchParams.get("taskId");
+        const artifacts = [...this.artifacts.values()]
+          .filter((artifact) => (!taskId || artifact.taskId === taskId) && this.canReadArtifact(actor, artifact))
+          .map((artifact) => this.publicArtifact(artifact));
+        return json(response, 200, { artifacts });
+      }
+
+      if (url.pathname.startsWith("/v1/admin/")) {
+        this.requireAdmin(request, actor);
+        if (request.method === "GET" && url.pathname === "/v1/admin/workers") {
+          return json(response, 200, { credentials: await this.authService.listWorkerCredentials() });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/admin/workers") {
+          const credential = await this.authService.createWorkerCredential(await readBody(request));
+          await this.recordEvent("credential.created", { actor: actor.id, credentialId: credential.credentialId, agentId: credential.agentId, deviceId: credential.deviceId, result: "success" });
+          await this.flushState();
+          return json(response, 201, { credential });
+        }
+        const rotate = url.pathname.match(/^\/v1\/admin\/workers\/([0-9a-f-]{36})\/rotate$/i);
+        if (request.method === "POST" && rotate) {
+          const credential = await this.authService.rotateWorkerCredential(rotate[1]);
+          this.disconnectCredential(rotate[1]);
+          await this.recordEvent("credential.rotated", { actor: actor.id, previousCredentialId: rotate[1], credentialId: credential.credentialId, agentId: credential.agentId, result: "success" });
+          await this.flushState();
+          return json(response, 200, { credential });
+        }
+        const revoke = url.pathname.match(/^\/v1\/admin\/workers\/([0-9a-f-]{36})$/i);
+        if (request.method === "DELETE" && revoke) {
+          const credential = await this.authService.revokeWorkerCredential(revoke[1]);
+          this.disconnectCredential(revoke[1]);
+          await this.recordEvent("credential.revoked", { actor: actor.id, credentialId: credential.credentialId, agentId: credential.agentId, result: "success" });
+          await this.flushState();
+          return json(response, 200, { credential });
+        }
+        if (request.method === "POST" && url.pathname === "/v1/admin/users") {
+          const user = await this.authService.createUser(await readBody(request));
+          await this.recordEvent("user.created", { actor: actor.id, userId: user.userId, username: user.username, role: user.role, result: "success" });
+          await this.flushState();
+          return json(response, 201, { user });
+        }
+        return json(response, 404, { error: "Not found" });
+      }
+
+      if (actor.kind !== "web") return json(response, 403, { error: "Web user session required" });
+      if (!["GET", "HEAD", "OPTIONS"].includes(request.method ?? "GET")) this.requireWebMutation(request, actor);
       if (request.method === "GET" && url.pathname === "/v1/agents") {
         return json(response, 200, { agents: [...this.agents.values()] });
       }
@@ -1286,7 +1601,7 @@ export class AgentHub {
       }
       if (request.method === "POST" && url.pathname === "/v1/workflows") {
         const body = await readBody(request);
-        const task = await this.createWorkflow(body);
+        const task = await this.createWorkflow({ ...body, sourceAgentId: actor.id });
         await this.commitAndDispatch();
         return json(response, 202, { task });
       }
@@ -1296,7 +1611,7 @@ export class AgentHub {
         const task = this.tasks.get(body.taskId ?? body.rootTaskId);
         if (!task || task.rootTaskId !== String(body.rootTaskId ?? task.rootTaskId)) return json(response, 404, { error: "Unknown task conversation" });
         const message = this.addMessage(task, {
-          senderId: body.senderId ?? "human",
+          senderId: actor.id,
           senderRole: "human",
           kind: "message",
           text: body.text.trim(),
@@ -1308,14 +1623,14 @@ export class AgentHub {
       if (request.method === "POST" && url.pathname === "/v1/tasks") {
         const body = await readBody(request);
         if (typeof body.input !== "string" || (!body.targetAgentId && !body.role)) return json(response, 400, { error: "string input and targetAgentId or role are required" });
-        const task = this.createTask(body);
+        const task = this.createTask({ ...body, sourceAgentId: actor.id });
         await this.queueOrDispatch(task);
         await this.commitAndDispatch();
         return json(response, 202, { task });
       }
       if (request.method === "POST" && url.pathname === "/v1/commands") {
         const body = await readBody(request);
-        const result = await this.handleCommand(body);
+        const result = await this.handleCommand(body, actor);
         await this.commitAndDispatch();
         return json(response, 200, result);
       }
@@ -1323,7 +1638,13 @@ export class AgentHub {
     } catch (error) {
       if (!this.storageFault) {
         try {
-          await this.recordEvent("http.error", { error: safeError(error) });
+          await this.recordEvent("http.error", {
+            actor: requestActor?.id ?? "anonymous",
+            method: request.method,
+            path: new URL(request.url ?? "/", this.url()).pathname,
+            result: "error",
+            error: safeError(error),
+          });
           await this.flushState();
         } catch {}
       }
@@ -1332,7 +1653,23 @@ export class AgentHub {
     }
   }
 
-  async handleCommand(command) {
+  requireWebMutation(request, actor) {
+    if (actor?.kind !== "web") throw httpError(403, "Web user session required");
+    if (!actor.legacy) this.authService.verifyCsrf(request, actor);
+  }
+
+  disconnectCredential(credentialId) {
+    for (const connection of this.connections.values()) {
+      if (connection.a446Actor?.credentialId === credentialId) connection.close(4003, "Worker credential revoked");
+    }
+  }
+
+  requireAdmin(request, actor) {
+    if (actor?.kind !== "web" || actor.role !== "admin") throw httpError(403, "Administrator role required");
+    if (!["GET", "HEAD", "OPTIONS"].includes(request.method ?? "GET")) this.requireWebMutation(request, actor);
+  }
+
+  async handleCommand(command, actor = { id: "human", role: "admin" }) {
     if (command.type === "workflow.human_response") {
       const root = this.tasks.get(command.rootTaskId);
       if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
@@ -1344,16 +1681,16 @@ export class AgentHub {
         status: "resolved",
         response,
         resolvedAt: new Date().toISOString(),
-        resolvedBy: command.by ?? "human",
+        resolvedBy: actor.id,
       };
       this.markTask(root);
-      this.addMessage(root, { senderId: command.by ?? "human", senderRole: "human", kind: "human_decision", text: response });
+      this.addMessage(root, { senderId: actor.id, senderRole: "human", kind: "human_decision", text: response });
       const planner = this.createTask({
         targetAgentId: root.workflow?.plannerAgentId,
         input: "根据人工决定继续规划。",
         rootTaskId: root.taskId,
         parentTaskId: root.taskId,
-        sourceAgentId: command.by ?? "human",
+        sourceAgentId: actor.id,
         role: "planner",
         stage: "human_followup",
         workflow: root.workflow,
@@ -1362,23 +1699,25 @@ export class AgentHub {
         contextBundle: { objective: root.input, humanResponse: response },
       });
       await this.queueOrDispatch(planner);
-      await this.recordEvent("workflow.human_response", { rootTaskId: root.taskId, by: command.by ?? "human" });
+      await this.recordEvent("workflow.human_response", { rootTaskId: root.taskId, actor: actor.id });
       return { ok: true, task: planner };
     }
     if (command.type === "task.approve") {
+      if (actor.role !== "admin") throw httpError(403, "Administrator role required for task approval");
       const task = this.tasks.get(command.taskId);
       if (!task) throw httpError(404, `Unknown task ${command.taskId}`);
       if (task.status !== "awaiting_approval" || !task.requiresApproval) {
         throw httpError(409, `Task ${command.taskId} is not awaiting approval`);
       }
       task.requiresApproval = false;
-      task.approval = { ...(task.approval ?? {}), approvedAt: new Date().toISOString(), approvedBy: command.by ?? "human" };
+      task.approval = { ...(task.approval ?? {}), approvedAt: new Date().toISOString(), approvedBy: actor.id };
       this.markTask(task);
       await this.queueOrDispatch(task);
-      await this.recordEvent("task.approved", { taskId: task.taskId, by: command.by ?? "human" });
+      await this.recordEvent("task.approved", { taskId: task.taskId, actor: actor.id });
       return { ok: true, task };
     }
     if (["agent.pause", "agent.resume"].includes(command.type)) {
+      if (actor.role !== "admin") throw httpError(403, "Administrator role required for agent control");
       const agent = this.agents.get(command.targetAgentId);
       if (agent) {
         agent.paused = command.type === "agent.pause";
@@ -1390,10 +1729,11 @@ export class AgentHub {
           if (task.targetAgentId === command.targetAgentId && task.status === "queued") await this.queueOrDispatch(task);
         }
       }
-      await this.recordEvent(command.type, { agentId: command.targetAgentId });
+      await this.recordEvent(command.type, { actor: actor.id, agentId: command.targetAgentId });
       return { ok: true, agent };
     }
     if (command.type === "task.cancel") {
+      if (actor.role !== "admin") throw httpError(403, "Administrator role required for task cancellation");
       const task = this.tasks.get(command.taskId);
       if (!task) throw httpError(404, `Unknown task ${command.taskId}`);
       if (!ACTIVE_TASK_STATUSES.has(task.status)) {
@@ -1416,7 +1756,7 @@ export class AgentHub {
           payload: { attemptId: task.currentAttemptId ?? null },
         }));
       }
-      await this.recordEvent("task.cancelled", { taskId: task.taskId, agentId: task.targetAgentId, attemptId: task.currentAttemptId ?? null });
+      await this.recordEvent("task.cancelled", { actor: actor.id, taskId: task.taskId, agentId: task.targetAgentId, attemptId: task.currentAttemptId ?? null });
       await this.retryQueuedTasks();
       return { ok: true, task };
     }
@@ -1431,6 +1771,7 @@ function createDirtyState() {
     messages: new Map(),
     agents: new Map(),
     attempts: new Map(),
+    artifacts: new Map(),
     deliveries: new Map(),
     deletedDeliveries: new Map(),
     inboundMessages: new Map(),
@@ -1445,6 +1786,7 @@ function hasDirtyState(dirty) {
     || dirty.messages.size > 0
     || dirty.agents.size > 0
     || dirty.attempts.size > 0
+    || dirty.artifacts.size > 0
     || dirty.deliveries.size > 0
     || dirty.deletedDeliveries.size > 0
     || dirty.inboundMessages.size > 0
@@ -1460,6 +1802,7 @@ function takeDirtyState(hub) {
     messages: structuredClone([...dirty.messages.values()]),
     agents: structuredClone([...dirty.agents.values()]),
     attempts: structuredClone([...dirty.attempts.values()]),
+    artifacts: structuredClone([...dirty.artifacts.values()]),
     deliveries: structuredClone([...dirty.deliveries.values()]),
     deletedDeliveries: structuredClone([...dirty.deletedDeliveries.values()]),
     inboundMessages: structuredClone([...dirty.inboundMessages.values()]),
@@ -1479,6 +1822,7 @@ function mergeDirtyState(dirty, changes) {
   for (const message of changes.messages ?? []) dirty.messages.set(message.messageId, message);
   for (const agent of changes.agents ?? []) dirty.agents.set(agent.agentId, agent);
   for (const attempt of changes.attempts ?? []) dirty.attempts.set(attempt.attemptId, attempt);
+  for (const artifact of changes.artifacts ?? []) dirty.artifacts.set(artifact.artifactId, artifact);
   for (const delivery of changes.deliveries ?? []) dirty.deliveries.set(deliveryKey(delivery.agentId, delivery.envelope.id), delivery);
   for (const delivery of changes.deletedDeliveries ?? []) {
     const key = deliveryKey(delivery.agentId, delivery.messageId);
@@ -1492,6 +1836,45 @@ function mergeDirtyState(dirty, changes) {
 
 function deliveryKey(agentId, messageId) {
   return `${agentId}:${messageId}`;
+}
+
+function toArtifactReference(file) {
+  return {
+    artifactId: file.artifactId,
+    path: file.path,
+    size: file.size,
+    sha256: file.sha256,
+    status: file.status,
+  };
+}
+
+function normalizeArtifactPath(value) {
+  const raw = String(value ?? "").trim().replaceAll("\\", "/");
+  if (!raw || raw.startsWith("/") || /^[A-Za-z]:\//.test(raw) || raw.includes("\0")) {
+    throw httpError(400, "Artifact path must be a relative workspace path");
+  }
+  const parts = raw.split("/").filter((part) => part && part !== ".");
+  if (parts.some((part) => part === "..")) throw httpError(400, "Artifact path cannot escape the workspace");
+  const normalized = parts.join("/");
+  if (!normalized) throw httpError(400, "Artifact path must name a file or subdirectory");
+  return normalized;
+}
+
+function isDeclaredArtifactPath(candidate, declaration) {
+  return candidate === declaration || candidate.startsWith(`${declaration}/`);
+}
+
+function publicActor(actor) {
+  return {
+    id: actor.id,
+    username: actor.username,
+    role: actor.role,
+  };
+}
+
+function contentDisposition(filename) {
+  const fallback = String(filename ?? "artifact.bin").replace(/[^A-Za-z0-9._-]/g, "_") || "artifact.bin";
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(String(filename ?? fallback))}`;
 }
 
 function httpError(statusCode, message) {
@@ -1509,11 +1892,13 @@ async function readBody(request) {
   return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
 }
 
-function json(response, status, value) {
+function json(response, status, value, headers = {}) {
   const body = JSON.stringify(value, null, 2);
   response.writeHead(status, {
     "content-type": "application/json; charset=utf-8",
     "content-length": Buffer.byteLength(body),
+    "cache-control": "no-store",
+    ...headers,
   });
   response.end(body);
 }

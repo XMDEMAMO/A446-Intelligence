@@ -112,7 +112,7 @@ export function chooseAgent(agents, request = {}) {
 export function buildRolePrompt(role, input, payload = {}) {
   if (!ROLE_SET.has(role)) return String(input ?? "");
   const contract = role === "planner"
-    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[]}],"needsHuman":false,"humanQuestion":null}. Do not execute or review the work. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
+    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"]}],"needsHuman":false,"humanQuestion":null}. Do not execute or review the work. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
     : role === "executor"
       ? `Return JSON only: {"brief":"short task brief","fullResult":"complete result","upstreamIssue":null}. If an upstream result is wrong, set upstreamIssue to {"summary":"...","evidence":["..."],"impact":"...","recommendation":"..."}; do not silently correct upstream work.`
       : `Return JSON only: {"verdict":"approved|rejected|upstream_confirmed|upstream_denied","brief":"review summary","issues":[],"correctionBrief":null}. Review only the submitted full result against the acceptance criteria.`;
@@ -218,6 +218,9 @@ function normalizeAssignment(value) {
     instructions: cleanText(value.instructions, 20_000),
     acceptance: Array.isArray(value.acceptance) ? value.acceptance.map((item) => cleanText(item, 1000)) : [],
     requiredCapabilities: Array.isArray(value.requiredCapabilities) ? value.requiredCapabilities.map(String) : [],
+    expectedOutputs: Array.isArray(value.expectedOutputs ?? value.expected_outputs)
+      ? (value.expectedOutputs ?? value.expected_outputs).map((item) => typeof item === "string" ? cleanText(item, 1000) : item?.path ? { path: cleanText(item.path, 1000) } : null).filter(Boolean)
+      : [],
     targetAgentId: value.targetAgentId ? String(value.targetAgentId) : null,
     modelPreference: value.modelPreference ? String(value.modelPreference) : null,
   };
@@ -234,7 +237,13 @@ function normalizeUpstreamIssue(value) {
 }
 
 function artifactReferences(artifacts) {
-  return (artifacts?.files ?? []).map((file) => ({ path: file.path, sha256: file.sha256, status: file.status }));
+  return (artifacts?.files ?? []).map((file) => ({
+    artifactId: file.artifactId,
+    path: file.path,
+    size: file.size,
+    sha256: file.sha256,
+    status: file.status,
+  }));
 }
 
 function extractJsonObject(text) {
