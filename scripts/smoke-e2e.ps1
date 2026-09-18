@@ -75,6 +75,22 @@ function Wait-ForWorkflow {
   throw "Timed out waiting for workflow $RootTaskId."
 }
 
+function Wait-ForMessageAttachment {
+  param([string]$RootTaskId, [string]$AttachmentType)
+  for ($Attempt = 0; $Attempt -lt 50; $Attempt++) {
+    $Messages = @((Invoke-HubRequest -Method Get -Path "/v1/messages?rootTaskId=$RootTaskId").messages)
+    foreach ($Message in $Messages) {
+      foreach ($Attachment in @($Message.attachments)) {
+        if ([string]$Attachment.type -eq $AttachmentType) {
+          return $Messages
+        }
+      }
+    }
+    Start-Sleep -Milliseconds 100
+  }
+  throw "Timed out waiting for attachment $AttachmentType in workflow $RootTaskId."
+}
+
 try {
   $Health = $null
   try {
@@ -100,10 +116,11 @@ try {
   Assert-True ($WorkflowTasks.Count -eq 4) 'workflow should run planner, executor, reviewer, and planner intake'
   $WorkflowRoles = @($WorkflowTasks | ForEach-Object role)
   Assert-True (($WorkflowRoles -join ',') -eq 'planner,executor,reviewer,planner') 'workflow role order should be planner, executor, reviewer, planner'
-  $Messages = @((Invoke-HubRequest -Method Get -Path "/v1/messages?rootTaskId=$($Workflow.task.rootTaskId)").messages)
-  Assert-True (($Messages | Where-Object { $_.attachments.type -contains 'full_result' }).Count -ge 1) 'executor should publish a full-result attachment'
+  $Messages = Wait-ForMessageAttachment -RootTaskId $Workflow.task.rootTaskId -AttachmentType 'full_result'
+  $FullResultAttachmentCount = @($Messages | ForEach-Object { $_.attachments } | Where-Object { $_.type -eq 'full_result' }).Count
+  Assert-True ($FullResultAttachmentCount -ge 1) 'executor should publish a full-result attachment'
   $Conversations = @((Invoke-HubRequest -Method Get -Path '/v1/conversations').conversations)
-  Assert-True (($Conversations | Where-Object rootTaskId -eq $Workflow.task.rootTaskId).Count -eq 1) 'one root task should create one conversation'
+  Assert-True (@($Conversations | Where-Object rootTaskId -eq $Workflow.task.rootTaskId).Count -eq 1) 'one root task should create one conversation'
   $Usage = Invoke-HubRequest -Method Get -Path '/v1/usage'
   Assert-True ($Usage.totals.totalTokens -gt 0) 'workflow should accumulate token counts'
 

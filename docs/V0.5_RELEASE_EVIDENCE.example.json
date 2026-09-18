@@ -1,0 +1,13 @@
+{
+  "baseSha": "35bcf43",
+  "releaseHead": "replace-with-integration-head",
+  "checkAll": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "browserE2E": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "postgresql": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "dependencyAudit": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "backupRestore": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "versionRollback": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "workerRestart": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "httpsWss": { "status": "pending", "recordedAt": null, "evidence": [] },
+  "realMultiDevice": { "status": "pending", "recordedAt": null, "evidence": [] }
+}
