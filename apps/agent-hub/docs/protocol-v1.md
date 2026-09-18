@@ -268,4 +268,34 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 
 除 `/health` 和登录外，正式服务器的控制面均要求 Web Session。修改请求还必须通过 CSRF 与同源校验；请求体中的 `by`、`senderId` 或其他自报身份不参与授权。管理员可管理身份、批准/取消任务和控制 Worker，普通操作者可创建任务、交流和读取已授权成果。
 
+### v0.5 并行实施控制面增量
+
+`POST /v1/workflows` 新增可选字段 `executorAgentId?: string | null`。缺失或 `null` 保持自动调度；非空值是硬约束，优先于 Planner assignment 的 `targetAgentId`。创建时指定 Agent 不存在、离线、暂停或角色不匹配时返回 HTTP `409` 与 `code=EXECUTOR_UNAVAILABLE`，不得创建半成品 Workflow，也不得静默回退到其他 Agent。执行 revision、Attempt 恢复和 Hub 重启必须保留实际执行者与原 `sessionScopeId`。
+
+为兼容已有 Task 响应，`schedulingError` 继续是可读字符串，并可增加 `schedulingErrorCode` 与 `schedulingErrorDetails`。旧客户端可以忽略新增字段。
+
+正式 Server Hub 的用户管理接口扩展为：
+
+- `GET /v1/admin/users`
+- `POST /v1/admin/users`，只允许创建 `operator`；HTTP 创建 `admin` 必须拒绝
+- `PATCH /v1/admin/users/{userId}`，只允许启用或停用 `operator`
+- `POST /v1/admin/users/{userId}/revoke-sessions`
+
+Worker 管理沿用现有路径。同一 `agentId` 最多存在一个 active 凭据；创建冲突返回 `409 ACTIVE_CREDENTIAL_EXISTS`。轮换必须在同一事务中撤销旧凭据并签发新凭据，提交后立即断开旧连接。明文 Token 只允许出现在创建或轮换成功响应中一次，不得进入列表、日志、事件或 URL。
+
+登录失败必须同时受来源 IP 和规范化用户名维度的可恢复限流保护。无效用户名、错误密码与停用用户统一返回 `401 AUTH_INVALID_CREDENTIALS`；限流返回 `429 AUTH_RATE_LIMITED`、`Retry-After` 和 `retryAfterMs`。默认只信任 socket 对端地址，只有显式配置受信反向代理后才读取转发地址。
+
+新增关键错误使用向后兼容结构：
+
+```json
+{
+  "error": "human-readable summary",
+  "code": "MACHINE_READABLE_CODE",
+  "details": {},
+  "retryAfterMs": 1000
+}
+```
+
+现有客户端可以继续只读取 `error`。`details` 不得包含密码、Token、Session Secret、CSRF Secret 或其他敏感值。完整字段、查询摘要规则、冻结错误码和跨账号所有权见 `docs/V0.5_SHARED_CONTRACT.md`。
+
 开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。
