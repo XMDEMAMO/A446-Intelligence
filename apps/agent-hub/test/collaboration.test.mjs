@@ -34,6 +34,80 @@ test("usage normalization and scheduler keep account, role, model, and quota sep
   assert.equal(selected.model.id, "large");
 });
 
+test("a named executor is a hard scheduling constraint with stable failure codes", () => {
+  const executor = agent("chosen", "executor");
+  const agents = new Map([[executor.agentId, executor], ["other", agent("other", "executor")]]);
+  const request = { targetAgentId: "chosen", role: "executor", requireDeclaredRole: true };
+  executor.paused = true;
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_PAUSED");
+  executor.paused = false;
+  executor.roles = ["reviewer"];
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_ROLE_MISMATCH");
+  executor.roles = ["executor"];
+  executor.activeTaskCount = 1;
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_AT_CAPACITY");
+  executor.activeTaskCount = 0;
+  executor.quotaSnapshot = { state: "Exhausted" };
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_QUOTA_UNAVAILABLE");
+  executor.quotaSnapshot = { state: "Unknown" };
+  executor.status = "offline";
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_UNAVAILABLE");
+  assert.equal(agents.get("other").status, "online");
+});
+
+test("a queued named executor reports an unsupported lease protocol without drifting", async () => {
+  const hub = new AgentHub({ leases: { enabled: true }, logs: { includePayloads: false } });
+  hub.agents.set("chosen", agent("chosen", "executor"));
+  const task = hub.createTask({
+    input: "lease task", targetAgentId: "chosen", role: "executor",
+    workflow: { enabled: true, executorAgentId: "chosen" },
+  });
+  await hub.queueOrDispatch(task);
+  assert.equal(task.status, "queued");
+  assert.equal(task.targetAgentId, "chosen");
+  assert.equal(task.schedulingErrorCode, "EXECUTOR_UNAVAILABLE");
+  assert.equal(task.schedulingErrorDetails.reason, "lease_protocol_unsupported");
+});
+
+test("workflow creation binds an explicit executor and revisions keep its session", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: false } });
+  hub.agents = new Map([
+    ["planner", agent("planner", "planner")],
+    ["chosen", agent("chosen", "executor")],
+    ["other", agent("other", "executor")],
+  ]);
+  await assert.rejects(
+    hub.createWorkflow({ objective: "work", executorAgentId: "missing" }),
+    (error) => error.statusCode === 409 && error.code === "EXECUTOR_UNAVAILABLE",
+  );
+  assert.equal(hub.tasks.size, 0);
+  hub.agents.get("chosen").paused = true;
+  await assert.rejects(
+    hub.createWorkflow({ objective: "work", executorAgentId: "chosen" }),
+    (error) => error.statusCode === 409 && error.details.reason === "paused",
+  );
+  hub.agents.get("chosen").paused = false;
+  const root = await hub.createWorkflow({ objective: "work", plannerAgentId: "planner", executorAgentId: "chosen" });
+  assert.equal(root.workflow.executorAgentId, "chosen");
+  root.submission = { brief: "plan", assignments: [{ title: "part", instructions: "do work", targetAgentId: "other" }] };
+  await hub.advanceWorkflow(root);
+  const execution = [...hub.tasks.values()].find((task) => task.role === "executor");
+  assert.equal(execution.requestedAgentId, "chosen");
+  assert.equal(execution.targetAgentId, "chosen");
+  assert.equal(execution.sessionScopeId, execution.taskId);
+  assert.ok(hub.log.recent(100).some((event) => event.type === "workflow.executor_override"));
+  const review = hub.createTask({
+    input: "review", rootTaskId: root.taskId, parentTaskId: execution.taskId,
+    role: "reviewer", stage: "result_review", workflow: root.workflow,
+  });
+  const revision = await hub.createRevisionTask(review, execution, { correctionBrief: "revise" }, 1);
+  assert.equal(revision, undefined);
+  const revisedTask = [...hub.tasks.values()].find((task) => task.stage === "revision");
+  assert.equal(revisedTask.targetAgentId, "chosen");
+  assert.equal(revisedTask.requestedAgentId, "chosen");
+  assert.equal(revisedTask.sessionScopeId, execution.sessionScopeId);
+});
+
 test("role output parser defaults an unstructured review to rejection", () => {
   assert.equal(parseRoleSubmission("reviewer", "looks okay").verdict, "rejected");
   assert.equal(parseRoleSubmission("executor", '{"brief":"done","fullResult":"complete"}').fullResult, "complete");
@@ -120,7 +194,7 @@ test("planner, executor, and reviewer form one minimal-context task conversation
         roles: ["planner"],
         models: [{ id: "plan-model", capabilities: ["reasoning"], quota: { state: "Healthy" } }],
         roleOutputs: {
-          "planner:planning": { brief: "split once", assignments: [{ title: "draft", instructions: "produce result", acceptance: ["complete"] }], needsHuman: false },
+          "planner:planning": { brief: "split once", assignments: [{ title: "draft", instructions: "produce result", acceptance: ["complete"], targetAgentId: "unavailable-executor" }], needsHuman: false },
           planner: { brief: "accepted result", assignments: [], needsHuman: false },
         },
       },
@@ -161,6 +235,7 @@ test("planner, executor, and reviewer form one minimal-context task conversation
       title: "Collaborative task",
       objective: "Solve one problem",
       acceptance: ["complete"],
+      executorAgentId: "executor-1",
     });
     const rootId = response.task.rootTaskId;
     await waitUntil(() => {
@@ -170,6 +245,7 @@ test("planner, executor, and reviewer form one minimal-context task conversation
 
     const tasks = [...hub.tasks.values()].filter((task) => task.rootTaskId === rootId);
     assert.deepEqual(tasks.map((task) => task.role), ["planner", "executor", "reviewer", "planner"]);
+    assert.equal(tasks.find((task) => task.role === "executor").targetAgentId, "executor-1");
     assert.deepEqual(tasks.map((task) => task.execution.model), ["plan-model", "work-model", "review-model", "plan-model"]);
     const reviewer = tasks.find((task) => task.role === "reviewer");
     const intake = tasks.find((task) => task.stage === "result_intake");

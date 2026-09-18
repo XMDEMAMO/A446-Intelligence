@@ -1,5 +1,6 @@
 import http from "node:http";
 import https from "node:https";
+import { isIP } from "node:net";
 import { readFile } from "node:fs/promises";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
@@ -513,6 +514,13 @@ export class AgentHub {
       this.sendAck(agentId, message.id);
       return;
     }
+    if (reliable && task && (TERMINAL_TASK_STATUSES.has(task.status) || task.targetAgentId && task.targetAgentId !== agentId)) {
+      await this.recordLateAttemptMessage(task, agentId, message);
+      this.markInbound(agentId, message);
+      await this.flushState();
+      this.sendAck(agentId, message.id);
+      return;
+    }
     if (message.type === "task.started" && task) {
       task.status = "running";
       task.startedAt = new Date().toISOString();
@@ -772,10 +780,22 @@ export class AgentHub {
   }
 
   async createWorkflow(input) {
-    if (typeof input.objective !== "string" || !input.objective.trim()) throw httpError(400, "workflow objective is required");
+    if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.objective !== "string" || !input.objective.trim()) {
+      throw httpError(400, "workflow objective is required", "VALIDATION_ERROR");
+    }
+    if (input.executorAgentId != null && (typeof input.executorAgentId !== "string" || !input.executorAgentId.trim() || input.executorAgentId !== input.executorAgentId.trim())) {
+      throw httpError(400, "executorAgentId must be a non-empty Agent ID or null", "VALIDATION_ERROR");
+    }
+    const executorAgentId = input.executorAgentId ?? null;
+    if (executorAgentId) {
+      const executor = this.agents.get(executorAgentId);
+      const reason = !executor ? "unknown" : executor.status !== "online" ? "offline" : executor.paused ? "paused" : !executor.roles?.includes("executor") ? "role_mismatch" : null;
+      if (reason) throw httpError(409, `Executor ${executorAgentId} is unavailable`, "EXECUTOR_UNAVAILABLE", { reason, agentId: executorAgentId });
+    }
     const workflow = {
       enabled: true,
       plannerAgentId: input.plannerAgentId ?? null,
+      executorAgentId,
       reviewerAgentId: input.reviewerAgentId ?? null,
       maxReviewCycles: Math.max(0, Number(input.maxReviewCycles ?? 2)),
     };
@@ -864,8 +884,18 @@ export class AgentHub {
         return;
       }
       for (const assignment of submission.assignments ?? []) {
+        const boundExecutorId = task.workflow?.executorAgentId ?? null;
+        if (boundExecutorId && assignment.targetAgentId && assignment.targetAgentId !== boundExecutorId) {
+          this.queueEvent("workflow.executor_override", {
+            rootTaskId: task.rootTaskId,
+            plannerTaskId: task.taskId,
+            requestedByPlanner: assignment.targetAgentId,
+            executorAgentId: boundExecutorId,
+          });
+        }
         const child = this.createTask({
-          targetAgentId: assignment.targetAgentId,
+          targetAgentId: boundExecutorId ?? assignment.targetAgentId,
+          requestedAgentId: boundExecutorId ?? assignment.targetAgentId ?? null,
           input: assignment.instructions,
           rootTaskId: task.rootTaskId,
           parentTaskId: task.taskId,
@@ -1016,6 +1046,7 @@ export class AgentHub {
   async createRevisionTask(reviewTask, reviewed, details, reviewCycle = reviewed.reviewCycle) {
     const revision = this.createTask({
       targetAgentId: reviewed.targetAgentId,
+      requestedAgentId: reviewed.requestedAgentId ?? reviewed.targetAgentId,
       input: details.upstreamDenied ? "审核未认可上游错误报告，请继续原任务。" : "根据审核意见修改原成果。",
       rootTaskId: reviewTask.rootTaskId,
       parentTaskId: reviewTask.taskId,
@@ -1266,7 +1297,8 @@ export class AgentHub {
       const active = tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
       const failed = tasks.some((task) => ["failed", "rejected"].includes(task.status));
       const currentIntervention = this.currentIntervention(root.taskId);
-      const status = currentIntervention?.status === "pending" ? "needs_human" : active ? "active" : failed ? "failed" : "completed";
+      const cancelled = tasks.length > 0 && tasks.every((task) => task.status === "cancelled");
+      const status = currentIntervention?.status === "pending" ? "needs_human" : active ? "active" : failed ? "failed" : cancelled ? "cancelled" : "completed";
       const participants = [...new Set(tasks.flatMap((task) => [task.sourceAgentId, task.targetAgentId]).filter(Boolean))];
       return {
         rootTaskId: root.taskId,
@@ -1291,15 +1323,24 @@ export class AgentHub {
         (!this.leasesEnabled() || agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
         && (!requiresArtifacts || agent.protocolFeatures?.includes(ARTIFACT_PROTOCOL_FEATURE))
       )));
+      const namedAgent = task.targetAgentId ? this.agents.get(task.targetAgentId) : null;
+      if (namedAgent && !candidates.has(namedAgent.agentId)) {
+        const reason = this.leasesEnabled() && !namedAgent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE)
+          ? "lease_protocol_unsupported" : "artifact_protocol_unsupported";
+        throw httpError(409, `Agent ${namedAgent.agentId} does not support this task protocol`, "EXECUTOR_UNAVAILABLE", { reason, agentId: namedAgent.agentId });
+      }
       selection = chooseAgent(candidates, {
         targetAgentId: task.targetAgentId,
         role: task.role,
+        requireDeclaredRole: task.role === "executor" && Boolean(task.workflow?.enabled),
         requiredCapabilities: task.requiredCapabilities,
         modelPreference: task.modelPreference,
       });
     } catch (error) {
       task.status = "queued";
       task.schedulingError = error.message;
+      task.schedulingErrorCode = error.code ?? (task.targetAgentId ? "EXECUTOR_UNAVAILABLE" : "NO_ELIGIBLE_AGENT");
+      task.schedulingErrorDetails = { ...(error.details ?? {}), observedAt: new Date().toISOString() };
       this.markTask(task);
       await this.recordEvent("task.queued_no_candidate", { taskId: task.taskId, agentId: task.targetAgentId, error: error.message });
       return;
@@ -1313,12 +1354,8 @@ export class AgentHub {
       reason: task.modelPreference ? "requested-model" : "capability-quota-load-score",
     };
     task.schedulingError = null;
-    if (agent?.paused) {
-      task.status = "queued";
-      this.markTask(task);
-      await this.recordEvent("task.queued_paused", { taskId: task.taskId, agentId: task.targetAgentId });
-      return;
-    }
+    task.schedulingErrorCode = null;
+    task.schedulingErrorDetails = null;
     task.status = "dispatched";
     task.dispatchedAt = new Date().toISOString();
     if (!task.activeSlotAgentId) {
@@ -1462,8 +1499,12 @@ export class AgentHub {
       if (retrySafe && !recoveryLimitExceeded) {
         task.status = "queued";
         task.currentAttemptId = null;
-        task.targetAgentId = task.requestedAgentId ?? null;
+        task.targetAgentId = task.role === "executor" && task.workflow?.enabled
+          ? (task.workflow.executorAgentId ?? task.targetAgentId ?? task.requestedAgentId ?? null)
+          : (task.requestedAgentId ?? null);
         task.schedulingError = null;
+        task.schedulingErrorCode = null;
+        task.schedulingErrorDetails = null;
         this.addMessage(task, {
           senderId: "system",
           senderRole: "system",
@@ -1691,7 +1732,7 @@ export class AgentHub {
       if (request.method === "POST" && url.pathname === "/v1/auth/login") {
         if (!this.authService) return json(response, 404, { error: "Identity authentication is not enabled" });
         const body = await readBody(request);
-        const login = await this.authService.login(body.username, body.password);
+        const login = await this.authService.login(body.username, body.password, { clientIp: clientIpForRequest(request, this.config.auth) });
         requestActor = login.actor;
         await this.recordEvent("auth.login", { actor: login.actor.id, result: "success" });
         await this.flushState();
@@ -1706,11 +1747,11 @@ export class AgentHub {
       const artifactRequest = url.pathname === "/v1/artifacts" || Boolean(artifactRoute);
       let actor = await this.authenticateHttpRequest(request);
       if (!actor && artifactRequest && this.authService) actor = await this.authService.authenticateWorker(request.headers.authorization);
-      if (!actor) return json(response, 401, { error: "Unauthorized" });
+      if (!actor) return json(response, 401, { error: "Unauthorized", code: "AUTH_REQUIRED" });
       requestActor = actor;
 
       if (request.method === "GET" && url.pathname === "/v1/auth/me") {
-        if (actor.kind !== "web") return json(response, 403, { error: "Web user session required" });
+        if (actor.kind !== "web") return json(response, 403, { error: "Web user session required", code: "FORBIDDEN" });
         return json(response, 200, { user: publicActor(actor) });
       }
       if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
@@ -1765,6 +1806,26 @@ export class AgentHub {
 
       if (url.pathname.startsWith("/v1/admin/")) {
         this.requireAdmin(request, actor);
+        if (request.method === "GET" && url.pathname === "/v1/admin/users") {
+          return json(response, 200, { users: await this.authService.listUsers() });
+        }
+        const userRoute = url.pathname.match(/^\/v1\/admin\/users\/([0-9a-f-]{36})$/i);
+        if (request.method === "PATCH" && userRoute) {
+          const body = await readBody(request);
+          if (!["active", "disabled"].includes(body.status)) throw httpError(400, "status must be active or disabled", "VALIDATION_ERROR");
+          const user = await this.authService.setUserStatus(userRoute[1], body.status);
+          await this.recordEvent("user.status_changed", { actor: actor.id, userId: userRoute[1], status: body.status, result: "success" });
+          await this.flushState();
+          return json(response, 200, { user });
+        }
+        const revokeSessions = url.pathname.match(/^\/v1\/admin\/users\/([0-9a-f-]{36})\/revoke-sessions$/i);
+        if (request.method === "POST" && revokeSessions) {
+          const result = await this.authService.revokeUserSessions(revokeSessions[1]);
+          const revokedSessions = typeof result === "number" ? result : result?.revokedSessions ?? 0;
+          await this.recordEvent("user.sessions_revoked", { actor: actor.id, userId: revokeSessions[1], revokedSessions, result: "success" });
+          await this.flushState();
+          return json(response, 200, { ok: true, revokedSessions });
+        }
         if (request.method === "GET" && url.pathname === "/v1/admin/workers") {
           return json(response, 200, { credentials: await this.authService.listWorkerCredentials() });
         }
@@ -1791,7 +1852,10 @@ export class AgentHub {
           return json(response, 200, { credential });
         }
         if (request.method === "POST" && url.pathname === "/v1/admin/users") {
-          const user = await this.authService.createUser(await readBody(request));
+          const body = await readBody(request);
+          if (body.role === "admin") throw httpError(403, "Administrators cannot be created over HTTP", "ADMIN_HTTP_CREATION_FORBIDDEN");
+          if (body.role != null && body.role !== "operator") throw httpError(400, "role must be operator", "VALIDATION_ERROR");
+          const user = await this.authService.createUser({ ...body, role: "operator" });
           await this.recordEvent("user.created", { actor: actor.id, userId: user.userId, username: user.username, role: user.role, result: "success" });
           await this.flushState();
           return json(response, 201, { user });
@@ -1799,7 +1863,7 @@ export class AgentHub {
         return json(response, 404, { error: "Not found" });
       }
 
-      if (actor.kind !== "web") return json(response, 403, { error: "Web user session required" });
+      if (actor.kind !== "web") return json(response, 403, { error: "Web user session required", code: "FORBIDDEN" });
       if (!["GET", "HEAD", "OPTIONS"].includes(request.method ?? "GET")) this.requireWebMutation(request, actor);
       if (request.method === "GET" && url.pathname === "/v1/interventions") {
         const rootTaskId = url.searchParams.get("rootTaskId");
@@ -1824,7 +1888,12 @@ export class AgentHub {
       if (request.method === "GET" && url.pathname === "/v1/tasks") {
         const rootTaskId = url.searchParams.get("rootTaskId");
         const tasks = [...this.tasks.values()].filter((task) => !rootTaskId || task.rootTaskId === rootTaskId);
-        return json(response, 200, { tasks, active: tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status)) });
+        return json(response, 200, { tasks: url.searchParams.get("view") === "summary" ? tasks.map(summarizeTask) : tasks, active: tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status)) });
+      }
+      const taskDetailRoute = url.pathname.match(/^\/v1\/tasks\/([0-9a-f-]{36})$/i);
+      if (request.method === "GET" && taskDetailRoute) {
+        const task = this.tasks.get(taskDetailRoute[1]);
+        return task ? json(response, 200, { task }) : json(response, 404, { error: "Task not found", code: "NOT_FOUND" });
       }
       if (request.method === "GET" && url.pathname === "/v1/attempts") {
         const taskId = url.searchParams.get("taskId");
@@ -1837,7 +1906,12 @@ export class AgentHub {
       if (request.method === "GET" && url.pathname === "/v1/messages") {
         const rootTaskId = url.searchParams.get("rootTaskId");
         const messages = this.messages.filter((message) => !rootTaskId || message.rootTaskId === rootTaskId);
-        return json(response, 200, { messages });
+        return json(response, 200, { messages: url.searchParams.get("view") === "summary" ? messages.map(summarizeMessage) : messages });
+      }
+      const messageDetailRoute = url.pathname.match(/^\/v1\/messages\/([0-9a-f-]{36})$/i);
+      if (request.method === "GET" && messageDetailRoute) {
+        const message = this.messages.find((item) => item.messageId === messageDetailRoute[1]);
+        return message ? json(response, 200, { message }) : json(response, 404, { error: "Message not found", code: "NOT_FOUND" });
       }
       if (request.method === "GET" && url.pathname === "/v1/usage") {
         const byAgent = [...this.agents.values()].map((agent) => ({
@@ -1918,13 +1992,25 @@ export class AgentHub {
         } catch {}
       }
       const statusCode = Number.isInteger(error.statusCode) ? error.statusCode : 500;
-      return json(response, statusCode, { error: error.message });
+      return json(response, statusCode, {
+        error: error.message,
+        code: error.code ?? httpErrorCode(statusCode),
+        ...(error.details && typeof error.details === "object" ? { details: error.details } : {}),
+        ...(Number.isFinite(error.retryAfterMs) ? { retryAfterMs: error.retryAfterMs } : {}),
+      }, error.headers ?? {});
     }
   }
 
   requireWebMutation(request, actor) {
-    if (actor?.kind !== "web") throw httpError(403, "Web user session required");
-    if (!actor.legacy) this.authService.verifyCsrf(request, actor);
+    if (actor?.kind !== "web") throw httpError(403, "Web user session required", "FORBIDDEN");
+    if (!actor.legacy) {
+      try {
+        this.authService.verifyCsrf(request, actor);
+      } catch (error) {
+        if (error.statusCode === 403 && !error.code) error.code = "CSRF_FAILED";
+        throw error;
+      }
+    }
   }
 
   disconnectCredential(credentialId) {
@@ -1934,7 +2020,7 @@ export class AgentHub {
   }
 
   requireAdmin(request, actor) {
-    if (actor?.kind !== "web" || actor.role !== "admin") throw httpError(403, "Administrator role required");
+    if (actor?.kind !== "web" || actor.role !== "admin") throw httpError(403, "Administrator role required", "FORBIDDEN");
     if (!["GET", "HEAD", "OPTIONS"].includes(request.method ?? "GET")) this.requireWebMutation(request, actor);
   }
 
@@ -1973,10 +2059,9 @@ export class AgentHub {
     if (["agent.pause", "agent.resume"].includes(command.type)) {
       if (actor.role !== "admin") throw httpError(403, "Administrator role required for agent control");
       const agent = this.agents.get(command.targetAgentId);
-      if (agent) {
-        agent.paused = command.type === "agent.pause";
-        this.markAgent(agent);
-      }
+      if (!agent) throw httpError(404, `Unknown Agent ${command.targetAgentId}`, "NOT_FOUND");
+      agent.paused = command.type === "agent.pause";
+      this.markAgent(agent);
       this.deliver(command.targetAgentId, makeEnvelope(command.type, { agentId: command.targetAgentId }));
       if (command.type === "agent.resume") {
         for (const task of this.tasks.values()) {
@@ -2180,10 +2265,43 @@ function isDeclaredArtifactPath(candidate, declaration) {
 
 function publicActor(actor) {
   return {
-    id: actor.id,
+    id: actor.userId ?? actor.id,
     username: actor.username,
     role: actor.role,
+    ...(actor.status ? { status: actor.status } : {}),
+    ...(actor.createdAt ? { createdAt: actor.createdAt } : {}),
+    ...(actor.updatedAt ? { updatedAt: actor.updatedAt } : {}),
+    ...(actor.lastLoginAt !== undefined ? { lastLoginAt: actor.lastLoginAt } : {}),
+    ...(actor.activeSessionCount !== undefined ? { activeSessionCount: actor.activeSessionCount } : {}),
   };
+}
+
+function summarizeTask(task) {
+  const { output, submission, contextBundle, ...summary } = task;
+  const { fullResult: _fullResult, ...safeSubmission } = submission ?? {};
+  const { fullResult: _contextFullResult, ...safeContext } = contextBundle ?? {};
+  return {
+    ...summary,
+    ...(submission ? { submission: safeSubmission } : {}),
+    ...(contextBundle ? { contextBundle: safeContext } : {}),
+  };
+}
+
+function summarizeMessage(message) {
+  return {
+    ...message,
+    attachments: (message.attachments ?? []).map(({ content, ...attachment }) => attachment),
+  };
+}
+
+function clientIpForRequest(request, authConfig = {}) {
+  const peer = String(request.socket?.remoteAddress ?? "unknown");
+  const trusted = authConfig?.trustedProxyIps ?? authConfig?.trustedProxies ?? [];
+  if (!Array.isArray(trusted) || !trusted.includes(peer)) return peer;
+  const forwarded = request.headers["x-forwarded-for"];
+  if (typeof forwarded !== "string") return peer;
+  const candidate = forwarded.split(",", 1)[0].trim();
+  return isIP(candidate) ? candidate : peer;
 }
 
 function contentDisposition(filename) {
@@ -2191,8 +2309,12 @@ function contentDisposition(filename) {
   return `attachment; filename="${fallback}"; filename*=UTF-8''${encodeURIComponent(String(filename ?? fallback))}`;
 }
 
-function httpError(statusCode, message) {
-  return Object.assign(new Error(message), { statusCode });
+function httpError(statusCode, message, code, details) {
+  return Object.assign(new Error(message), { statusCode, ...(code ? { code } : {}), ...(details ? { details } : {}) });
+}
+
+function httpErrorCode(statusCode) {
+  return ({ 400: "VALIDATION_ERROR", 401: "AUTH_REQUIRED", 403: "FORBIDDEN", 404: "NOT_FOUND", 409: "STATE_CONFLICT", 413: "PAYLOAD_TOO_LARGE", 503: "HUB_UNAVAILABLE" })[statusCode] ?? "INTERNAL_ERROR";
 }
 
 async function readBody(request) {
@@ -2200,10 +2322,14 @@ async function readBody(request) {
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > 1024 * 1024) throw new Error("Request body too large");
+    if (size > 1024 * 1024) throw httpError(413, "Request body too large", "PAYLOAD_TOO_LARGE");
     chunks.push(chunk);
   }
-  return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  try {
+    return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+  } catch {
+    throw httpError(400, "Invalid JSON request body", "VALIDATION_ERROR");
+  }
 }
 
 function json(response, status, value, headers = {}) {

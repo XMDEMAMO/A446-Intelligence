@@ -124,6 +124,51 @@ test("lease recovery reassigns dynamic work away from an offline Worker", async 
   assert.equal(task.status, "dispatched");
 });
 
+test("workflow executor recovery keeps the first worker and session across restart", async () => {
+  const store = new MemoryHubStore();
+  let hub = await new AgentHub(hubConfig({ scanIntervalMs: 60_000 }), { store }).start();
+  const first = testAgent("a-executor");
+  const other = testAgent("b-executor");
+  first.roles = ["executor"];
+  other.roles = ["executor"];
+  hub.agents.set(first.agentId, first);
+  hub.agents.set(other.agentId, other);
+  hub.markAgent(first);
+  hub.markAgent(other);
+  const task = hub.createTask({
+    input: "revision-safe work", role: "executor", workflow: { enabled: true, executorAgentId: null },
+    taskSpec: retrySafeTaskSpec(),
+  });
+  await hub.queueOrDispatch(task);
+  const firstAttemptId = task.currentAttemptId;
+  const scope = task.sessionScopeId;
+  assert.equal(task.targetAgentId, first.agentId);
+  await hub.flushState();
+  await hub.stop();
+
+  hub = await new AgentHub(hubConfig({ scanIntervalMs: 60_000 }), { store }).start();
+  try {
+    const restored = hub.tasks.get(task.taskId);
+    assert.equal(restored.targetAgentId, first.agentId);
+    assert.equal(restored.sessionScopeId, scope);
+    const onlineOther = hub.agents.get(other.agentId);
+    onlineOther.status = "online";
+    hub.markAgent(onlineOther);
+    const attempt = hub.attempts.get(firstAttemptId);
+    attempt.leaseExpiresAt = new Date(Date.now() - 100).toISOString();
+    await hub.reapExpiredLeases();
+    assert.equal(restored.status, "queued");
+    assert.equal(restored.targetAgentId, first.agentId);
+    assert.equal(restored.requestedAgentId, null);
+    assert.equal(restored.sessionScopeId, scope);
+    assert.equal(restored.schedulingErrorCode, "EXECUTOR_UNAVAILABLE");
+    assert.equal([...hub.attempts.values()].filter((item) => item.taskId === task.taskId).length, 1);
+    assert.equal(onlineOther.activeTaskCount, 0);
+  } finally {
+    await hub.stop();
+  }
+});
+
 test("automatic lease recovery stops at the configured limit", async () => {
   const hub = new AgentHub(hubConfig({ maxRecoveryAttempts: 1 }));
   const agent = testAgent("bounded-worker");

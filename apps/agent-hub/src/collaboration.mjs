@@ -91,38 +91,50 @@ export function addUsage(left, right) {
 }
 
 export function chooseAgent(agents, request = {}) {
+  const role = request.role ? String(request.role).toLowerCase() : null;
   if (request.targetAgentId) {
     const selected = agents.get(request.targetAgentId);
-    if (!selected) throw httpError(409, `Agent ${request.targetAgentId} is not registered`);
-    if (selected.status !== "online") throw httpError(409, `Agent ${request.targetAgentId} is not online`);
+    if (!selected) throw schedulingError("EXECUTOR_UNAVAILABLE", `Agent ${request.targetAgentId} is not registered`, "unknown", request.targetAgentId);
+    if (selected.status !== "online") throw schedulingError("EXECUTOR_UNAVAILABLE", `Agent ${request.targetAgentId} is not online`, "offline", request.targetAgentId);
+    if (selected.paused) throw schedulingError("EXECUTOR_PAUSED", `Agent ${request.targetAgentId} is paused`, "paused", request.targetAgentId);
+    if (role && (request.requireDeclaredRole ? !selected.roles?.includes(role) : selected.roles?.length && !selected.roles.includes(role))) {
+      throw schedulingError("EXECUTOR_ROLE_MISMATCH", `Agent ${request.targetAgentId} does not accept role ${role}`, "role_mismatch", request.targetAgentId);
+    }
     if (Number(selected.activeTaskCount ?? 0) >= Number(selected.maxConcurrency ?? 1)) {
-      throw httpError(409, `Agent ${request.targetAgentId} is at capacity`);
+      throw schedulingError("EXECUTOR_AT_CAPACITY", `Agent ${request.targetAgentId} is at capacity`, "at_capacity", request.targetAgentId);
     }
-    if (selected.quotaSnapshot?.state === "Exhausted") throw httpError(409, `Agent ${request.targetAgentId} account quota is exhausted`);
-    const role = request.role ? String(request.role).toLowerCase() : null;
-    if (role && selected.roles?.length && !selected.roles.includes(role)) {
-      throw httpError(409, `Agent ${request.targetAgentId} does not accept role ${role}`);
-    }
+    if (selected.quotaSnapshot?.state === "Exhausted") throw schedulingError("EXECUTOR_QUOTA_UNAVAILABLE", `Agent ${request.targetAgentId} account quota is exhausted`, "quota_exhausted", request.targetAgentId);
     const required = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
     const agentCapabilities = new Set(selected.capabilities ?? []);
     if (!required.every((item) => agentCapabilities.has(item) || selected.models?.some((model) => model.capabilities?.includes(item)))) {
-      throw httpError(409, `Agent ${request.targetAgentId} does not satisfy required capabilities`);
+      throw schedulingError("EXECUTOR_UNAVAILABLE", `Agent ${request.targetAgentId} does not satisfy required capabilities`, "capability_mismatch", request.targetAgentId);
     }
-    const model = chooseModel(selected, request);
+    let model;
+    try {
+      model = chooseModel(selected, request);
+    } catch (error) {
+      const requestedModel = request.model ?? request.modelPreference;
+      const unknownModel = requestedModel && !selected.models?.some((item) => item.id === requestedModel);
+      throw schedulingError(
+        unknownModel ? "EXECUTOR_UNAVAILABLE" : "EXECUTOR_QUOTA_UNAVAILABLE",
+        error.message,
+        unknownModel ? "model_mismatch" : "model_unavailable",
+        request.targetAgentId,
+      );
+    }
     return { agent: selected, model };
   }
-  const role = request.role ? String(request.role).toLowerCase() : null;
   const required = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
   const candidates = [...agents.values()].filter((agent) => {
     if (agent.status !== "online" || agent.paused) return false;
     if (Number(agent.activeTaskCount ?? 0) >= Number(agent.maxConcurrency ?? 1)) return false;
     if (agent.quotaSnapshot?.state === "Exhausted") return false;
-    if (role && agent.roles?.length && !agent.roles.includes(role)) return false;
+    if (role && (request.requireDeclaredRole ? !agent.roles?.includes(role) : agent.roles?.length && !agent.roles.includes(role))) return false;
     const capabilities = new Set(agent.capabilities ?? []);
     if (!required.every((item) => capabilities.has(item) || agent.models?.some((model) => model.capabilities?.includes(item)))) return false;
     return Boolean(chooseModel(agent, request, false));
   });
-  if (!candidates.length) throw httpError(409, `No online agent matches role ${role ?? "any"}`);
+  if (!candidates.length) throw schedulingError("NO_ELIGIBLE_AGENT", `No online agent matches role ${role ?? "any"}`, "no_candidate");
   candidates.sort((a, b) => scoreAgent(b, request) - scoreAgent(a, request) || a.agentId.localeCompare(b.agentId));
   const agent = candidates[0];
   return { agent, model: chooseModel(agent, request) };
@@ -317,4 +329,8 @@ function cleanText(value, max) {
 
 function httpError(statusCode, message) {
   return Object.assign(new Error(message), { statusCode });
+}
+
+function schedulingError(code, message, reason, agentId = null) {
+  return Object.assign(httpError(409, message), { code, details: { reason, ...(agentId ? { agentId } : {}) } });
 }
