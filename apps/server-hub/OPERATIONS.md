@@ -10,10 +10,13 @@
 - `A446_ARTIFACT_ROOT` 必须是仓库外的绝对目录，供运行账户独占写入。不要把它设为工作区、临时目录或可被 Web 直接静态访问的位置。
 - 每个逻辑 Worker 使用独立凭据，并绑定一个 `agentId` 与 `deviceId`；浏览器使用 Web Session，不与 Worker 共用凭据。
 - Worker 的本地 Policy 仍是最终权限边界。服务器不能批准被 Worker 拒绝的权限、路径或凭据操作。
+- 登录失败同时按规范化用户名与可信来源 IP 做可恢复退避。只有 Hub 明确配置并校验反向代理时才可读取转发地址；公网请求自带的 `X-Forwarded-For` 不可信。
 
 环境变量名称见 [.env.example](.env.example)。该文件只是模板，当前程序不会自动读取 `.env` 文件。
 
 首次在一台 Ubuntu/Debian 预发布服务器部署时，请先按 [单台预发布服务器配置教程](../../docs/STAGING_SERVER_SETUP_GUIDE.md) 完成 PostgreSQL 隔离、systemd、Caddy、Web 静态文件和 Worker 接入，再回到本指南进行备份与恢复验收。
+
+可直接复核和复制的 Caddy、安全头、systemd、版本链接、备份/恢复与公网无凭据探测样例位于 [deploy/README.md](../../deploy/README.md)。样例中的域名、路径和账号仍需在目标服务器上显式确认，不能原样当作秘密或生产参数。
 
 ## 2. 最小启动顺序
 
@@ -83,6 +86,8 @@ New-Item -ItemType Directory -Force -Path $backupDirectory | Out-Null
 pg_dump --format=custom --file "$backupDirectory\a446.dump" $env:A446_DATABASE_URL
 ```
 
+Ubuntu/Debian 的推荐自动化入口是 `scripts/deploy/backup-server.sh`。它要求 Hub 已停止并显式设置 `A446_MAINTENANCE_CONFIRMED=yes`，随后同时生成 PostgreSQL custom dump、Artifact 快照、完成标记与数据库校验和。连接串仅通过子进程环境传给 `pg_dump`，不会写入命令输出或清单。
+
 先确认数据库备份成功，再对 Artifact 根目录创建同一维护窗口的快照。备份介质应按部署方安全策略加密、限制读取权限，并定期做恢复演练。
 
 恢复前必须停止 Server Hub，并确认目标数据库和 Artifact 根目录是已授权的恢复目标。以下 `pg_restore --clean` 会删除目标中与备份冲突的对象，不能对不应被覆盖的数据库执行：
@@ -92,6 +97,8 @@ pg_restore --clean --if-exists --no-owner --dbname $env:A446_DATABASE_URL 'D:\A4
 ```
 
 随后把同一备份点的 Artifact 快照恢复到配置的 `A446_ARTIFACT_ROOT`，恢复服务账户目录权限，运行 `npm.cmd run migrate`，再启动 Hub。完成后检查 `/health`、待处理人工介入、Artifact 下载及审计记录；不要仅凭进程启动成功判断恢复完成。
+
+`scripts/deploy/restore-server.sh` 需要额外设置 `A446_RESTORE_CONFIRMED=yes`。它先校验完成标记与 SHA-256，再把现有 Artifact 目录移动成带时间戳的可恢复副本，并用单事务执行 `pg_restore --clean`。脚本不会自动删除旧副本，也不会自动启动服务。版本代码使用 `scripts/deploy/switch-release.sh` 切换符号链接；该脚本不降级 schema，旧代码不兼容新 schema 时必须恢复成对备份。
 
 ## 5. 验证、日志和发布包
 
@@ -113,3 +120,16 @@ npm.cmd run test:postgres
 该测试会清空 A446 表，不能指向生产库。批次四新增的 Mock 故障注入会验证 Hub 重启、Executor 断线和 Reviewer 断线；它不替代 PostgreSQL 集成测试，也不消耗真实模型额度。
 
 生产日志应默认保持 `logs.includePayloads=false`，并存到仓库外受控目录。发布前检查包内不含 `node_modules`、`dist`、`var`、Artifact 内容、Worker state/Checkpoint、`.env`、Token、密码、Cookie 或数据库转储。真实 Codex/Antigravity 多机流程会消耗现有产品额度，只能在当前人类明确授权后执行。
+
+## 6. 身份管理集成检查
+
+`IdentityService` 的数据库实现与 Hub HTTP 路由由不同并行账号维护。合入集成分支时必须逐项确认：
+
+- 登录路由传入可信解析后的 `clientIp`，并转发错误对象的 `code`、`retryAfterMs`、`headers`；
+- `GET/POST/PATCH /v1/admin/users` 与撤销 Session 路由只调用 `listUsers`、`createOperator`、`setUserStatus`、`revokeUserSessions`；
+- Web API 不调用可创建管理员的 bootstrap `createUser`；
+- rotate/revoke 提交成功后关闭对应旧 credential 的活动 WebSocket；
+- API 公开用户 ID 使用 UUID，不返回 `password_salt`、`password_hash`、`password_parameters`、Session secret 或 CSRF hash；
+- 只有配置的可信代理可影响来源地址，直连模式只用 socket 对端地址。
+
+数据库集成测试 `test/identity-hardening.test.mjs` 覆盖退避恢复、无原始 IP/用户名审计、管理员 HTTP 创建拒绝、停用/撤销 Session、Worker 唯一 active 凭据与轮换旧 Token 失效。

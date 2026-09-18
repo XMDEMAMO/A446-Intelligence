@@ -158,6 +158,8 @@ function testHubConfig(port = 0) {
 async function resetDatabase(pool) {
   await pool.query(`
     TRUNCATE TABLE
+      web_auth_events,
+      web_login_throttles,
       web_sessions,
       web_users,
       worker_credentials,

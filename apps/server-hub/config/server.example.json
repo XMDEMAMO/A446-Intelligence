@@ -8,7 +8,23 @@
     "sessionTtlMs": 43200000,
     "cookieName": "a446_session",
     "secureCookies": true,
-    "allowedOrigins": ["https://hub.example.com"]
+    "allowedOrigins": ["https://hub.example.com"],
+    "loginProtection": {
+      "enabled": true,
+      "windowMs": 900000,
+      "auditRetentionMs": 2592000000,
+      "throttleRetentionMs": 86400000,
+      "username": {
+        "maxFailures": 8,
+        "baseDelayMs": 500,
+        "maxDelayMs": 300000
+      },
+      "ip": {
+        "maxFailures": 20,
+        "baseDelayMs": 250,
+        "maxDelayMs": 30000
+      }
+    }
   },
   "tls": {
     "enabled": false

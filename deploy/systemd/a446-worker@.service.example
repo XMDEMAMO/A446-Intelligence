@@ -1,0 +1,34 @@
+[Unit]
+Description=A446 Worker %i
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=a446-worker
+Group=a446-worker
+WorkingDirectory=/srv/a446/current/apps/agent-hub
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/a446/workers/%i.env
+ExecStart=/usr/bin/node src/worker-cli.mjs --config /etc/a446/workers/%i.json
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=45
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
