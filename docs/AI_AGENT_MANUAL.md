@@ -40,6 +40,7 @@ A446 Intelligence 的目标是通用本地/分布式 Agent 平台。软件项目
 - 规划/执行/审核闭环、最小上下文和上游错误裁定。
 - 动态 Agent/模型调度、任务群聊、Token 与可信额度快照。
 - PostgreSQL 支持的单进程 Server Hub alpha、持久可靠投递、Attempt/Lease 和重启恢复。
+- 启动及运行期统一资源快照、陈旧状态，以及可单次处理并按原节点恢复的持久人工介入。
 
 不得声称当前仓库已经具备：
 
@@ -125,13 +126,17 @@ Local Hub
 | GET | /v1/events | 近期事件 |
 | GET | /v1/conversations | 根任务群聊列表 |
 | GET | /v1/messages | 群聊消息，可按 rootTaskId 筛选 |
+| GET | /v1/interventions | 持久人工介入，可按 rootTaskId 和 status 筛选 |
 | GET | /v1/usage | 总计、Agent 和账号用量 |
 | POST | /v1/workflows | 创建规划/执行/审核工作流 |
 | POST | /v1/messages | 发送人工群聊旁注 |
 | POST | /v1/tasks | 创建任务 |
 | POST | /v1/commands | 审批、取消、暂停、恢复 |
+| POST | /v1/interventions/{id}/resolve | 对待处理介入批准、拒绝或文本回复 |
 
 正式 Server Hub 另提供 `/v1/auth/*`、`/v1/artifacts*` 和管理员身份接口。Artifact 上传下载必须使用认证 Actor，修改型 Web 请求必须携带 CSRF Token；请求体自报的 `by`、`senderId` 或 `agentId` 不能作为授权依据。完整契约见 `apps/agent-hub/docs/protocol-v1.md`。
+
+Worker 在启动及运行期低频刷新 `resourceSnapshot`。能力、设备、模型和额度区段必须携带来源、探测时间、最后成功时间、陈旧状态和错误摘要；失败时保留最后可信值并标记 `stale`，没有可信额度来源时保持 `Unknown`。人工介入以独立 Store 记录为准，只能从 `pending` 条件处理一次，恢复必须沿用记录的角色、阶段、父任务和 `sessionScopeId`。
 
 命令类型：
 
@@ -340,6 +345,7 @@ Antigravity：
 - ACK 与 pending delivery。
 - 状态、消息和可靠投递是否在发送前完成同一持久化事务。
 - currentAttemptId 条件更新、Lease 续期/过期和迟到结果隔离。
+- 人工介入独立记录、pending 条件更新、重复提交 409 和原节点/会话恢复。
 - 未声明安全重试的任务在 Lease 过期后进入人工确认。
 - Worker 重连和同 Agent 连接替换。
 - 终态任务不会被晚到的结果覆盖。
@@ -361,6 +367,7 @@ Antigravity：
 - 取消和重连。
 - 会话延续。
 - 健康与额度状态不伪造百分比。
+- 运行期探针刷新、最后可信值陈旧降级和动态模型/能力上报。
 
 ### 修改协议
 
@@ -415,6 +422,8 @@ npm.cmd run test:postgres
 ~~~
 
 该测试会清空目标数据库中的 A446 表，禁止指向生产库或含有需保留数据的数据库。没有真实 PostgreSQL 与真实文件流结果时，不得宣布持久化、Lease、身份或 Artifact 阶段通过。
+
+阶段 F 的人工介入同样依赖 PostgreSQL 条件更新；只运行 Memory Store 测试时，不得宣布人工介入持久化阶段已验收。
 
 ## 13. 真实 Adapter 检查
 

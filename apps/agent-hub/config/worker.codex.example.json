@@ -28,10 +28,12 @@
     "maxFileBytes": 104857600
   },
   "capabilityProbe": {
+    "intervalMs": 60000,
     "timeoutMs": 5000,
     "tools": [
-      { "name": "git", "command": "git", "args": ["--version"] }
-    ]
+      { "name": "git", "command": "git", "args": ["--version"], "capabilities": ["git"] }
+    ],
+    "services": []
   },
   "reconnect": {
     "baseMs": 1000,

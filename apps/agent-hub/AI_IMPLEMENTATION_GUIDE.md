@@ -41,6 +41,8 @@ The following behavior is implemented and must remain working:
 - One-root-task/one-conversation messages, reviewed-result handoff, upstream-error adjudication, and bounded revision loops.
 - Dynamic Agent/model selection using role, capabilities, online state, load, and trusted quota state.
 - Per-turn and cumulative token counts plus an optional machine-readable official-client quota probe.
+- Startup and low-frequency resource refresh with explicit source, last-success, stale, and error metadata.
+- Independently persisted human interventions with one-time decisions and recorded-node/session recovery.
 
 ## 3 Security invariants
 
@@ -162,13 +164,17 @@ Important local fields:
     "maxFileBytes": 104857600
   },
   "capabilityProbe": {
+    "intervalMs": 60000,
     "timeoutMs": 5000,
     "tools": [
-      { "name": "git", "command": "git", "args": ["--version"] }
-    ]
+      { "name": "git", "command": "git", "args": ["--version"], "capabilities": ["git"] }
+    ],
+    "services": []
   }
 }
 ```
+
+`capabilityProbe.intervalMs` refreshes adapter readiness, configured tools/services, and scheduling device data without restarting the Hub. Optional `capabilityProbe.device.python`, `device.gpu`, and `device.browsers` entries use the same `shell=false` command contract. An optional `modelProbe` command may return `{ "source": "official-client", "models": [...] }`; without it, `models` remains a configuration fallback with unknown availability and `source=config`.
 
 Device/account/model identity is separate from the logical Agent:
 
@@ -341,6 +347,8 @@ When an official client or a locally trusted sidecar can expose its displayed qu
 
 The command runs locally with `shell=false` and must print a JSON object containing `state` and `windows`. This interface must not read cookies, browser profiles, credentials, or authentication databases. A failed or unavailable probe preserves `Unknown`/the last trusted snapshot; it never derives a numeric percentage from token counts.
 
+All resource sections use `available / unavailable / unknown / stale`. Every refreshed section reports `source`, `checkedAt`, `lastSuccessAt`, `stale`, and a bounded `errorSummary`. A failed refresh retains the last trusted value as `stale` and never takes the whole Worker offline. The heartbeat repeats refreshed `capabilities`, `models`, `observedCapabilities`, `resourceSnapshot`, and `quotaSnapshot`, so the Hub can schedule against changes without restarting.
+
 ## 11.1 Collaboration contracts
 
 One root workflow maps to one observable conversation. Role output is structured JSON:
@@ -403,12 +411,16 @@ task.assign.payload.sessionScopeId
 task.result.payload.role/model/submission/usage/usageTotals/quotaSnapshot
 worker.hello.payload.protocolFeatures
 worker.heartbeat.payload.currentAttemptId
+worker.hello/worker.heartbeat payload.resourceSnapshot
+worker.heartbeat.payload.capabilities/models
 task.assign.payload.attemptId/lease
 task.started.payload.attemptId
 task.result/task.error/task.rejected/approval.request payload.attemptId
 ```
 
 Protocol v1 allows new payload fields to be ignored by older peers. A server with leases enabled must dispatch only to Workers advertising `attempt-lease-v1`, persist the assignment before sending it, renew only the matching current Attempt, and prevent expired or superseded Attempt messages from changing task state. It must treat `task.rejected` as terminal and must not repeatedly reschedule the same task without an explicitly retry-safe Task Spec or a human-approved Policy change.
+
+Human interventions are independent Store objects, not only a field on the root task. A record preserves the root/origin task IDs, requesting role/stage, `sessionScopeId`, minimal context, allowed decisions, and continuation node. A pending record can be resolved once; PostgreSQL must conditionally update `status=pending`, and repeated or concurrent decisions return `409`. Workflow responses create the follow-up from the recorded parent and session scope. Approval/retry decisions remain administrator-only. Do not copy executor `fullResult` into intervention context.
 
 ## 14 Required verification
 
@@ -468,6 +480,8 @@ MVP-L17  task, message, Attempt, delivery, inbound dedupe, agent snapshot, and a
 MVP-L18  a running task completes after Hub restart and Worker reconnect without a second winning result
 MVP-L19  expired retry-safe work receives a new Attempt; stale Attempt results are audited but cannot mutate the task
 MVP-L20  expired work with unknown or external side effects stops for human approval
+MVP-L21  resource changes refresh without reconnect; failed probes retain stale trusted values and unknown quota stays Unknown
+MVP-L22  human interventions survive restart, resolve once, and continue from the recorded role/stage/session scope
 ```
 
 Do not report success if tests were skipped, a real failure was replaced with a mock result, or a security assertion was weakened.
@@ -514,7 +528,7 @@ safe next action
 
 ## 18 Current known boundary
 
-The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, and Artifact hashing. The separate `apps/server-hub` alpha adds a single-process PostgreSQL-backed scheduler, durable reliable-delivery records, Attempt/Lease recovery, and database-guarded result transitions without adding PostgreSQL to the Worker runtime.
+The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, refreshable capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, Artifact hashing, and persistent one-time human recovery. The separate `apps/server-hub` alpha adds a single-process PostgreSQL-backed scheduler, durable reliable-delivery records, Attempt/Lease recovery, database-guarded result transitions, independent interventions, and authenticated Artifact transfer without adding PostgreSQL to the Worker runtime.
 
 The following remain outside this local package:
 

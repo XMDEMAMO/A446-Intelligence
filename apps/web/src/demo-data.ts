@@ -114,6 +114,7 @@ export function createDemoSnapshot(): HubSnapshot {
     tasks,
     conversations,
     messages,
+    interventions: [],
     usage: {
       totals: usage(43_500, 14_590),
       byAgent: agents.map((agent) => ({

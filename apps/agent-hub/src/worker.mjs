@@ -11,7 +11,7 @@ import { AntigravityAdapter } from "./adapters/antigravity.mjs";
 import { buildArtifactManifest } from "./artifact-manifest.mjs";
 import { ArtifactClient } from "./artifact-client.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
-import { initialExecutorStatus, probeLocalCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
+import { initialExecutorStatus, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
 import { addUsage, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
 import { probeQuota } from "./quota-probe.mjs";
@@ -29,7 +29,8 @@ export class AgentWorker {
     this.current = null;
     this.currentAbort = null;
     this.heartbeatTimer = null;
-    this.quotaTimer = null;
+    this.resourceTimer = null;
+    this.resourceRefresh = null;
     this.reconnectAttempt = 0;
     this.saveChain = Promise.resolve();
     this.state = {
@@ -41,6 +42,10 @@ export class AgentWorker {
       executorStatus: null,
       usageTotals: null,
       sessions: {},
+      observedCapabilities: null,
+      modelSnapshot: null,
+      quotaSnapshot: null,
+      resourceSnapshot: null,
     };
     this.policy = normalizePolicy(config.policy, config.workspace);
     this.artifactClient = new ArtifactClient(config, this.policy);
@@ -51,8 +56,17 @@ export class AgentWorker {
       maxOutputChars: config.checkpoints?.maxOutputChars ?? 200_000,
     });
     this.observedCapabilities = null;
-    this.quotaSnapshot = normalizeQuotaSnapshot(config.quotaSnapshot);
+    this.modelSnapshot = null;
+    this.models = normalizeModels(config.models, config.adapter);
+    this.dynamicCapabilities = config.capabilities ?? ["task.execute", "pause", "resume", "cancel"];
+    this.quotaSnapshot = normalizeQuotaSnapshot(config.quotaSnapshot) ?? normalizeQuotaSnapshot({
+      state: "Unknown",
+      source: "unavailable",
+      checkedAt: new Date().toISOString(),
+      windows: [],
+    });
     this.quotaProbeError = null;
+    this.resourceSnapshot = null;
     this.adapter = createAdapter(config.adapter ?? { type: "mock" }, {
       agentId: this.agentId,
       workspace: config.workspace,
@@ -66,8 +80,11 @@ export class AgentWorker {
     await this.checkpoints.init();
     await this.loadState();
     await this.adapter.start(this.state);
-    this.observedCapabilities = probeLocalCapabilities(this.config);
-    await this.refreshQuota();
+    this.observedCapabilities = this.state.observedCapabilities ?? this.observedCapabilities;
+    this.modelSnapshot = this.state.modelSnapshot ?? this.modelSnapshot;
+    this.quotaSnapshot = normalizeQuotaSnapshot(this.state.quotaSnapshot) ?? this.quotaSnapshot;
+    this.resourceSnapshot = this.state.resourceSnapshot ?? this.resourceSnapshot;
+    await this.refreshResources();
     const detected = initialExecutorStatus(this.adapter.type, this.observedCapabilities);
     this.state.executorStatus = this.state.executorStatus
       ? { ...detected, quota: this.state.executorStatus.quota ?? "Unknown", lastError: this.state.executorStatus.lastError ?? detected.lastError }
@@ -81,7 +98,7 @@ export class AgentWorker {
   async stop() {
     this.stopping = true;
     if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
-    if (this.quotaTimer) clearInterval(this.quotaTimer);
+    if (this.resourceTimer) clearInterval(this.resourceTimer);
     this.currentAbort?.abort();
     if (this.ws?.readyState === WebSocket.OPEN) this.ws.close(1000, "Worker stopping");
     else if (this.ws && this.ws.readyState !== WebSocket.CLOSED) this.ws.terminate();
@@ -90,15 +107,70 @@ export class AgentWorker {
   }
 
   async refreshQuota() {
-    if (!this.config.quotaProbe?.command) return this.quotaSnapshot;
+    if (!this.config.quotaProbe?.command) {
+      this.state.quotaSnapshot = this.quotaSnapshot;
+      return this.quotaSnapshot;
+    }
     try {
       const snapshot = await probeQuota(this.config.quotaProbe, { workspace: this.config.workspace });
       if (snapshot) this.quotaSnapshot = snapshot;
       this.quotaProbeError = null;
     } catch (error) {
-      this.quotaProbeError = { message: String(error?.message ?? error).slice(0, 500), checkedAt: new Date().toISOString() };
+      const checkedAt = new Date().toISOString();
+      const message = String(error?.message ?? error).slice(0, 500);
+      this.quotaProbeError = { message, checkedAt };
+      this.quotaSnapshot = normalizeQuotaSnapshot({
+        ...(this.quotaSnapshot ?? {}),
+        state: this.quotaSnapshot?.state ?? "Unknown",
+        source: this.quotaSnapshot?.source ?? this.config.quotaProbe.source ?? "unavailable",
+        checkedAt,
+        windows: this.quotaSnapshot?.windows ?? [],
+        stale: Boolean(this.quotaSnapshot?.lastSuccessAt),
+        errorSummary: message,
+      });
     }
+    this.state.quotaSnapshot = this.quotaSnapshot;
+    if (this.resourceSnapshot) this.updateResourceSnapshot();
     return this.quotaSnapshot;
+  }
+
+  async refreshResources() {
+    if (this.resourceRefresh) return this.resourceRefresh;
+    this.resourceRefresh = (async () => {
+      this.observedCapabilities = probeLocalCapabilities(this.config, this.observedCapabilities);
+      this.modelSnapshot = await probeConfiguredModels(this.config, this.modelSnapshot, { workspace: this.config.workspace });
+      this.models = this.modelSnapshot.items;
+      await this.refreshQuota();
+      this.dynamicCapabilities = schedulingCapabilities(this.config, this.observedCapabilities);
+      this.updateResourceSnapshot();
+      this.state.observedCapabilities = this.observedCapabilities;
+      this.state.modelSnapshot = this.modelSnapshot;
+      this.state.quotaSnapshot = this.quotaSnapshot;
+      return this.resourceSnapshot;
+    })();
+    try {
+      return await this.resourceRefresh;
+    } finally {
+      this.resourceRefresh = null;
+    }
+  }
+
+  updateResourceSnapshot() {
+    const sections = [this.observedCapabilities, this.modelSnapshot, this.quotaSnapshot];
+    const stale = sections.some((section) => section?.stale);
+    const unavailable = [this.observedCapabilities?.state, this.modelSnapshot?.state].includes("unavailable");
+    this.resourceSnapshot = {
+      schemaVersion: 1,
+      state: stale ? "stale" : unavailable ? "unavailable" : "available",
+      checkedAt: new Date().toISOString(),
+      stale,
+      errorSummary: sections.map((section) => section?.errorSummary).filter(Boolean).join("; ").slice(0, 500) || null,
+      capabilities: this.observedCapabilities,
+      models: this.modelSnapshot,
+      quota: this.quotaSnapshot,
+    };
+    this.state.resourceSnapshot = this.resourceSnapshot;
+    return this.resourceSnapshot;
   }
 
   async loadState() {
@@ -113,6 +185,10 @@ export class AgentWorker {
         executorStatus: saved.executorStatus ?? null,
         usageTotals: saved.usageTotals ?? null,
         sessions: saved.sessions ?? {},
+        observedCapabilities: saved.observedCapabilities ?? null,
+        modelSnapshot: saved.modelSnapshot ?? null,
+        quotaSnapshot: saved.quotaSnapshot ?? null,
+        resourceSnapshot: saved.resourceSnapshot ?? null,
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -168,13 +244,14 @@ export class AgentWorker {
           agentId: this.agentId,
           payload: {
             adapter: this.adapter.type,
-            capabilities: this.config.capabilities ?? ["task.execute", "pause", "resume", "cancel"],
+            capabilities: this.dynamicCapabilities,
             protocolFeatures: ["attempt-lease-v1", ...(this.artifactClient.enabled ? ["artifact-transfer-v1"] : [])],
             sessionId: this.state.sessionId,
             paused: this.state.paused,
             platform: process.platform,
             node: process.version,
             observedCapabilities: this.observedCapabilities,
+            resourceSnapshot: this.resourceSnapshot,
             executors: [this.state.executorStatus],
             ...this.agentProfile(),
           },
@@ -204,6 +281,9 @@ export class AgentWorker {
         paused: this.state.paused,
         sessionId: this.state.sessionId,
         observedCapabilities: this.observedCapabilities,
+        resourceSnapshot: this.resourceSnapshot,
+        capabilities: this.dynamicCapabilities,
+        models: this.models,
         executors: [this.state.executorStatus],
         currentTaskId: this.current?.taskId ?? null,
         currentAttemptId: this.current?.payload?.attemptId ?? null,
@@ -214,10 +294,15 @@ export class AgentWorker {
     }));
     beat();
     this.heartbeatTimer = setInterval(beat, Number(this.config.heartbeatMs ?? 5000));
-    if (this.quotaTimer) clearInterval(this.quotaTimer);
-    if (this.config.quotaProbe?.command) {
-      this.quotaTimer = setInterval(() => void this.refreshQuota(), Number(this.config.quotaProbe.intervalMs ?? 60_000));
-      this.quotaTimer.unref();
+    if (this.resourceTimer) clearInterval(this.resourceTimer);
+    const refreshIntervalMs = Number(this.config.capabilityProbe?.intervalMs ?? this.config.quotaProbe?.intervalMs ?? 60_000);
+    if (refreshIntervalMs > 0) {
+      this.resourceTimer = setInterval(() => {
+        void this.refreshResources().then(() => this.saveState()).catch((error) => {
+          console.error(`[${this.agentId}] resource refresh error: ${error.message}`);
+        });
+      }, Math.max(100, refreshIntervalMs));
+      this.resourceTimer.unref();
     }
   }
 
@@ -467,7 +552,8 @@ export class AgentWorker {
         label: this.config.account.label ? String(this.config.account.label) : undefined,
       } : null,
       roles: normalizeRoles(this.config.roles ?? this.config.role),
-      models: normalizeModels(this.config.models, this.config.adapter),
+      models: this.models,
+      resourceSnapshot: this.resourceSnapshot,
       maxConcurrency: 1,
       usageTotals: this.state.usageTotals,
       quotaSnapshot: this.quotaSnapshot,

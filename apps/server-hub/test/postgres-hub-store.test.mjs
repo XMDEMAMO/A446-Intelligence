@@ -68,6 +68,8 @@ test("PostgreSQL restores an active task across Hub restart and preserves termin
       requiresApproval: true,
     });
     const approvalTaskId = approvalResponse.task.taskId;
+    const approvalInterventionId = [...hub.interventions.values()].find((item) => item.taskId === approvalTaskId)?.interventionId;
+    assert.ok(approvalInterventionId);
 
     const cancelledResponse = await post(hub, "/v1/tasks", {
       targetAgentId: "postgres-worker",
@@ -102,6 +104,7 @@ test("PostgreSQL restores an active task across Hub restart and preserves termin
     assert.equal(hub.tasks.get(completedTaskId)?.status, "completed");
     assert.match(hub.tasks.get(completedTaskId)?.output ?? "", /postgres-worker/);
     assert.equal(hub.tasks.get(approvalTaskId)?.status, "awaiting_approval");
+    assert.equal(hub.interventions.get(approvalInterventionId)?.status, "pending");
     assert.equal(hub.tasks.get(cancelledTaskId)?.status, "cancelled");
     assert.equal(hub.attempts.get(completedAttemptId)?.status, "completed");
     assert.equal(hub.agents.get("postgres-worker")?.status, "offline");
@@ -109,6 +112,14 @@ test("PostgreSQL restores an active task across Hub restart and preserves termin
     assert.ok(hub.log.recent(1000).some((event) => event.type === "task.result"));
     assert.ok(hub.processedInbound.size > 0);
     assert.ok([...hub.pendingDeliveries.values()].some((delivery) => delivery.envelope.id === pendingEnvelopeId));
+
+    const decisions = await Promise.all([
+      postStatus(hub, `/v1/interventions/${approvalInterventionId}/resolve`, { decision: "approve" }),
+      postStatus(hub, `/v1/interventions/${approvalInterventionId}/resolve`, { decision: "approve" }),
+    ]);
+    assert.deepEqual(decisions.sort(), [200, 409]);
+    assert.equal(hub.interventions.get(approvalInterventionId)?.status, "resolved");
+    assert.equal(hub.tasks.get(approvalTaskId)?.status, "queued");
   } finally {
     if (worker) await worker.stop();
     if (hub) await hub.stop();
@@ -173,6 +184,16 @@ async function post(hub, pathname, body) {
   const text = await response.text();
   assert.equal(response.ok, true, text);
   return JSON.parse(text);
+}
+
+async function postStatus(hub, pathname, body) {
+  const response = await fetch(`${hub.url()}${pathname}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  await response.text();
+  return response.status;
 }
 
 async function waitUntil(predicate, timeoutMs = 10000) {

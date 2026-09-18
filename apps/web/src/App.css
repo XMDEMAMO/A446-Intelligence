@@ -323,6 +323,9 @@
 .intervention-box { grid-template-columns: minmax(180px, 0.8fr) minmax(220px, 1fr) auto; align-items: center; border-top-color: #ead8b8; background: #fff9ef; }
 .intervention-box strong { color: #965a09; font-size: 11px; }
 .intervention-box p { margin: 3px 0 0; color: #705a38; font-size: 10px; }
+.intervention-box small { color: #9b7a48; font-size: 8px; }
+.intervention-actions { display: flex; justify-content: flex-end; gap: 6px; }
+.intervention-actions .reject { color: #9e3434; background: #f6dddd; }
 
 .detail-sidebar { overflow-y: auto; border-left: 1px solid var(--line); }
 .side-section { padding: 21px 18px; border-bottom: 1px solid var(--line); }
@@ -337,6 +340,9 @@
 .participant strong { overflow: hidden; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
 .participant small { overflow: hidden; color: var(--muted); font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
 .participant em { overflow: hidden; color: #3e666e; font-size: 8px; font-style: normal; text-overflow: ellipsis; white-space: nowrap; }
+.participant .resource-summary.available { color: #167653; }
+.participant .resource-summary.stale { color: #97600f; }
+.participant .resource-summary.unavailable { color: #a13232; }
 .participant > span { padding: 3px 6px; border-radius: 999px; color: #167653; background: #e0f2e9; font-size: 8px; }
 .participant > span.busy { color: #97600f; background: #fff0d5; }
 .muted { color: var(--muted); font-size: 10px; }
@@ -352,6 +358,7 @@
 .quota-badge.healthy { color: #11714f; background: #dff2e8; }
 .quota-badge.low { color: #9a6008; background: #fff0d5; }
 .quota-badge.exhausted { color: #a13232; background: #f8dddd; }
+.quota-badge.stale { color: #875b18; background: #f7ead2; }
 .token-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; margin-top: 12px; }
 .token-grid span { display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; }
 .token-grid b { color: var(--ink); font-family: var(--mono); font-size: 8px; }
@@ -363,6 +370,8 @@
 .quota-meter progress::-webkit-progress-value { border-radius: 9px; background: var(--cyan); }
 .quota-meter small { color: var(--faint); font-size: 7px; }
 .quota-unknown { margin-top: 10px; padding: 7px; border-radius: 7px; color: var(--muted); background: #f0f3f4; font-size: 8px; text-align: center; }
+.quota-unknown small { display: block; margin-top: 3px; color: var(--faint); }
+.quota-unknown.stale { color: #875b18; background: #fff4df; }
 .connection-warning { margin: 14px 18px; padding: 10px; border: 1px solid #efdcb9; border-radius: 9px; color: #775d34; background: #fff8ec; font-size: 9px; line-height: 1.5; }
 
 .modal-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 24px; background: rgba(13, 31, 36, 0.52); backdrop-filter: blur(5px); }

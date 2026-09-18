@@ -5,6 +5,7 @@ function emptyState() {
     agents: [],
     attempts: [],
     artifacts: [],
+    interventions: [],
     deliveries: [],
     inboundMessages: [],
     auditEvents: [],
@@ -27,14 +28,18 @@ export class MemoryHubStore {
   }
 
   async commit(changes = {}) {
+    for (const task of changes.tasks ?? []) assertTaskGuard(this.state.tasks, task, changes.taskGuards?.[task.taskId]);
+    for (const intervention of changes.interventions ?? []) {
+      assertInterventionGuard(this.state.interventions, intervention, changes.interventionGuards?.[intervention.interventionId]);
+    }
     for (const task of changes.tasks ?? []) {
-      assertTaskGuard(this.state.tasks, task, changes.taskGuards?.[task.taskId]);
       upsert(this.state.tasks, task, (item) => item.taskId);
     }
     for (const message of changes.messages ?? []) upsert(this.state.messages, message, (item) => item.messageId);
     for (const agent of changes.agents ?? []) upsert(this.state.agents, agent, (item) => item.agentId);
     for (const attempt of changes.attempts ?? []) upsert(this.state.attempts, attempt, (item) => item.attemptId);
     for (const artifact of changes.artifacts ?? []) upsert(this.state.artifacts, artifact, (item) => item.artifactId);
+    for (const intervention of changes.interventions ?? []) upsert(this.state.interventions, intervention, (item) => item.interventionId);
     for (const delivery of changes.deliveries ?? []) {
       upsert(this.state.deliveries, delivery, deliveryKey);
     }
@@ -61,7 +66,7 @@ export function createEmptyHubState() {
 
 function normalizeState(seed) {
   const state = emptyState();
-  for (const key of ["tasks", "messages", "agents", "attempts", "artifacts", "deliveries", "inboundMessages", "auditEvents"]) {
+  for (const key of ["tasks", "messages", "agents", "attempts", "artifacts", "interventions", "deliveries", "inboundMessages", "auditEvents"]) {
     state[key] = Array.isArray(seed[key]) ? structuredClone(seed[key]) : [];
   }
   state.metadata = {
@@ -94,5 +99,16 @@ function assertTaskGuard(tasks, task, guard) {
   const statusAllowed = guard.allowedStatuses?.includes(current?.status);
   if (!current || current.currentAttemptId !== guard.currentAttemptId || !statusAllowed) {
     throw Object.assign(new Error(`Stale task transition rejected for ${task.taskId}`), { code: "STALE_TASK_TRANSITION" });
+  }
+}
+
+function assertInterventionGuard(interventions, intervention, guard) {
+  if (!guard) return;
+  const current = interventions.find((item) => item.interventionId === intervention.interventionId);
+  if (!current || !guard.allowedStatuses?.includes(current.status)) {
+    throw Object.assign(new Error(`Intervention ${intervention.interventionId} is no longer pending`), {
+      code: "INTERVENTION_CONFLICT",
+      statusCode: 409,
+    });
   }
 }

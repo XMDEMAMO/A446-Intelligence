@@ -31,6 +31,8 @@ export class AgentHub {
     this.pendingDeliveries = new Map();
     this.attempts = new Map();
     this.artifacts = new Map();
+    this.interventions = new Map();
+    this.interventionLocks = new Map();
     this.processedInbound = new Set();
     this.store = services.store ?? new MemoryHubStore();
     this.authService = services.authService ?? null;
@@ -70,6 +72,20 @@ export class AgentHub {
     }));
     this.attempts = new Map((state.attempts ?? []).map((attempt) => [attempt.attemptId, attempt]));
     this.artifacts = new Map((state.artifacts ?? []).map((artifact) => [artifact.artifactId, artifact]));
+    this.interventions = new Map((state.interventions ?? []).map((stored) => {
+      const intervention = normalizeStoredIntervention(stored, this.tasks);
+      return [intervention.interventionId, intervention];
+    }));
+    for (const root of [...this.tasks.values()].filter((task) => task.taskId === task.rootTaskId && task.humanIntervention)) {
+      if ([...this.interventions.values()].some((item) => item.rootTaskId === root.taskId)) continue;
+      const intervention = normalizeStoredIntervention({
+        ...root.humanIntervention,
+        interventionId: `${root.taskId}:legacy`,
+        rootTaskId: root.taskId,
+        taskId: root.taskId,
+      }, this.tasks);
+      this.interventions.set(intervention.interventionId, intervention);
+    }
     this.processedInbound = new Set((state.inboundMessages ?? []).map((message) => message.messageId));
     this.log.restore(state.auditEvents ?? []);
 
@@ -84,6 +100,9 @@ export class AgentHub {
       this.markAgent(restored);
       return [restored.agentId, restored];
     }));
+    for (const root of [...this.tasks.values()].filter((task) => task.taskId === task.rootTaskId)) {
+      root.humanIntervention = this.publicIntervention(this.currentIntervention(root.taskId), true);
+    }
   }
 
   leasesEnabled() {
@@ -118,6 +137,12 @@ export class AgentHub {
 
   markArtifact(artifact) {
     if (artifact?.artifactId) this.dirty.artifacts.set(artifact.artifactId, artifact);
+  }
+
+  markIntervention(intervention, guard) {
+    if (!intervention?.interventionId) return;
+    this.dirty.interventions.set(intervention.interventionId, intervention);
+    if (guard) this.dirty.interventionGuards.set(intervention.interventionId, guard);
   }
 
   markDelivery(delivery) {
@@ -363,6 +388,7 @@ export class AgentHub {
             adapter: message.payload?.adapter,
             sessionId: message.payload?.sessionId,
             observedCapabilities: message.payload?.observedCapabilities,
+            resourceSnapshot: message.payload?.resourceSnapshot ?? null,
             executors: message.payload?.executors ?? [],
             deviceId: authenticatedActor?.deviceId ?? message.payload?.deviceId ?? registeredAgentId,
             account: message.payload?.account ?? null,
@@ -459,6 +485,9 @@ export class AgentHub {
         agent.busy = Boolean(message.payload?.busy);
         agent.paused = Boolean(message.payload?.paused);
         agent.observedCapabilities = message.payload?.observedCapabilities ?? agent.observedCapabilities;
+        agent.resourceSnapshot = message.payload?.resourceSnapshot ?? agent.resourceSnapshot;
+        agent.capabilities = Array.isArray(message.payload?.capabilities) ? message.payload.capabilities.map(String) : agent.capabilities;
+        agent.models = Array.isArray(message.payload?.models) ? normalizeModels(message.payload.models) : agent.models;
         agent.executors = message.payload?.executors ?? agent.executors;
         agent.currentTaskId = message.payload?.currentTaskId ?? null;
         agent.usageTotals = message.payload?.usageTotals ?? agent.usageTotals;
@@ -515,6 +544,14 @@ export class AgentHub {
       }
       this.finishTaskActivity(task);
       this.markTask(task, this.taskAttemptGuard(message));
+      this.createIntervention(task, {
+        kind: "worker_approval",
+        question: message.payload?.question ?? message.payload?.reason ?? "Worker 请求人工批准后继续任务。",
+        requestedBy: agentId,
+        requesterRole: task.role ?? "executor",
+        allowedActions: ["approve", "reject"],
+        continuation: { type: "retry_task", taskId: task.taskId },
+      });
       await this.recordEvent("approval.requested", { taskId: task.taskId, agentId, attemptId: attempt?.attemptId, approval: message.payload });
     } else if (message.type === "task.rejected" && task) {
       task.status = "rejected";
@@ -721,6 +758,16 @@ export class AgentHub {
       mentions: task.targetAgentId ? [task.targetAgentId] : task.role ? [`@${task.role}`] : [],
     });
     this.queueEvent("task.created", task);
+    if (task.requiresApproval) {
+      this.createIntervention(task, {
+        kind: "task_approval",
+        question: `任务等待人工批准：${task.taskSpec?.title ?? task.input.slice(0, 160)}`,
+        requestedBy: "system",
+        requesterRole: task.role ?? "system",
+        allowedActions: ["approve", "reject"],
+        continuation: { type: "retry_task", taskId: task.taskId },
+      });
+    }
     return task;
   }
 
@@ -990,20 +1037,225 @@ export class AgentHub {
 
   requireHuman(task, question) {
     const root = this.tasks.get(task.rootTaskId) ?? task;
-    root.humanIntervention = {
-      status: "required",
-      question: String(question),
-      requestedBy: task.targetAgentId,
-      requestedAt: new Date().toISOString(),
-    };
-    this.markTask(root);
-    this.addMessage(task, {
-      senderId: task.targetAgentId,
-      senderRole: task.role,
-      kind: "human_intervention",
-      text: String(question),
-      mentions: ["human"],
+    return this.createIntervention(task, {
+      kind: "workflow_input",
+      question,
+      allowedActions: ["respond", "approve", "reject"],
+      continuation: {
+        type: "workflow_followup",
+        targetAgentId: root.workflow?.plannerAgentId ?? (task.role === "planner" ? task.targetAgentId : null),
+        role: "planner",
+        stage: "human_followup",
+        sessionScopeId: root.sessionScopeId ?? task.sessionScopeId ?? root.taskId,
+      },
     });
+  }
+
+  createIntervention(task, options = {}) {
+    const root = this.tasks.get(task.rootTaskId) ?? task;
+    const kind = String(options.kind ?? "workflow_input");
+    const duplicate = [...this.interventions.values()].find((item) => (
+      item.taskId === task.taskId && item.kind === kind && item.status === "pending"
+    ));
+    if (duplicate) return duplicate;
+    const requestedAt = new Date().toISOString();
+    const question = String(options.question ?? "需要人工决定").trim().slice(0, 4000);
+    const intervention = {
+      interventionId: randomUUID(),
+      rootTaskId: root.taskId,
+      taskId: task.taskId,
+      kind,
+      status: "pending",
+      question,
+      requestedBy: options.requestedBy ?? task.targetAgentId ?? "system",
+      requesterRole: options.requesterRole ?? task.role ?? "system",
+      requesterStage: options.requesterStage ?? task.stage ?? null,
+      sessionScopeId: options.sessionScopeId ?? task.sessionScopeId ?? null,
+      allowedActions: Array.isArray(options.allowedActions) ? options.allowedActions : ["respond"],
+      context: minimalInterventionContext(root, task, options.context),
+      continuation: options.continuation ?? null,
+      requestedAt,
+      updatedAt: requestedAt,
+    };
+    this.interventions.set(intervention.interventionId, intervention);
+    this.markIntervention(intervention);
+    this.syncRootIntervention(root.taskId);
+    if (options.addMessage !== false) {
+      this.addMessage(task, {
+        senderId: intervention.requestedBy,
+        senderRole: intervention.requesterRole,
+        kind: "human_intervention",
+        text: question,
+        mentions: ["human"],
+      });
+    }
+    this.queueEvent("intervention.requested", {
+      interventionId: intervention.interventionId,
+      rootTaskId: intervention.rootTaskId,
+      taskId: intervention.taskId,
+      kind: intervention.kind,
+      requesterRole: intervention.requesterRole,
+      requesterStage: intervention.requesterStage,
+      sessionScopeId: intervention.sessionScopeId,
+    });
+    return intervention;
+  }
+
+  currentIntervention(rootTaskId) {
+    const matching = [...this.interventions.values()]
+      .filter((item) => item.rootTaskId === rootTaskId)
+      .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
+    return matching.find((item) => item.status === "pending") ?? matching[0] ?? null;
+  }
+
+  publicIntervention(intervention, legacyStatus = false) {
+    if (!intervention) return null;
+    const { continuation, context, ...safe } = intervention;
+    return {
+      ...safe,
+      ...(!legacyStatus ? { context } : {}),
+      status: legacyStatus ? (intervention.status === "pending" ? "required" : "resolved") : intervention.status,
+      ...(legacyStatus ? { recordStatus: intervention.status } : {}),
+      resume: continuation ? {
+        type: continuation.type,
+        role: continuation.role ?? null,
+        stage: continuation.stage ?? null,
+        sessionScopeId: continuation.sessionScopeId ?? intervention.sessionScopeId ?? null,
+      } : null,
+    };
+  }
+
+  syncRootIntervention(rootTaskId) {
+    const root = this.tasks.get(rootTaskId);
+    if (!root) return;
+    root.humanIntervention = this.publicIntervention(this.currentIntervention(rootTaskId), true);
+    this.markTask(root);
+  }
+
+  closePendingInterventions(task, actorId, reason) {
+    const resolvedAt = new Date().toISOString();
+    for (const intervention of this.interventions.values()) {
+      if (intervention.taskId !== task.taskId || intervention.status !== "pending") continue;
+      intervention.status = "resolved";
+      intervention.decision = "reject";
+      intervention.response = reason;
+      intervention.resolvedAt = resolvedAt;
+      intervention.resolvedBy = actorId;
+      intervention.updatedAt = resolvedAt;
+      this.markIntervention(intervention, { allowedStatuses: ["pending"] });
+    }
+    this.syncRootIntervention(task.rootTaskId);
+  }
+
+  async resolveIntervention(interventionId, input, actor) {
+    const previous = this.interventionLocks.get(interventionId) ?? Promise.resolve();
+    const operation = previous.catch(() => {}).then(() => this.resolveInterventionNow(interventionId, input, actor));
+    this.interventionLocks.set(interventionId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (this.interventionLocks.get(interventionId) === operation) this.interventionLocks.delete(interventionId);
+    }
+  }
+
+  async resolveInterventionNow(interventionId, input, actor) {
+    const intervention = this.interventions.get(interventionId);
+    if (!intervention) throw httpError(404, `Unknown intervention ${interventionId}`);
+    if (intervention.status !== "pending") throw httpError(409, `Intervention ${interventionId} is already resolved`);
+    const decision = String(input.decision ?? input.action ?? "respond").toLowerCase();
+    if (!intervention.allowedActions.includes(decision)) throw httpError(400, `Decision ${decision} is not allowed for this intervention`);
+    const response = String(input.response ?? "").trim().slice(0, 10_000);
+    if (decision === "respond" && !response) throw httpError(400, "Human response is required");
+    if (intervention.continuation?.type === "retry_task" && actor.role !== "admin") {
+      throw httpError(403, "Administrator role required for task approval or rejection");
+    }
+    const origin = this.tasks.get(intervention.taskId);
+    const root = this.tasks.get(intervention.rootTaskId);
+    if (intervention.continuation?.type === "workflow_followup" && !root) {
+      throw httpError(409, "Intervention root workflow is unavailable");
+    }
+    if (intervention.continuation?.type === "retry_task" && (!origin || TERMINAL_TASK_STATUSES.has(origin.status))) {
+      throw httpError(409, "Intervention task can no longer be resumed");
+    }
+
+    const resolvedAt = new Date().toISOString();
+    intervention.status = "resolved";
+    intervention.decision = decision;
+    intervention.response = response || null;
+    intervention.resolvedAt = resolvedAt;
+    intervention.resolvedBy = actor.id;
+    intervention.updatedAt = resolvedAt;
+    this.markIntervention(intervention, { allowedStatuses: ["pending"] });
+    this.syncRootIntervention(intervention.rootTaskId);
+
+    const messageTask = origin ?? root;
+    if (messageTask) {
+      this.addMessage(messageTask, {
+        senderId: actor.id,
+        senderRole: "human",
+        kind: "human_decision",
+        text: response || (decision === "approve" ? "已批准" : "已拒绝"),
+      });
+    }
+
+    let resumedTask = null;
+    if (intervention.continuation?.type === "workflow_followup") {
+      resumedTask = this.createTask({
+        targetAgentId: intervention.continuation.targetAgentId,
+        input: "根据记录的人工决定从原工作流节点继续。",
+        rootTaskId: intervention.rootTaskId,
+        parentTaskId: intervention.taskId,
+        sourceAgentId: actor.id,
+        role: intervention.continuation.role,
+        stage: intervention.continuation.stage,
+        workflow: origin?.workflow ?? root.workflow,
+        sessionScopeId: intervention.continuation.sessionScopeId,
+        taskSpec: root.taskSpec,
+        contextBundle: {
+          ...intervention.context,
+          humanResponse: response || decision,
+          humanDecision: { interventionId, decision, response: response || null },
+        },
+      });
+      await this.queueOrDispatch(resumedTask);
+    } else if (intervention.continuation?.type === "retry_task") {
+      const task = origin;
+      if (decision === "approve") {
+        task.requiresApproval = false;
+        task.status = "queued";
+        task.approval = { ...(task.approval ?? {}), approvedAt: resolvedAt, approvedBy: actor.id, interventionId };
+        this.markTask(task);
+        await this.queueOrDispatch(task);
+        resumedTask = task;
+      } else {
+        task.requiresApproval = false;
+        task.status = "rejected";
+        task.completedAt = resolvedAt;
+        task.error = { name: "HumanRejectedError", message: response || "Human rejected the intervention request" };
+        this.finishTaskActivity(task);
+        this.markTask(task);
+        await this.retryQueuedTasks();
+        resumedTask = task;
+      }
+    }
+
+    await this.recordEvent("intervention.resolved", {
+      interventionId,
+      rootTaskId: intervention.rootTaskId,
+      taskId: intervention.taskId,
+      actor: actor.id,
+      decision,
+      resumedTaskId: resumedTask?.taskId ?? null,
+    });
+    if (intervention.continuation?.type === "workflow_followup") {
+      await this.recordEvent("workflow.human_response", { rootTaskId: intervention.rootTaskId, actor: actor.id, interventionId, decision });
+    } else if (decision === "approve") {
+      await this.recordEvent("task.approved", { taskId: intervention.taskId, actor: actor.id, interventionId });
+    } else {
+      await this.recordEvent("task.human_rejected", { taskId: intervention.taskId, actor: actor.id, interventionId });
+    }
+    await this.commitAndDispatch();
+    return { ok: true, intervention: this.publicIntervention(intervention), task: resumedTask };
   }
 
   conversations() {
@@ -1013,7 +1265,8 @@ export class AgentHub {
       const messages = this.messages.filter((message) => message.rootTaskId === root.taskId);
       const active = tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
       const failed = tasks.some((task) => ["failed", "rejected"].includes(task.status));
-      const status = root.humanIntervention?.status === "required" ? "needs_human" : active ? "active" : failed ? "failed" : "completed";
+      const currentIntervention = this.currentIntervention(root.taskId);
+      const status = currentIntervention?.status === "pending" ? "needs_human" : active ? "active" : failed ? "failed" : "completed";
       const participants = [...new Set(tasks.flatMap((task) => [task.sourceAgentId, task.targetAgentId]).filter(Boolean))];
       return {
         rootTaskId: root.taskId,
@@ -1024,7 +1277,7 @@ export class AgentHub {
         participants,
         taskCount: tasks.length,
         messageCount: messages.length,
-        humanIntervention: root.humanIntervention ?? null,
+        humanIntervention: this.publicIntervention(currentIntervention, true),
       };
     }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   }
@@ -1235,14 +1488,16 @@ export class AgentHub {
             ? `Automatic lease recovery limit (${this.leaseMaxRecoveryAttempts()}) reached`
             : "Task may have external side effects or has no explicit retry-safe policy",
         };
-        this.addMessage(task, {
-          senderId: "system",
-          senderRole: "system",
-          kind: "human_intervention",
-          text: recoveryLimitExceeded
+        this.createIntervention(task, {
+          kind: "lease_expiry",
+          question: recoveryLimitExceeded
             ? `执行租约再次过期，已达到自动恢复上限 ${this.leaseMaxRecoveryAttempts()} 次，需要人工确认。`
             : "执行租约已过期。该任务未声明可安全重试，需要人工确认后才能重新派发。",
-          mentions: ["human"],
+          requestedBy: "system",
+          requesterRole: task.role ?? "system",
+          allowedActions: ["approve", "reject"],
+          continuation: { type: "retry_task", taskId: task.taskId },
+          context: { reason: task.approval.reason },
         });
         await this.recordEvent("task.lease_expired_needs_approval", {
           taskId: task.taskId,
@@ -1546,6 +1801,20 @@ export class AgentHub {
 
       if (actor.kind !== "web") return json(response, 403, { error: "Web user session required" });
       if (!["GET", "HEAD", "OPTIONS"].includes(request.method ?? "GET")) this.requireWebMutation(request, actor);
+      if (request.method === "GET" && url.pathname === "/v1/interventions") {
+        const rootTaskId = url.searchParams.get("rootTaskId");
+        const status = url.searchParams.get("status");
+        const interventions = [...this.interventions.values()]
+          .filter((item) => (!rootTaskId || item.rootTaskId === rootTaskId) && (!status || item.status === status))
+          .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt))
+          .map((item) => this.publicIntervention(item));
+        return json(response, 200, { interventions });
+      }
+      const interventionResolveRoute = url.pathname.match(/^\/v1\/interventions\/([^/]{1,200})\/resolve$/i);
+      if (request.method === "POST" && interventionResolveRoute) {
+        const result = await this.resolveIntervention(decodeURIComponent(interventionResolveRoute[1]), await readBody(request), actor);
+        return json(response, 200, result);
+      }
       if (request.method === "GET" && url.pathname === "/v1/agents") {
         return json(response, 200, { agents: [...this.agents.values()] });
       }
@@ -1670,37 +1939,20 @@ export class AgentHub {
   }
 
   async handleCommand(command, actor = { id: "human", role: "admin" }) {
+    if (command.type === "intervention.resolve") {
+      return this.resolveIntervention(String(command.interventionId ?? ""), command, actor);
+    }
     if (command.type === "workflow.human_response") {
       const root = this.tasks.get(command.rootTaskId);
       if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
-      if (root.humanIntervention?.status !== "required") throw httpError(409, `Workflow ${command.rootTaskId} is not awaiting human input`);
       const response = String(command.response ?? "").trim();
       if (!response) throw httpError(400, "Human response is required");
-      root.humanIntervention = {
-        ...root.humanIntervention,
-        status: "resolved",
-        response,
-        resolvedAt: new Date().toISOString(),
-        resolvedBy: actor.id,
-      };
-      this.markTask(root);
-      this.addMessage(root, { senderId: actor.id, senderRole: "human", kind: "human_decision", text: response });
-      const planner = this.createTask({
-        targetAgentId: root.workflow?.plannerAgentId,
-        input: "根据人工决定继续规划。",
-        rootTaskId: root.taskId,
-        parentTaskId: root.taskId,
-        sourceAgentId: actor.id,
-        role: "planner",
-        stage: "human_followup",
-        workflow: root.workflow,
-        sessionScopeId: root.sessionScopeId,
-        taskSpec: root.taskSpec,
-        contextBundle: { objective: root.input, humanResponse: response },
-      });
-      await this.queueOrDispatch(planner);
-      await this.recordEvent("workflow.human_response", { rootTaskId: root.taskId, actor: actor.id });
-      return { ok: true, task: planner };
+      let intervention = [...this.interventions.values()].find((item) => item.rootTaskId === root.taskId && item.status === "pending" && item.kind === "workflow_input");
+      if (!intervention && root.humanIntervention?.status === "required") {
+        intervention = this.requireHuman(root, root.humanIntervention.question);
+      }
+      if (!intervention) throw httpError(409, `Workflow ${command.rootTaskId} is not awaiting human input`);
+      return this.resolveIntervention(intervention.interventionId, { decision: "respond", response }, actor);
     }
     if (command.type === "task.approve") {
       if (actor.role !== "admin") throw httpError(403, "Administrator role required for task approval");
@@ -1709,6 +1961,8 @@ export class AgentHub {
       if (task.status !== "awaiting_approval" || !task.requiresApproval) {
         throw httpError(409, `Task ${command.taskId} is not awaiting approval`);
       }
+      const intervention = [...this.interventions.values()].find((item) => item.taskId === task.taskId && item.status === "pending" && item.continuation?.type === "retry_task");
+      if (intervention) return this.resolveIntervention(intervention.interventionId, { decision: "approve" }, actor);
       task.requiresApproval = false;
       task.approval = { ...(task.approval ?? {}), approvedAt: new Date().toISOString(), approvedBy: actor.id };
       this.markTask(task);
@@ -1749,6 +2003,7 @@ export class AgentHub {
       }
       this.finishTaskActivity(task);
       this.markTask(task);
+      this.closePendingInterventions(task, actor.id, "Task cancelled by an administrator");
       if (task.targetAgentId) {
         this.deliver(task.targetAgentId, makeEnvelope("task.cancel", {
           agentId: task.targetAgentId,
@@ -1772,6 +2027,8 @@ function createDirtyState() {
     agents: new Map(),
     attempts: new Map(),
     artifacts: new Map(),
+    interventions: new Map(),
+    interventionGuards: new Map(),
     deliveries: new Map(),
     deletedDeliveries: new Map(),
     inboundMessages: new Map(),
@@ -1787,6 +2044,7 @@ function hasDirtyState(dirty) {
     || dirty.agents.size > 0
     || dirty.attempts.size > 0
     || dirty.artifacts.size > 0
+    || dirty.interventions.size > 0
     || dirty.deliveries.size > 0
     || dirty.deletedDeliveries.size > 0
     || dirty.inboundMessages.size > 0
@@ -1803,6 +2061,8 @@ function takeDirtyState(hub) {
     agents: structuredClone([...dirty.agents.values()]),
     attempts: structuredClone([...dirty.attempts.values()]),
     artifacts: structuredClone([...dirty.artifacts.values()]),
+    interventions: structuredClone([...dirty.interventions.values()]),
+    interventionGuards: structuredClone(Object.fromEntries(dirty.interventionGuards)),
     deliveries: structuredClone([...dirty.deliveries.values()]),
     deletedDeliveries: structuredClone([...dirty.deletedDeliveries.values()]),
     inboundMessages: structuredClone([...dirty.inboundMessages.values()]),
@@ -1823,6 +2083,8 @@ function mergeDirtyState(dirty, changes) {
   for (const agent of changes.agents ?? []) dirty.agents.set(agent.agentId, agent);
   for (const attempt of changes.attempts ?? []) dirty.attempts.set(attempt.attemptId, attempt);
   for (const artifact of changes.artifacts ?? []) dirty.artifacts.set(artifact.artifactId, artifact);
+  for (const intervention of changes.interventions ?? []) dirty.interventions.set(intervention.interventionId, intervention);
+  for (const [interventionId, guard] of Object.entries(changes.interventionGuards ?? {})) dirty.interventionGuards.set(interventionId, guard);
   for (const delivery of changes.deliveries ?? []) dirty.deliveries.set(deliveryKey(delivery.agentId, delivery.envelope.id), delivery);
   for (const delivery of changes.deletedDeliveries ?? []) {
     const key = deliveryKey(delivery.agentId, delivery.messageId);
@@ -1845,6 +2107,58 @@ function toArtifactReference(file) {
     size: file.size,
     sha256: file.sha256,
     status: file.status,
+  };
+}
+
+function minimalInterventionContext(root, task, extra = {}) {
+  const acceptance = Array.isArray(root.taskSpec?.acceptance)
+    ? root.taskSpec.acceptance.map((item) => String(item).slice(0, 1000)).slice(0, 50)
+    : [];
+  return {
+    objective: String(extra?.objective ?? root.contextBundle?.objective ?? root.input ?? "").slice(0, 20_000),
+    acceptance,
+    taskTitle: String(task.taskSpec?.title ?? task.input ?? "").slice(0, 500),
+    ...(extra?.reason ? { reason: String(extra.reason).slice(0, 2000) } : {}),
+  };
+}
+
+function normalizeStoredIntervention(stored, tasks) {
+  const rootTaskId = String(stored.rootTaskId ?? stored.root_task_id ?? "");
+  const root = tasks.get(rootTaskId);
+  const taskId = String(stored.taskId ?? rootTaskId);
+  const task = tasks.get(taskId) ?? root;
+  const status = stored.status === "required" ? "pending" : stored.status === "resolved" ? "resolved" : stored.status ?? "pending";
+  const kind = stored.kind ?? "workflow_input";
+  const requestedAt = new Date(stored.requestedAt ?? stored.createdAt ?? Date.now()).toISOString();
+  const continuation = stored.continuation ?? (kind === "workflow_input" ? {
+    type: "workflow_followup",
+    targetAgentId: root?.workflow?.plannerAgentId ?? (task?.role === "planner" ? task?.targetAgentId : null),
+    role: "planner",
+    stage: "human_followup",
+    sessionScopeId: root?.sessionScopeId ?? task?.sessionScopeId ?? rootTaskId,
+  } : {
+    type: "retry_task",
+    taskId,
+  });
+  return {
+    ...stored,
+    interventionId: String(stored.interventionId ?? `${rootTaskId}:legacy`),
+    rootTaskId,
+    taskId,
+    kind,
+    status,
+    question: String(stored.question ?? "需要人工决定"),
+    requestedBy: stored.requestedBy ?? task?.targetAgentId ?? "system",
+    requesterRole: stored.requesterRole ?? task?.role ?? "system",
+    requesterStage: stored.requesterStage ?? task?.stage ?? null,
+    sessionScopeId: stored.sessionScopeId ?? task?.sessionScopeId ?? null,
+    allowedActions: Array.isArray(stored.allowedActions)
+      ? stored.allowedActions
+      : kind === "workflow_input" ? ["respond", "approve", "reject"] : ["approve", "reject"],
+    context: stored.context ?? (root && task ? minimalInterventionContext(root, task) : {}),
+    continuation,
+    requestedAt,
+    updatedAt: new Date(stored.updatedAt ?? stored.resolvedAt ?? requestedAt).toISOString(),
   };
 }
 

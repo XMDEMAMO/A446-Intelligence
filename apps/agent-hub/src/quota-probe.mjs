@@ -3,18 +3,27 @@ import { normalizeQuotaSnapshot } from "./collaboration.mjs";
 
 export async function probeQuota(spec, context = {}) {
   if (!spec?.command) return null;
+  const parsed = await probeJson(spec, context);
+  const checkedAt = parsed.checkedAt ?? new Date().toISOString();
+  return normalizeQuotaSnapshot({
+    ...parsed,
+    checkedAt,
+    lastSuccessAt: parsed.lastSuccessAt ?? checkedAt,
+    source: parsed.source ?? spec.source ?? "client-probe",
+    stale: false,
+    errorSummary: null,
+  });
+}
+
+export async function probeJson(spec, context = {}) {
+  if (!spec?.command) return null;
   const stdout = await runProbe(spec.command, Array.isArray(spec.args) ? spec.args : [], {
     cwd: context.workspace,
     timeoutMs: Number(spec.timeoutMs ?? 10_000),
     stripProxyEnv: Boolean(spec.stripProxyEnv),
     maxOutputChars: Number(spec.maxOutputChars ?? 100_000),
   });
-  const parsed = parseProbeOutput(stdout);
-  return normalizeQuotaSnapshot({
-    ...parsed,
-    checkedAt: parsed.checkedAt ?? new Date().toISOString(),
-    source: parsed.source ?? spec.source ?? "client-probe",
-  });
+  return parseProbeOutput(stdout);
 }
 
 function runProbe(command, args, options) {
@@ -49,9 +58,9 @@ function runProbe(command, args, options) {
   });
 }
 
-function parseProbeOutput(output) {
+export function parseProbeOutput(output) {
   const text = String(output ?? "").trim();
-  if (!text) throw new Error("quota probe returned no output");
+  if (!text) throw new Error("probe returned no output");
   const candidates = [text, ...text.split(/\r?\n/).reverse()];
   for (const candidate of candidates) {
     try {
@@ -59,5 +68,5 @@ function parseProbeOutput(output) {
       if (value && typeof value === "object" && !Array.isArray(value)) return value;
     } catch {}
   }
-  throw new Error("quota probe output must contain a JSON object");
+  throw new Error("probe output must contain a JSON object");
 }
