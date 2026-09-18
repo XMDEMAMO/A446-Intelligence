@@ -167,9 +167,10 @@ test("identity HTTP routes pass trusted client IP and enforce administrator boun
     verifyCsrf(request) {
       if (request.headers["x-csrf-token"] !== "csrf") throw Object.assign(new Error("CSRF failed"), { statusCode: 403 });
     },
-    async listUsers() { calls.push(["list"]); return [{ id: userId, username: "admin", role: "admin", status: "active" }]; },
-    async createUser(input) { calls.push(["create", input.role]); return { id: userId, username: input.username, role: input.role }; },
-    async setUserStatus(id, status) { calls.push(["status", id, status]); return { id, status }; },
+    async listUsers() { calls.push(["list"]); return [{ userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z", passwordHash: "must-not-leak" }]; },
+    async createUser() { throw new Error("Direct user creation must not be used by HTTP"); },
+    async createOperator(input) { calls.push(["create", input.role]); return { userId, username: input.username, role: input.role }; },
+    async setUserStatus(id, status) { calls.push(["status", id, status]); return { userId: id, status }; },
     async revokeUserSessions(id) { calls.push(["revoke", id]); return 2; },
   };
   const hub = await new AgentHub({
@@ -208,7 +209,12 @@ test("identity HTTP routes pass trusted client IP and enforce administrator boun
     assert.equal(limited.headers.get("retry-after"), "2");
     assert.equal((await limited.json()).retryAfterMs, 2000);
     assert.equal((await request("/v1/admin/users", "operator")).status, 403);
-    assert.equal((await request("/v1/admin/users", "admin")).status, 200);
+    const me = await request("/v1/auth/me", "admin");
+    assert.equal(me.status, 200);
+    assert.deepEqual((await me.json()).user, { id: userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z" });
+    const users = await request("/v1/admin/users", "admin");
+    assert.equal(users.status, 200);
+    assert.equal((await users.json()).users[0].id, userId);
     const csrfFailure = await fetch(`${hub.url()}/v1/admin/users`, {
       method: "POST", headers: { "x-test-role": "admin", "content-type": "application/json" },
       body: JSON.stringify({ username: "operator", password: "secret" }),
@@ -220,8 +226,11 @@ test("identity HTTP routes pass trusted client IP and enforce administrator boun
     assert.equal((await forbiddenAdmin.json()).code, "ADMIN_HTTP_CREATION_FORBIDDEN");
     const created = await request("/v1/admin/users", "admin", "POST", { username: "operator", password: "secret" });
     assert.equal(created.status, 201);
+    assert.equal((await created.json()).user.id, userId);
     assert.ok(calls.some((item) => item[0] === "create" && item[1] === "operator"));
-    assert.equal((await request(`/v1/admin/users/${userId}`, "admin", "PATCH", { status: "disabled" })).status, 200);
+    const changed = await request(`/v1/admin/users/${userId}`, "admin", "PATCH", { status: "disabled" });
+    assert.equal(changed.status, 200);
+    assert.equal((await changed.json()).user.id, userId);
     const revoked = await request(`/v1/admin/users/${userId}/revoke-sessions`, "admin", "POST");
     assert.equal((await revoked.json()).revokedSessions, 2);
   } finally {

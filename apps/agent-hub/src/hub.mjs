@@ -1752,7 +1752,9 @@ export class AgentHub {
 
       if (request.method === "GET" && url.pathname === "/v1/auth/me") {
         if (actor.kind !== "web") return json(response, 403, { error: "Web user session required", code: "FORBIDDEN" });
-        return json(response, 200, { user: publicActor(actor) });
+        const users = actor.userId && this.authService?.listUsers ? await this.authService.listUsers() : [];
+        const currentUser = users.find((user) => (user.id ?? user.userId) === actor.userId);
+        return json(response, 200, { user: currentUser ? publicUser(currentUser) : publicActor(actor) });
       }
       if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
         this.requireWebMutation(request, actor);
@@ -1807,7 +1809,7 @@ export class AgentHub {
       if (url.pathname.startsWith("/v1/admin/")) {
         this.requireAdmin(request, actor);
         if (request.method === "GET" && url.pathname === "/v1/admin/users") {
-          return json(response, 200, { users: await this.authService.listUsers() });
+          return json(response, 200, { users: (await this.authService.listUsers()).map(publicUser) });
         }
         const userRoute = url.pathname.match(/^\/v1\/admin\/users\/([0-9a-f-]{36})$/i);
         if (request.method === "PATCH" && userRoute) {
@@ -1816,7 +1818,7 @@ export class AgentHub {
           const user = await this.authService.setUserStatus(userRoute[1], body.status);
           await this.recordEvent("user.status_changed", { actor: actor.id, userId: userRoute[1], status: body.status, result: "success" });
           await this.flushState();
-          return json(response, 200, { user });
+          return json(response, 200, { user: publicUser(user) });
         }
         const revokeSessions = url.pathname.match(/^\/v1\/admin\/users\/([0-9a-f-]{36})\/revoke-sessions$/i);
         if (request.method === "POST" && revokeSessions) {
@@ -1855,10 +1857,11 @@ export class AgentHub {
           const body = await readBody(request);
           if (body.role === "admin") throw httpError(403, "Administrators cannot be created over HTTP", "ADMIN_HTTP_CREATION_FORBIDDEN");
           if (body.role != null && body.role !== "operator") throw httpError(400, "role must be operator", "VALIDATION_ERROR");
-          const user = await this.authService.createUser({ ...body, role: "operator" });
-          await this.recordEvent("user.created", { actor: actor.id, userId: user.userId, username: user.username, role: user.role, result: "success" });
+          const createOperator = this.authService.createOperator ?? this.authService.createUser;
+          const user = await createOperator.call(this.authService, { ...body, role: "operator" });
+          await this.recordEvent("user.created", { actor: actor.id, userId: user.userId ?? user.id, username: user.username, role: user.role, result: "success" });
           await this.flushState();
-          return json(response, 201, { user });
+          return json(response, 201, { user: publicUser(user) });
         }
         return json(response, 404, { error: "Not found" });
       }
@@ -2273,6 +2276,19 @@ function publicActor(actor) {
     ...(actor.updatedAt ? { updatedAt: actor.updatedAt } : {}),
     ...(actor.lastLoginAt !== undefined ? { lastLoginAt: actor.lastLoginAt } : {}),
     ...(actor.activeSessionCount !== undefined ? { activeSessionCount: actor.activeSessionCount } : {}),
+  };
+}
+
+function publicUser(user) {
+  return {
+    id: user.id ?? user.userId,
+    username: user.username,
+    role: user.role,
+    status: user.status,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    lastLoginAt: user.lastLoginAt,
+    activeSessionCount: user.activeSessionCount,
   };
 }
 
