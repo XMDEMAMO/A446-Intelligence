@@ -53,7 +53,11 @@ Invoke-ProjectStep -Name 'Building web production bundle...' -Reproduce 'cd apps
 }
 
 Invoke-ProjectStep -Name 'Running combined end-to-end smoke test...' -Reproduce 'powershell -ExecutionPolicy Bypass -File scripts\smoke-e2e.ps1' -Action {
-  & (Join-Path $ProjectRoot 'scripts\smoke-e2e.ps1')
+  $WindowsPowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
+  & $WindowsPowerShell -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $ProjectRoot 'scripts\smoke-e2e.ps1')
+  if ($LASTEXITCODE -ne 0) {
+    throw "scripts\smoke-e2e.ps1 failed with exit code $LASTEXITCODE."
+  }
 }
 
 Invoke-ProjectStep -Name 'Installing locked browser E2E dependencies...' -Reproduce 'cd tests\e2e; npm.cmd ci --ignore-scripts' -Action {
