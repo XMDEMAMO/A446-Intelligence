@@ -1,0 +1,36 @@
+[Unit]
+Description=A446 Server Hub
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=a446
+Group=a446
+WorkingDirectory=/srv/a446/current/apps/server-hub
+Environment=NODE_ENV=production
+EnvironmentFile=/etc/a446/server-hub.env
+ExecStart=/usr/bin/node src/server-hub-cli.mjs --config /etc/a446/server-hub.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+UMask=0077
+
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+ReadWritePaths=/var/lib/a446/artifacts /var/log/a446
+
+[Install]
+WantedBy=multi-user.target

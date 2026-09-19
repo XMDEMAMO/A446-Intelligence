@@ -8,11 +8,13 @@ const required = [
   "src/migrate-cli.mjs",
   "src/postgres-hub-store.mjs",
   "src/identity-service.mjs",
+  "src/login-protection.mjs",
   "src/local-artifact-store.mjs",
   "src/identity-cli.mjs",
   "migrations/001_persistent_scheduling.sql",
   "migrations/002_artifacts_and_identity.sql",
   "migrations/003_resource_and_interventions.sql",
+  "migrations/004_identity_hardening.sql",
   "config/server.example.json",
   "config/worker.example.json",
   ".env.example",
@@ -24,6 +26,7 @@ const environmentTemplate = await readFile(path.join(root, ".env.example"), "utf
 if (config.storage?.driver !== "postgres") throw new Error("server.example.json must use PostgreSQL");
 if (config.leases?.enabled !== true) throw new Error("server.example.json must enable leases");
 if (config.auth?.required !== true || config.auth?.mode !== "identity") throw new Error("server.example.json must require identity authentication");
+if (config.auth?.loginProtection?.enabled !== true) throw new Error("server.example.json must enable login protection");
 if (!config.artifacts?.rootDirectoryEnv) throw new Error("server.example.json must configure an external Artifact Store root");
 for (const name of ["A446_DATABASE_URL", "A446_ARTIFACT_ROOT", "A446_TEST_DATABASE_URL"]) {
   if (!environmentTemplate.match(new RegExp(`^${name}=`, "m"))) throw new Error(`.env.example must document ${name}`);

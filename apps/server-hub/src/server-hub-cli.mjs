@@ -42,6 +42,7 @@ const authService = new IdentityService({
   cookieName: config.auth.cookieName,
   secureCookies: config.auth.secureCookies !== false,
   allowedOrigins: config.auth.allowedOrigins,
+  loginProtection: config.auth.loginProtection,
 });
 const artifactStore = new LocalArtifactStore({
   rootDirectory: path.resolve(artifactRoot),

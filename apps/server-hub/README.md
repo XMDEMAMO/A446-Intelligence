@@ -24,6 +24,8 @@ Place the loopback listener behind an HTTPS/WSS reverse proxy. Formal Server Hub
 
 Set `auth.allowedOrigins` to the exact public HTTPS origin used by the Web console. This lets CSRF origin checks remain strict when a loopback Server Hub sits behind a reverse proxy or the Vite development proxy.
 
+`auth.loginProtection` configures recoverable backoff independently for normalized usernames and source IP addresses. The service persists only SHA-256 scope keys and bounded result metadata in `web_login_throttles` and `web_auth_events`; it never stores submitted passwords or raw source addresses. The HTTP route owner must pass `login(username, password, { clientIp })` a source address resolved from the socket or an explicitly trusted reverse proxy. It must not trust arbitrary public `X-Forwarded-For` values.
+
 ## Bootstrap identities
 
 Create the first administrator with a password passed through a temporary environment variable:
@@ -54,6 +56,10 @@ npm.cmd run identity -- revoke-worker --config config/server.example.json --cred
 
 Rotation prints a new token once and revokes the old credential. The Web API exposes the same operations to administrators; operators cannot manage identities, approve tasks, cancel tasks, or control Worker state.
 
+The identity service also provides `createOperator`, `listUsers`, `setUserStatus`, and `revokeUserSessions` for the v0.5 administrator API. `createOperator` deliberately rejects `role=admin`; the bootstrap CLI remains the only administrator-creation path. Disabling a user revokes all of that user's sessions in the same transaction. Database migration `004_identity_hardening.sql` enforces at most one active credential per `agentId`.
+
+The shared Hub HTTP file is maintained on the parallel integration branch. Until that route layer calls these methods, passes the trusted client IP, and serializes `code`, `retryAfterMs`, and `Retry-After`, the service implementation alone does not expose the new behavior over HTTP. The frozen integration contract is [V0.5_SHARED_CONTRACT.md](../../docs/V0.5_SHARED_CONTRACT.md).
+
 ## Web authentication and artifacts
 
 Web users sign in through `POST /v1/auth/login`. The server uses an opaque server-side session, an `HttpOnly; Secure; SameSite=Strict` cookie, and a CSRF token for mutations. Browser requests no longer receive or proxy a shared Hub token.
@@ -80,3 +86,5 @@ The tests truncate all A446 tables in that database. Never point them at a datab
 ## Operations and release preparation
 
 See [OPERATIONS.md](OPERATIONS.md) for the minimal startup order, environment-variable boundary, TLS/WSS reverse-proxy requirements, coordinated PostgreSQL/Artifact backup and recovery, and release-package checklist. The non-secret variable names are collected in [.env.example](.env.example); it is documentation only and is not loaded automatically.
+
+Versioned Caddy, systemd, backup, restore, rollback, and public verification examples live in [deploy/README.md](../../deploy/README.md). They use a release-directory layout and keep runtime secrets outside the repository.
