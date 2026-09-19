@@ -63,6 +63,13 @@ function Assert-Command {
   }
 }
 
+function Read-TrimmedHost {
+  param([Parameter(Mandatory = $true)][string]$Prompt)
+  $value = Read-Host $Prompt
+  if ($null -eq $value) { return }
+  return ([string]$value).Trim()
+}
+
 function Add-CodexToPathIfInstalled {
   if (Get-Command 'codex' -ErrorAction SilentlyContinue) { return }
   if (-not $env:LOCALAPPDATA) { return }
@@ -87,7 +94,7 @@ function Resolve-DeviceId {
   if ($Requested) { return Normalize-DeviceId $Requested }
   if ($Saved -and $Saved.deviceId) { return Normalize-DeviceId ([string]$Saved.deviceId) }
   $default = Normalize-DeviceId $env:COMPUTERNAME
-  $entered = ([string](Read-Host "Unique device name [$default]")).Trim()
+  $entered = Read-TrimmedHost "Unique device name [$default]"
   return Normalize-DeviceId $(if ($entered) { $entered } else { $default })
 }
 
@@ -128,12 +135,12 @@ function Resolve-HubAddress {
     Write-Host 'Active IPv4 addresses on this computer:'
     for ($index = 0; $index -lt $addresses.Count; $index += 1) { Write-Host "  $($index + 1). $($addresses[$index])" }
     $default = if ($addresses.Count) { $addresses[0] } else { '' }
-    $entered = ([string](Read-Host "Hub IPv4 address [$default]")).Trim()
+    $entered = Read-TrimmedHost "Hub IPv4 address [$default]"
     if (-not $entered) { $entered = $default }
     if (-not (Test-IPv4 $entered)) { throw 'A valid local IPv4 address is required.' }
     return $entered
   }
-  $entered = ([string](Read-Host 'Coordinator IPv4 address (shown on the coordinator)')).Trim()
+  $entered = Read-TrimmedHost 'Coordinator IPv4 address (shown on the coordinator)'
   if (-not (Test-IPv4 $entered)) { throw 'A valid coordinator IPv4 address is required.' }
   return $entered
 }
@@ -146,7 +153,7 @@ function Resolve-AccessMode {
   Write-Host 'Local execution access:'
   Write-Host '  1. Full local access (private trusted devices)'
   Write-Host '  2. Workspace-only safe mode'
-  $answer = ([string](Read-Host 'Select [1/2, default 1]')).Trim()
+  $answer = Read-TrimmedHost 'Select [1/2, default 1]'
   return $(if ($answer -eq '2') { 'safe' } else { 'full' })
 }
 
@@ -160,7 +167,7 @@ function Initialize-PairingToken {
   if ($RunMode -eq 'coordinator') {
     $token = "A446-$([Guid]::NewGuid().ToString('N'))-$([Guid]::NewGuid().ToString('N'))"
   } else {
-    $token = ([string](Read-Host 'Pairing token shown on the coordinator')).Trim()
+    $token = Read-TrimmedHost 'Pairing token shown on the coordinator'
     if (-not $token) { throw 'A pairing token is required.' }
   }
   New-Item -ItemType Directory -Path $LanRoot -Force | Out-Null
@@ -200,7 +207,7 @@ function Initialize-AntigravityAlias {
     Write-Host ''
     Write-Host 'Antigravity does not expose the signed-in account identity to its CLI.'
     Write-Host 'Use the same non-secret alias on every device that shares this account.'
-    $alias = ([string](Read-Host "Antigravity account alias [$($Manifest.deviceId)-google]")).Trim()
+    $alias = Read-TrimmedHost "Antigravity account alias [$($Manifest.deviceId)-google]"
     if (-not $alias) { $alias = "$($Manifest.deviceId)-google" }
   }
   $alias = Normalize-DeviceId $alias
