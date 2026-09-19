@@ -50,3 +50,15 @@ Mock 本地模式不启用中央 Artifact Store，因此测试断言任务回传
 - 经当前人类明确授权后，使用真实 Codex 与 Antigravity 在不同设备上完成一次规划、执行、审核和规划回收，并记录 Attempt、耗时、Token、可信额度、返工次数和 Artifact 哈希。
 - 在目标服务器的实际 TLS、域名、反向代理、Artifact 磁盘预算和备份位置确定后，完成部署演练与恢复演练。
 在这些门槛完成前，阶段 G 仍是“进行中”，不得声称 v0.5 已达到 Server Ready 完成定义。
+
+## 6. v0.5 并行 D 分支验证增量
+
+`codex/v05-validation-release-d` 从共享契约冻结点新增以下发布验证基础，不修改 Hub 或 Web 核心业务逻辑：
+
+- `scripts/smoke-e2e.ps1` 等待完整成果附件真正可见后再断言，避免任务终态与群聊消息提交之间的短暂竞态；同时修正 PowerShell 单元素集合计数。
+- `tests/e2e` 使用本机 Edge、Chrome 或 Chromium 运行真实浏览器，默认连接无秘密的本地契约服务，覆盖登录、成果附件、人工介入、指定 Executor 硬约束、RBAC、Worker Token 一次展示、取消与退出会话。
+- `scripts/check-all.ps1` 纳入浏览器 E2E 和三个生产包的 `npm audit --omit=dev`；提供 `-RequirePostgres`，缺少专用数据库时不得作为发布批准。
+- `scripts/check-release.ps1` 作为严格门禁，强制专用 PostgreSQL；可按明确授权追加真实公网浏览器流程和仓库外证据文件校验。
+- `docs/V0.5_RELEASE_ACCEPTANCE_REPORT.md` 和证据模板区分自动通过、未执行和真实演练，不允许把 Mock、计划或跳过项写成发布通过。
+
+A、B、C 功能分支进入唯一集成 HEAD 后，D 的实时浏览器门禁必须在真实 HTTPS 入口复跑。真实 Codex 与 Antigravity 多设备工作流仍需当前人类明确授权，不能由自动检查自行消耗额度。

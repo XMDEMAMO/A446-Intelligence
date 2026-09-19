@@ -1,0 +1,16 @@
+{
+  "name": "a446-browser-e2e",
+  "version": "0.5.0-alpha.3",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test --test-concurrency=1 browser-foundation.test.mjs browser-contract-api.test.mjs browser-admin-ui.test.mjs",
+    "test:live": "node --test --test-concurrency=1 browser-live-release.test.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.63.0"
+  }
+}
