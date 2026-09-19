@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
-import { delay } from "../src/common.mjs";
+import { delay, makeEnvelope } from "../src/common.mjs";
 
 test("two workers preserve sessions, route output, pause, and approval", { timeout: 15000 }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-hub-test-"));
@@ -62,6 +62,7 @@ test("two workers preserve sessions, route output, pause, and approval", { timeo
     await waitUntil(() => workers[0].state.paused === true);
     const paused = await post(hub, "/v1/tasks", { targetAgentId: "agent-a", input: "queued while paused" });
     assert.equal(hub.tasks.get(paused.task.taskId).status, "queued");
+    assert.equal(hub.tasks.get(paused.task.taskId).schedulingErrorCode, "EXECUTOR_PAUSED");
     await post(hub, "/v1/commands", { type: "agent.resume", targetAgentId: "agent-a" });
     await waitForRoot(hub, paused.task.rootTaskId);
 
@@ -95,6 +96,145 @@ test("two workers preserve sessions, route output, pause, and approval", { timeo
     await Promise.all(workers.map((worker) => worker.stop()));
     await hub.stop();
     await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
+test("workflow creation reports invalid explicit executors without creating tasks", async () => {
+  const hub = await new AgentHub({ host: "127.0.0.1", port: 0, logs: { includePayloads: false } }).start();
+  try {
+    const response = await fetch(`${hub.url()}/v1/workflows`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ objective: "fixed work", executorAgentId: "missing" }),
+    });
+    assert.equal(response.status, 409);
+    assert.equal((await response.json()).code, "EXECUTOR_UNAVAILABLE");
+    assert.equal(hub.tasks.size, 0);
+    const bound = hub.createTask({ targetAgentId: "assigned-executor", input: "bound work" });
+    await hub.handleWorkerMessage("another-agent", makeEnvelope("task.started", {
+      agentId: "another-agent", taskId: bound.taskId,
+    }));
+    assert.equal(bound.status, "queued");
+  } finally {
+    await hub.stop();
+  }
+});
+
+test("conversation cancellation and summary reads preserve full-result detail", async () => {
+  const hub = await new AgentHub({ host: "127.0.0.1", port: 0, logs: { includePayloads: false } }).start();
+  try {
+    const task = hub.createTask({ input: "work", role: "executor", contextBundle: { fullResult: "private context" } });
+    task.output = "private output";
+    task.submission = { brief: "summary", fullResult: "private result" };
+    hub.markTask(task);
+    const message = hub.addMessage(task, { text: "result", attachments: [{ type: "full_result", content: "private attachment", taskId: task.taskId }] });
+    const taskList = await (await fetch(`${hub.url()}/v1/tasks?rootTaskId=${task.taskId}&view=summary`)).json();
+    assert.equal(taskList.tasks.length, 1);
+    assert.equal(JSON.stringify(taskList).includes("private"), false);
+    const fullTask = await (await fetch(`${hub.url()}/v1/tasks/${task.taskId}`)).json();
+    assert.equal(fullTask.task.submission.fullResult, "private result");
+    const messageList = await (await fetch(`${hub.url()}/v1/messages?rootTaskId=${task.taskId}&view=summary`)).json();
+    assert.equal(JSON.stringify(messageList).includes("private attachment"), false);
+    const fullMessage = await (await fetch(`${hub.url()}/v1/messages/${message.messageId}`)).json();
+    assert.equal(fullMessage.message.attachments[0].content, "private attachment");
+    await hub.handleCommand({ type: "task.cancel", taskId: task.taskId });
+    assert.equal(hub.conversations()[0].status, "cancelled");
+    for (const type of ["task.started", "approval.request", "task.rejected", "task.result"]) {
+      await hub.handleWorkerMessage("late-agent", makeEnvelope(type, { agentId: "late-agent", taskId: task.taskId, payload: { output: "late" } }));
+      assert.equal(task.status, "cancelled");
+    }
+    assert.equal([...hub.interventions.values()].filter((item) => item.status === "pending").length, 0);
+  } finally {
+    await hub.stop();
+  }
+});
+
+test("identity HTTP routes pass trusted client IP and enforce administrator boundaries", async () => {
+  const calls = [];
+  const userId = "11111111-1111-4111-8111-111111111111";
+  const service = {
+    async init() {},
+    async login(username, _password, context) {
+      calls.push(["login", username, context.clientIp]);
+      if (username === "limited") throw Object.assign(new Error("Try again later"), {
+        statusCode: 429, code: "AUTH_RATE_LIMITED", retryAfterMs: 2000, headers: { "retry-after": "2" },
+      });
+      return { actor: { kind: "web", id: "user:admin", userId, username, role: "admin" }, csrfToken: "csrf", expiresAt: new Date().toISOString(), cookie: "session=x", csrfCookie: "csrf=x" };
+    },
+    async authenticateWeb(request) {
+      const role = request.headers["x-test-role"];
+      return role ? { kind: "web", id: `user:${role}`, userId, username: role, role } : null;
+    },
+    verifyCsrf(request) {
+      if (request.headers["x-csrf-token"] !== "csrf") throw Object.assign(new Error("CSRF failed"), { statusCode: 403 });
+    },
+    async listUsers() { calls.push(["list"]); return [{ userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z", passwordHash: "must-not-leak" }]; },
+    async createUser() { throw new Error("Direct user creation must not be used by HTTP"); },
+    async createOperator(input) { calls.push(["create", input.role]); return { userId, username: input.username, role: input.role }; },
+    async setUserStatus(id, status) { calls.push(["status", id, status]); return { userId: id, status }; },
+    async revokeUserSessions(id) { calls.push(["revoke", id]); return 2; },
+  };
+  const hub = await new AgentHub({
+    host: "127.0.0.1", port: 0, auth: { mode: "identity", trustedProxyIps: ["127.0.0.1"] },
+    logs: { includePayloads: false },
+  }, { authService: service }).start();
+  const request = (pathname, role, method = "GET", body) => fetch(`${hub.url()}${pathname}`, {
+    method,
+    headers: { ...(role ? { "x-test-role": role, "x-csrf-token": "csrf" } : {}), ...(body ? { "content-type": "application/json" } : {}) },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+  try {
+    const anonymous = await request("/v1/tasks");
+    assert.equal(anonymous.status, 401);
+    assert.equal((await anonymous.json()).code, "AUTH_REQUIRED");
+    const login = await fetch(`${hub.url()}/v1/auth/login`, {
+      method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": "192.0.2.10" },
+      body: JSON.stringify({ username: "admin", password: "test" }),
+    });
+    assert.equal(login.status, 200);
+    assert.equal((await login.json()).user.id, userId);
+    assert.deepEqual(calls[0], ["login", "admin", "192.0.2.10"]);
+    hub.config.auth.trustedProxyIps = [];
+    const untrustedForward = await fetch(`${hub.url()}/v1/auth/login`, {
+      method: "POST", headers: { "content-type": "application/json", "x-forwarded-for": "192.0.2.20" },
+      body: JSON.stringify({ username: "admin", password: "test" }),
+    });
+    assert.equal(untrustedForward.status, 200);
+    await untrustedForward.json();
+    assert.equal(calls.at(-1)[2], "127.0.0.1");
+    const limited = await fetch(`${hub.url()}/v1/auth/login`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ username: "limited", password: "test" }),
+    });
+    assert.equal(limited.status, 429);
+    assert.equal(limited.headers.get("retry-after"), "2");
+    assert.equal((await limited.json()).retryAfterMs, 2000);
+    assert.equal((await request("/v1/admin/users", "operator")).status, 403);
+    const me = await request("/v1/auth/me", "admin");
+    assert.equal(me.status, 200);
+    assert.deepEqual((await me.json()).user, { id: userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z" });
+    const users = await request("/v1/admin/users", "admin");
+    assert.equal(users.status, 200);
+    assert.equal((await users.json()).users[0].id, userId);
+    const csrfFailure = await fetch(`${hub.url()}/v1/admin/users`, {
+      method: "POST", headers: { "x-test-role": "admin", "content-type": "application/json" },
+      body: JSON.stringify({ username: "operator", password: "secret" }),
+    });
+    assert.equal(csrfFailure.status, 403);
+    assert.equal((await csrfFailure.json()).code, "CSRF_FAILED");
+    const forbiddenAdmin = await request("/v1/admin/users", "admin", "POST", { username: "new-admin", password: "secret", role: "admin" });
+    assert.equal(forbiddenAdmin.status, 403);
+    assert.equal((await forbiddenAdmin.json()).code, "ADMIN_HTTP_CREATION_FORBIDDEN");
+    const created = await request("/v1/admin/users", "admin", "POST", { username: "operator", password: "secret" });
+    assert.equal(created.status, 201);
+    assert.equal((await created.json()).user.id, userId);
+    assert.ok(calls.some((item) => item[0] === "create" && item[1] === "operator"));
+    const changed = await request(`/v1/admin/users/${userId}`, "admin", "PATCH", { status: "disabled" });
+    assert.equal(changed.status, 200);
+    assert.equal((await changed.json()).user.id, userId);
+    const revoked = await request(`/v1/admin/users/${userId}/revoke-sessions`, "admin", "POST");
+    assert.equal((await revoked.json()).revokedSessions, 2);
+  } finally {
+    await hub.stop();
   }
 });
 

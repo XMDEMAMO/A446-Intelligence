@@ -101,6 +101,33 @@ test("approval interventions require an administrator and rejection is terminal"
   }
 });
 
+test("multiple pending interventions resolve independently and cancellation closes only its task", async () => {
+  const hub = await new AgentHub(testConfig()).start();
+  try {
+    const root = hub.createTask({ input: "workflow", role: "planner", workflow: { enabled: true } });
+    const first = hub.createTask({ input: "first", rootTaskId: root.taskId, parentTaskId: root.taskId, role: "executor", workflow: root.workflow });
+    const second = hub.createTask({ input: "second", rootTaskId: root.taskId, parentTaskId: root.taskId, role: "executor", workflow: root.workflow });
+    const firstIntervention = hub.requireHuman(first, "First decision");
+    const secondIntervention = hub.requireHuman(second, "Second decision");
+    await hub.flushState();
+    assert.notEqual(firstIntervention.interventionId, secondIntervention.interventionId);
+    const listing = await fetch(`${hub.url()}/v1/interventions?rootTaskId=${root.taskId}&status=pending`);
+    assert.equal((await listing.json()).interventions.length, 2);
+    await hub.handleCommand({ type: "task.cancel", taskId: first.taskId });
+    assert.equal(hub.interventions.get(firstIntervention.interventionId).status, "resolved");
+    assert.equal(hub.interventions.get(secondIntervention.interventionId).status, "pending");
+    assert.equal(hub.conversations()[0].status, "needs_human");
+    const pending = await fetch(`${hub.url()}/v1/interventions?rootTaskId=${root.taskId}&status=pending`);
+    assert.deepEqual((await pending.json()).interventions.map((item) => item.interventionId), [secondIntervention.interventionId]);
+    await assert.rejects(
+      hub.resolveIntervention(firstIntervention.interventionId, { decision: "respond", response: "late" }, { id: "user:admin", role: "admin" }),
+      (error) => error.statusCode === 409,
+    );
+  } finally {
+    await hub.stop();
+  }
+});
+
 function testConfig() {
   return {
     host: "127.0.0.1",
