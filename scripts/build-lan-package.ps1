@@ -65,6 +65,12 @@ try {
     'apps\web\test'
   )) { Copy-SourceItem -RelativePath $relative }
 
+  # Keep the cmd.exe entry point portable across Windows code pages.
+  $launcherPath = Join-Path $stagingRoot 'START-A446-MULTI-DEVICE-LAN.bat'
+  $launcherText = [System.IO.File]::ReadAllText($launcherPath)
+  $launcherText = $launcherText.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", "`r`n")
+  [System.IO.File]::WriteAllText($launcherPath, $launcherText, [System.Text.Encoding]::ASCII)
+
   $sourceCommit = (& git -C $ProjectRoot rev-parse HEAD).Trim()
   $sourceBranch = (& git -C $ProjectRoot branch --show-current).Trim()
   $dirty = [bool](& git -C $ProjectRoot status --porcelain)

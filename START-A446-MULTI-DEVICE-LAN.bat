@@ -1,7 +1,6 @@
 @echo off
-setlocal
-chcp 65001 >nul
-title A446 多设备局域网启动器
+setlocal EnableExtensions
+title A446 Multi-Device LAN Launcher
 
 set "A446_MODE=%~1"
 if /I "%A446_MODE%"=="coordinator" goto run
@@ -9,13 +8,13 @@ if /I "%A446_MODE%"=="worker" goto run
 if /I "%A446_MODE%"=="preflight" goto run
 
 echo.
-echo A446 多设备局域网启动器
+echo A446 Multi-Device LAN Launcher
 echo.
-echo   1. 协调设备（Hub + 网页 + 本机 Agent）
-echo   2. 执行设备（连接协调设备）
-echo   3. 仅检查账号、模型、额度和本机环境
+echo   1. Coordinator device (Hub + Web + local Agents)
+echo   2. Worker device (connect to coordinator)
+echo   3. Environment preflight only
 echo.
-choice /C 123 /N /M "请选择 [1/2/3]: "
+choice /C 123 /N /M "Select [1/2/3]: "
 if errorlevel 3 set "A446_MODE=preflight"
 if errorlevel 2 if not errorlevel 3 set "A446_MODE=worker"
 if errorlevel 1 if not errorlevel 2 set "A446_MODE=coordinator"
@@ -25,7 +24,7 @@ powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\st
 set "A446_EXIT=%ERRORLEVEL%"
 if not "%A446_EXIT%"=="0" (
   echo.
-  echo 启动失败，退出代码：%A446_EXIT%
+  echo Startup failed. Exit code: %A446_EXIT%
   pause
 )
 exit /B %A446_EXIT%
