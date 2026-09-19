@@ -1,5 +1,6 @@
 @echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 title A446 Multi-Device LAN Launcher
 
 set "A446_MODE=%~1"

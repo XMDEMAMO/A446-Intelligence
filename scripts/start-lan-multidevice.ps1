@@ -9,6 +9,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 $HubPort = 8787
 $WebPort = 5173
 $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
@@ -45,14 +47,18 @@ function Invoke-NoProxyJson {
 function Read-JsonFile {
   param([Parameter(Mandatory = $true)][string]$Path)
   if (-not (Test-Path -LiteralPath $Path)) { return $null }
-  try { return Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json } catch { return $null }
+  try {
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    return ($text | ConvertFrom-Json)
+  } catch { return $null }
 }
 
 function Save-Settings {
   param([Parameter(Mandatory = $true)][hashtable]$Value)
   New-Item -ItemType Directory -Path $LanRoot -Force | Out-Null
   $temporary = Join-Path $LanRoot "settings.$PID.tmp"
-  $Value | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $temporary -Encoding UTF8
+  $json = $Value | ConvertTo-Json -Depth 8
+  [System.IO.File]::WriteAllText($temporary, $json, [System.Text.Encoding]::UTF8)
   Move-Item -LiteralPath $temporary -Destination $SettingsFile -Force
 }
 
@@ -190,9 +196,15 @@ function Invoke-DevicePreparation {
   param([string]$RunMode, [string]$Address, [string]$Id, [string]$Access)
   Push-Location $HubRoot
   try {
-    $raw = & node 'scripts/prepare-lan-device.mjs' --mode $RunMode --hub-ip $Address --device-id $Id --access $Access
+    $manifestPath = Join-Path $LanRoot "device-$Id.json"
+    if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
+    & node 'scripts/prepare-lan-device.mjs' --mode $RunMode --hub-ip $Address --device-id $Id --access $Access
     if ($LASTEXITCODE -ne 0) { throw 'Device discovery and configuration generation failed.' }
-    return ($raw | ConvertFrom-Json)
+    if (Test-Path -LiteralPath $manifestPath) {
+      $text = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)
+      return ($text | ConvertFrom-Json)
+    }
+    throw "Manifest file was not generated: $manifestPath"
   } finally { Pop-Location }
 }
 
@@ -250,9 +262,16 @@ function Show-ProviderSummaries {
     $cache = Join-Path $LanRoot "provider-cache\preflight-$($Manifest.deviceId)-$provider.json"
     Push-Location $HubRoot
     try {
-      $raw = & node 'scripts/provider-probe.mjs' --provider $provider --command ([string]$worker.command) --kind all --cache-file $cache --max-age-ms 30000 --timeout-ms 20000
+      & node 'scripts/provider-probe.mjs' --provider $provider --command ([string]$worker.command) --kind all --cache-file $cache --max-age-ms 30000 --timeout-ms 20000
       if ($LASTEXITCODE -ne 0) { Write-Warning "Provider details are temporarily unavailable for $provider."; continue }
-      $snapshot = $raw | ConvertFrom-Json
+      $snapshot = $null
+      if (Test-Path -LiteralPath $cache) {
+        try {
+          $text = [System.IO.File]::ReadAllText($cache, [System.Text.Encoding]::UTF8)
+          $snapshot = $text | ConvertFrom-Json
+        } catch {}
+      }
+      if (-not $snapshot) { continue }
       Write-Host ''
       Write-Host "Provider: $provider"
       Write-Host "Account:  $($snapshot.account.label)"
