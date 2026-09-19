@@ -1,8 +1,31 @@
-export type ConnectionMode = 'connecting' | 'live' | 'demo'
+export type ConnectionMode = 'loading' | 'live' | 'reconnecting' | 'offline' | 'demo'
 export type AgentRole = 'planner' | 'executor' | 'reviewer'
 export type AgentHealth = 'Healthy' | 'Degraded' | 'Unhealthy' | 'Unknown'
 export type QuotaState = 'Healthy' | 'Low' | 'Exhausted' | 'Unknown'
 export type ResourceState = 'available' | 'unavailable' | 'unknown' | 'stale'
+export type WebUserRole = 'admin' | 'operator'
+export type WebUserStatus = 'active' | 'disabled'
+
+export interface WebUser {
+  id: string
+  username: string
+  role: WebUserRole
+  status?: WebUserStatus
+  createdAt?: string
+  updatedAt?: string
+  lastLoginAt?: string | null
+  activeSessionCount?: number | null
+}
+
+export interface WorkerCredential {
+  credentialId: string
+  agentId: string
+  deviceId: string
+  status: 'active' | 'revoked' | string
+  createdAt?: string
+  lastUsedAt?: string | null
+  revokedAt?: string | null
+}
 
 export interface TokenUsage {
   inputTokens: number
@@ -204,12 +227,22 @@ export interface HubTask {
   rootTaskId?: string
   parentTaskId?: string | null
   targetAgentId: string | null
+  requestedAgentId?: string | null
+  executorAgentId?: string | null
   sourceAgentId?: string
   input: string
   role?: AgentRole | null
   stage?: string
   route?: string[]
   metadata?: Record<string, unknown>
+  workflow?: {
+    enabled?: boolean
+    plannerAgentId?: string | null
+    executorAgentId?: string | null
+    reviewerAgentId?: string | null
+    maxReviewCycles?: number
+  } | null
+  sessionScopeId?: string | null
   taskSpec?: TaskSpec | null
   contextBundle?: Record<string, unknown>
   execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
@@ -220,6 +253,22 @@ export interface HubTask {
   reviewCycle?: number
   requiresApproval?: boolean
   status: string
+  schedulingError?: string | null
+  schedulingErrorCode?:
+    | 'NO_ELIGIBLE_AGENT'
+    | 'EXECUTOR_UNAVAILABLE'
+    | 'EXECUTOR_PAUSED'
+    | 'EXECUTOR_ROLE_MISMATCH'
+    | 'EXECUTOR_AT_CAPACITY'
+    | 'EXECUTOR_QUOTA_UNAVAILABLE'
+    | string
+    | null
+  schedulingErrorDetails?: {
+    reason?: string
+    agentId?: string
+    observedAt?: string
+    [key: string]: unknown
+  } | null
   createdAt: string
   dispatchedAt?: string
   startedAt?: string
@@ -257,7 +306,7 @@ export interface HubMessage {
 export interface Conversation {
   rootTaskId: string
   title: string
-  status: 'active' | 'completed' | 'failed' | 'needs_human' | string
+  status: 'active' | 'completed' | 'failed' | 'needs_human' | 'cancelled' | string
   createdAt: string
   updatedAt: string
   participants: string[]
@@ -298,11 +347,26 @@ export interface HubSnapshot {
   events: HubEvent[]
 }
 
+export interface HubOverview {
+  health: HubHealth
+  agents: Agent[]
+  conversations: Conversation[]
+  usage: { totals: TokenUsage | null; byAgent: UsageAgentSummary[] }
+}
+
+export interface ConversationDetail {
+  rootTaskId: string
+  tasks: HubTask[]
+  messages: HubMessage[]
+  interventions: HumanIntervention[]
+}
+
 export interface CreateWorkflowRequest {
   title: string
   objective: string
   acceptance: string[]
   plannerAgentId?: string | null
+  executorAgentId?: string | null
   reviewerAgentId?: string | null
   modelPreference?: string | null
   reasoningEffort?: string | null
