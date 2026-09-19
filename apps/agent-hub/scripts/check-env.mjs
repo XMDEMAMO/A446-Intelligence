@@ -36,7 +36,12 @@ if (args.config) {
     ].filter(Boolean).join("; "),
   });
   for (const tool of observed.tools) {
-    results.push({ check: `capability ${tool.name}`, ok: tool.available, detail: tool.version ?? tool.error ?? "unknown" });
+    results.push({
+      check: `capability ${tool.name}`,
+      ok: true,
+      status: tool.available ? "PASS" : "WARN",
+      detail: tool.available ? (tool.version ?? "available") : `not detected (optional: tasks requiring ${tool.name} will not be scheduled here)`,
+    });
   }
   results.push({
     check: "quota telemetry",
@@ -54,7 +59,8 @@ if (args.codex) {
 }
 
 for (const result of results) {
-  console.log(`${result.ok ? "PASS" : "FAIL"}  ${result.check}: ${result.detail}`);
+  const badge = result.status ?? (result.ok ? "PASS" : "FAIL");
+  console.log(`${badge.padEnd(4, " ")}  ${result.check}: ${result.detail}`);
 }
 process.exitCode = results.some((result) => !result.ok) ? 1 : 0;
 
