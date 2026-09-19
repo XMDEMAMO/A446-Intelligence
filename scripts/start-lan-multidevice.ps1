@@ -216,6 +216,18 @@ function Initialize-AntigravityAlias {
   $env:A446_ANTIGRAVITY_ACCOUNT_LABEL = "Antigravity $alias"
 }
 
+function Show-ProviderDiagnostics {
+  param([object]$Manifest)
+  foreach ($diagnostic in @($Manifest.providerDiagnostics)) {
+    if (-not $diagnostic -or $diagnostic.ready) { continue }
+    Write-Warning "$($diagnostic.provider) is not ready: $($diagnostic.errorSummary)"
+    foreach ($attempt in @($diagnostic.attempts)) {
+      $reason = if ($attempt.detail) { [string]$attempt.detail } elseif ($attempt.error) { [string]$attempt.error } else { "exit $($attempt.exitCode)" }
+      Write-Host "  - $($attempt.command): $reason"
+    }
+  }
+}
+
 function Test-WorkerConfigs {
   param([object]$Manifest)
   if (-not @($Manifest.workers).Count) {
@@ -404,6 +416,7 @@ $resolvedAccess = Resolve-AccessMode -Requested $AccessMode -Saved $saved
 $env:A446_DEVICE_ID = $resolvedDeviceId
 
 $manifest = Invoke-DevicePreparation -RunMode $Mode -Address $resolvedHubIp -Id $resolvedDeviceId -Access $resolvedAccess
+Show-ProviderDiagnostics -Manifest $manifest
 Initialize-AntigravityAlias -Manifest $manifest -CurrentSettings $settings
 $settings.deviceId = $resolvedDeviceId
 if ($Mode -ne 'preflight') { $settings.hubIp = $resolvedHubIp }

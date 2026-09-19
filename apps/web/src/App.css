@@ -465,17 +465,22 @@
 .quota-badge { padding: 3px 7px; color: #596c70; background: #e9edef; font-size: 8px; }
 .quota-badge.healthy { color: #11714f; background: #dff2e8; }
 .quota-badge.low { color: #9a6008; background: #fff0d5; }
+.quota-badge.partial { color: #9a6008; background: #fff0d5; }
 .quota-badge.exhausted { color: #a13232; background: #f8dddd; }
 .quota-badge.stale { color: #875b18; background: #f7ead2; }
 .token-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 5px 12px; margin-top: 12px; }
 .token-grid span { display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; }
 .token-grid b { color: var(--ink); font-family: var(--mono); font-size: 8px; }
 .account-agents { margin-top: 9px; color: var(--faint); font-size: 8px; }
-.quota-meter { margin-top: 10px; }
+.quota-groups { display: grid; gap: 10px; margin-top: 10px; }
+.quota-group { display: grid; gap: 7px; }
+.quota-group + .quota-group { padding-top: 9px; border-top: 1px solid var(--line); }
+.quota-group > strong { color: #53686d; font-size: 8px; font-weight: 800; }
 .quota-meter > div { display: flex; justify-content: space-between; color: var(--muted); font-size: 8px; }
 .quota-meter progress { width: 100%; height: 5px; margin: 7px 0 3px; overflow: hidden; border: 0; border-radius: 9px; background: #e6ecec; }
 .quota-meter progress::-webkit-progress-bar { border-radius: 9px; background: #e6ecec; }
 .quota-meter progress::-webkit-progress-value { border-radius: 9px; background: var(--cyan); }
+.quota-meter progress::-moz-progress-bar { border-radius: 9px; background: var(--cyan); }
 .quota-meter small { color: var(--faint); font-size: 7px; }
 .quota-unknown { margin-top: 10px; padding: 7px; border-radius: 7px; color: var(--muted); background: #f0f3f4; font-size: 8px; text-align: center; }
 .quota-unknown small { display: block; margin-top: 3px; color: var(--faint); }

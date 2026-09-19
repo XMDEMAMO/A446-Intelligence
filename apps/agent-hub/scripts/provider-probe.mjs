@@ -119,6 +119,8 @@ export function normalizeCodexModels(result) {
   return items.filter((item) => item && item.hidden !== true && (item.id || item.model)).map((item) => ({
     id: String(item.id ?? item.model),
     label: item.displayName ? String(item.displayName) : String(item.id ?? item.model),
+    family: "codex",
+    quotaGroup: "Codex",
     enabled: true,
     capabilities: [],
     reasoningEfforts: Array.isArray(item.supportedReasoningEfforts)
@@ -143,8 +145,18 @@ export function normalizeCodexRateLimits(result, checkedAt = new Date().toISOStr
       const value = bucket[slot];
       if (!value || typeof value !== "object") continue;
       const usedPercent = finitePercent(value.usedPercent);
+      const quotaGroup = normalizeCodexQuotaGroup(bucket.limitName ?? bucket.limitId);
+      const durationMinutes = quotaDurationMinutes(
+        value.windowDurationMins ?? value.windowDurationMinutes ?? value.window_minutes,
+        slot,
+      );
+      const windowType = quotaWindowType(value.window ?? value.name ?? value.id, durationMinutes, slot);
       windows.push({
-        name: `${String(bucket.limitName ?? bucket.limitId ?? "codex")} ${slot}`,
+        id: `${String(bucket.limitId ?? quotaGroup)}:${slot}`,
+        name: `${quotaGroup} ${windowType}`,
+        quotaGroup,
+        windowType,
+        durationMinutes,
         usedPercent,
         remainingPercent: usedPercent == null ? null : Math.max(0, 100 - usedPercent),
         resetsAt: toIsoTimestamp(value.resetsAt),
@@ -165,9 +177,12 @@ export function parseAntigravityModels(output) {
     const match = line.match(/^(\S+)\s+(.+)$/);
     if (!match || !/^(?:gemini|claude|gpt)-/i.test(match[1])) return null;
     const effort = modelEffort(match[1], match[2]);
+    const family = modelFamily(match[1]);
     return {
       id: match[1],
       label: match[2].trim(),
+      family,
+      quotaGroup: antigravityQuotaGroup(family),
       enabled: true,
       capabilities: [],
       reasoningEfforts: effort ? [effort] : [],
@@ -179,11 +194,18 @@ export function normalizeAntigravityUsage(result, checkedAt = new Date().toISOSt
   const groups = locateQuotaGroups(result);
   const windows = [];
   for (const group of groups) {
-    const groupName = String(group?.name ?? group?.label ?? group?.title ?? group?.id ?? "Antigravity");
+    const rawGroupName = String(group?.name ?? group?.label ?? group?.title ?? group?.id ?? "Antigravity");
+    const quotaGroup = antigravityQuotaGroup(rawGroupName);
     for (const bucket of Array.isArray(group?.buckets) ? group.buckets : []) {
       const remainingPercent = quotaRemainingPercent(bucket);
+      const rawWindow = bucket?.window ?? bucket?.name ?? bucket?.id ?? "quota";
+      const windowType = quotaWindowType(rawWindow);
+      const durationMinutes = quotaDurationMinutes(null, windowType);
       windows.push({
-        name: `${groupName} ${String(bucket?.window ?? bucket?.name ?? bucket?.id ?? "quota")}`,
+        name: `${quotaGroup} ${String(bucket?.name ?? rawWindow)}`,
+        quotaGroup,
+        windowType,
+        durationMinutes,
         remainingPercent,
         usedPercent: remainingPercent == null ? null : Math.max(0, 100 - remainingPercent),
         resetsAt: normalizeIsoTime(bucket?.reset_time ?? bucket?.resetTime ?? bucket?.resetsAt),
@@ -390,6 +412,44 @@ function modelEffort(id, label) {
   const fromId = String(id).match(/-(low|medium|high)$/i)?.[1];
   const fromLabel = String(label).match(/\((low|medium|high)\)\s*$/i)?.[1];
   return String(fromId ?? fromLabel ?? "").toLowerCase() || null;
+}
+
+function modelFamily(value) {
+  const normalized = String(value ?? "").toLowerCase();
+  if (normalized.startsWith("gemini-")) return "gemini";
+  if (normalized.startsWith("claude-")) return "claude";
+  if (normalized.startsWith("gpt-")) return "gpt";
+  return "unknown";
+}
+
+function antigravityQuotaGroup(value) {
+  const normalized = String(value ?? "").toLowerCase();
+  if (normalized.includes("gemini")) return "Gemini Models";
+  if (normalized.includes("claude") || normalized.includes("gpt") || normalized === "3p") return "Claude and GPT models";
+  return String(value ?? "Antigravity");
+}
+
+function normalizeCodexQuotaGroup(value) {
+  const label = String(value ?? "Codex").trim();
+  return /^codex$/i.test(label) ? "Codex" : label;
+}
+
+function quotaWindowType(value, durationMinutes = null, fallback = null) {
+  if (durationMinutes === 300) return "5h";
+  if (durationMinutes === 10_080) return "7d";
+  const normalized = String(value ?? fallback ?? "").toLowerCase();
+  if (/(?:^|[^a-z0-9])5\s*(?:h|hour)|five[ -]?hour/.test(normalized)) return "5h";
+  if (/weekly|week|(?:^|[^a-z0-9])7\s*d/.test(normalized)) return "7d";
+  return normalized || String(fallback ?? "quota");
+}
+
+function quotaDurationMinutes(value, fallback = null) {
+  const numeric = Number(value);
+  if (Number.isFinite(numeric) && numeric > 0) return numeric;
+  const type = quotaWindowType(fallback);
+  if (type === "5h" || type === "primary") return 300;
+  if (type === "7d" || type === "secondary") return 10_080;
+  return null;
 }
 
 function finitePercent(value) {

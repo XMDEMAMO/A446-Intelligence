@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
-import { addUsage, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
 import { delay } from "../src/common.mjs";
 
 test("usage normalization and scheduler keep account, role, model, and quota separate", () => {
@@ -71,6 +71,52 @@ test("a queued named executor reports an unsupported lease protocol without drif
   assert.equal(task.targetAgentId, "chosen");
   assert.equal(task.schedulingErrorCode, "EXECUTOR_UNAVAILABLE");
   assert.equal(task.schedulingErrorDetails.reason, "lease_protocol_unsupported");
+});
+
+test("Antigravity model families use only their own quota pool", () => {
+  const quotaSnapshot = {
+    state: "Exhausted",
+    source: "antigravity-cli-usage",
+    checkedAt: "2026-09-19T00:00:00.000Z",
+    windows: [
+      { name: "Gemini Models 5h", quotaGroup: "Gemini Models", windowType: "5h", durationMinutes: 300, remainingPercent: 100 },
+      { name: "Gemini Models weekly", quotaGroup: "Gemini Models", windowType: "7d", durationMinutes: 10_080, remainingPercent: 80 },
+      { name: "Claude and GPT models 5h", quotaGroup: "Claude and GPT models", windowType: "5h", durationMinutes: 300, remainingPercent: 0 },
+      { name: "Claude and GPT models weekly", quotaGroup: "Claude and GPT models", windowType: "7d", durationMinutes: 10_080, remainingPercent: 30 },
+    ],
+  };
+  const models = bindModelQuotas([
+    { id: "gemini-3.8-flash-high", family: "gemini", quotaGroup: "Gemini Models" },
+    { id: "claude-sonnet-4-6", family: "claude", quotaGroup: "Claude and GPT models" },
+  ], quotaSnapshot);
+  assert.equal(models[0].quota.state, "Healthy");
+  assert.equal(models[0].quota.windows.length, 2);
+  assert.equal(models[1].quota.state, "Exhausted");
+
+  const antigravity = {
+    agentId: "antigravity",
+    status: "online",
+    paused: false,
+    roles: ["executor"],
+    models,
+    quotaSnapshot,
+    executors: [{ health: "Healthy" }],
+  };
+  const agents = new Map([[antigravity.agentId, antigravity]]);
+  assert.equal(chooseAgent(agents, { role: "executor" }).model.id, "gemini-3.8-flash-high");
+  assert.throws(
+    () => chooseAgent(agents, { targetAgentId: "antigravity", role: "executor", modelPreference: "claude-sonnet-4-6" }),
+    (error) => error.code === "EXECUTOR_QUOTA_UNAVAILABLE",
+  );
+
+  const hub = new AgentHub({ logs: { includePayloads: false } });
+  hub.agents = agents;
+  const catalog = hub.schedulerCatalog();
+  assert.equal(catalog[0].models[0].quotaGroup, "Gemini Models");
+  assert.equal(catalog[0].models[0].quotaState, "Healthy");
+  assert.equal(catalog[0].models[1].quotaGroup, "Claude and GPT models");
+  assert.equal(catalog[0].models[1].quotaState, "Exhausted");
+  assert.equal(catalog[0].quota.windows[0].durationMinutes, 300);
 });
 
 test("two Agent identities sharing one login are serialized at account level", async () => {

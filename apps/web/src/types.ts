@@ -37,7 +37,11 @@ export interface TokenUsage {
 }
 
 export interface QuotaWindow {
+  id?: string
   name: string
+  quotaGroup?: string
+  windowType?: string
+  durationMinutes?: number | null
   usedPercent: number | null
   remainingPercent: number | null
   resetsAt: string | null
@@ -64,10 +68,14 @@ export interface AccountProfile {
 export interface ModelProfile {
   id: string | null
   label?: string
+  family?: string
+  quotaGroup?: string
   enabled?: boolean
   capabilities?: string[]
   reasoningEfforts?: string[]
+  defaultReasoningEffort?: string | null
   quota?: QuotaSnapshot | null
+  quotaState?: QuotaState
   availability?: ResourceState
   source?: string
   checkedAt?: string

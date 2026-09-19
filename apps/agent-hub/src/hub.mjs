@@ -6,7 +6,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
-import { addUsage, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
@@ -394,7 +394,7 @@ export class AgentHub {
             deviceId: authenticatedActor?.deviceId ?? message.payload?.deviceId ?? registeredAgentId,
             account: message.payload?.account ?? null,
             roles: normalizeRoles(message.payload?.roles),
-            models: normalizeModels(message.payload?.models, { model: message.payload?.model }),
+            models: bindModelQuotas(normalizeModels(message.payload?.models, { model: message.payload?.model }), message.payload?.quotaSnapshot),
             maxConcurrency: Number(message.payload?.maxConcurrency ?? 1),
             activeTaskCount: [...this.tasks.values()].filter((task) => task.activeSlotAgentId === registeredAgentId && ACTIVE_SLOT_STATUSES.has(task.status)).length,
             usageTotals: message.payload?.usageTotals ?? null,
@@ -488,11 +488,11 @@ export class AgentHub {
         agent.observedCapabilities = message.payload?.observedCapabilities ?? agent.observedCapabilities;
         agent.resourceSnapshot = message.payload?.resourceSnapshot ?? agent.resourceSnapshot;
         agent.capabilities = Array.isArray(message.payload?.capabilities) ? message.payload.capabilities.map(String) : agent.capabilities;
-        agent.models = Array.isArray(message.payload?.models) ? normalizeModels(message.payload.models) : agent.models;
+        agent.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot) ?? agent.quotaSnapshot;
+        agent.models = bindModelQuotas(Array.isArray(message.payload?.models) ? normalizeModels(message.payload.models) : agent.models, agent.quotaSnapshot);
         agent.executors = message.payload?.executors ?? agent.executors;
         agent.currentTaskId = message.payload?.currentTaskId ?? null;
         agent.usageTotals = message.payload?.usageTotals ?? agent.usageTotals;
-        agent.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot) ?? agent.quotaSnapshot;
         agent.quotaProbeError = message.payload?.quotaProbeError ?? agent.quotaProbeError;
         agent.account = message.payload?.account ?? agent.account;
         this.markAgent(agent);
@@ -1339,15 +1339,23 @@ export class AgentHub {
       models: (agent.models ?? []).map((model) => ({
         id: model.id,
         label: model.label,
+        family: model.family,
+        quotaGroup: model.quotaGroup,
         reasoningEfforts: model.reasoningEfforts ?? [],
+        defaultReasoningEffort: model.defaultReasoningEffort ?? null,
         availability: model.availability ?? "unknown",
         quotaState: model.quota?.state ?? "Unknown",
       })),
       quota: agent.quotaSnapshot ? {
         state: agent.quotaSnapshot.state,
         windows: (agent.quotaSnapshot.windows ?? []).map((window) => ({
+          id: window.id,
           name: window.name,
+          quotaGroup: window.quotaGroup,
+          windowType: window.windowType,
+          durationMinutes: window.durationMinutes,
           remainingPercent: window.remainingPercent,
+          usedPercent: window.usedPercent,
           resetsAt: window.resetsAt,
         })),
         stale: Boolean(agent.quotaSnapshot.stale),

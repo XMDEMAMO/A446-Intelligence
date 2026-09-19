@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { buildHubConfig, buildWorkerConfig } from "../scripts/prepare-lan-device.mjs";
+import { buildHubConfig, buildWorkerConfig, detectProviderInventory, selectReadyCommand } from "../scripts/prepare-lan-device.mjs";
 
 test("multi-device LAN config gives one account slot one concurrent task and trusted probes", () => {
   const root = path.resolve("C:/a446-test");
@@ -26,4 +26,23 @@ test("coordinator config uses durable local files and explicit private-LAN plain
   assert.equal(hub.artifacts.rootDirectory, "../artifacts");
   assert.equal(hub.leases.enabled, true);
   assert.equal(hub.allowPlaintextRemote, true);
+});
+
+test("Codex discovery skips a stale entry and keeps the ready executable absolute", () => {
+  const stale = "D:\\Tools\\npm-global\\codex.cmd";
+  const ready = "C:\\Users\\ASUS\\AppData\\Local\\OpenAI\\Codex\\bin\\build\\codex.exe";
+  const runner = (command) => command === ready
+    ? { ok: true, command, detail: "Logged in using ChatGPT", error: null, exitCode: 0 }
+    : { ok: false, command, detail: "Not logged in", error: null, exitCode: 1 };
+  const selected = selectReadyCommand([stale, ready], ["login", "status"], {}, runner);
+  assert.equal(selected.selected.command, ready);
+  assert.equal(selected.attempts.length, 2);
+
+  const inventory = detectProviderInventory({}, {
+    commandStatus: runner,
+    codexCandidates: [stale, ready],
+    agyCommand: "agy",
+  });
+  assert.equal(inventory.providers.find((provider) => provider.provider === "codex").command, ready);
+  assert.equal(inventory.diagnostics.find((item) => item.provider === "codex").selectedCommand, ready);
 });

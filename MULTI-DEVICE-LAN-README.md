@@ -54,7 +54,7 @@
 | 账号身份 | 官方 App Server 返回；本地转换为稳定账号 ID | CLI 暂不返回可靠身份；首次由人输入非敏感账号别名 |
 | 模型列表 | `model/list` 动态读取 | `agy models` 动态读取 |
 | 思考强度 | 使用模型实际返回的 `supportedReasoningEfforts` | 从 CLI 模型变体/标识读取；未报告时不臆测 |
-| 额度 | 官方 `account/rateLimits/read` | Antigravity 1.1.12 及以上通过只读 `/usage` JSON 获取；旧版或失败时显示 Unknown |
+| 额度 | 官方 `account/rateLimits/read`，分别保留 5 小时和 7 天窗口 | Antigravity 1.1.12 及以上通过只读 `/usage` JSON 获取；分别保留 Gemini 与 Claude/GPT 两个模型组的 5 小时和 7 天窗口；旧版或失败时显示 Unknown |
 | Token | 每轮结果上报并按任务、Agent、账号累计 | 每轮结果上报并按任务、Agent、账号累计 |
 
 “自动识别账号”在本版本中指识别每个官方 CLI 当前激活的登录。一个客户端同时保存了多少历史账号，不等于这些账号都可被安全自动调度。自动切换账号、读取登录资料或账号轮换不在本版本范围内。
@@ -87,6 +87,8 @@ Antigravity 当前不能可靠返回账号身份。若多台设备登录的是�
 - Python、Git、GPU、Node 等本机环境摘要。
 
 规划 Agent 可以给任务指定 Agent、模型和思考强度，也可以留空让 Hub 自动选择。Hub 会再次检查在线状态、角色、能力、模型、额度、Agent 并发和账号总并发；规划结果不能越过这些硬约束。
+
+Antigravity 的模型会按官方额度规则分成两个池：`Gemini Models` 包含 Gemini Flash/Pro，`Claude and GPT models` 包含 Claude Opus/Sonnet 与 GPT-OSS。每个模型只继承所属池的 5 小时和 7 天额度；一个池耗尽不会误判另一个池也不可用。网页额度条显示的是“剩余比例”，所以 100% 是满格，0% 是空格。
 
 ## 5. 协作流程和上下文
 
@@ -166,3 +168,5 @@ Antigravity 额度只在 CLI 版本确认不低于 1.1.12 时调用官方只读 
 网页显示 Agent 离线：确认对应设备启动窗口仍在、连接的是同一个热点/路由器、Hub IP 正确，并允许 Node.js 通过 Windows“专用网络”防火墙。
 
 额度显示 Unknown：先运行菜单中的“仅检查”。Codex 需保持官方客户端登录；Antigravity 需升级到 1.1.12 以上并保持 CLI 登录。探测失败时系统会保留最后一次可信值并标记为陈旧，不会伪造百分比。
+
+Codex 显示未登录但桌面应用已登录：同一台电脑可能同时存在旧的 `codex.cmd` 与桌面应用内置的 `codex.exe`。启动器会逐个检查可直接执行的 `codex.exe`，选择实际已登录的绝对路径，并在失败时列出每个候选入口的结果。确需手工指定时，在启动前设置用户环境变量 `A446_CODEX_EXE` 为已登录的 `codex.exe` 完整路径；不要把 Worker 改为调用 `codex.cmd`。

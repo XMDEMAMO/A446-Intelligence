@@ -31,6 +31,7 @@ import type {
   HubTask,
   HumanIntervention,
   QuotaSnapshot,
+  QuotaWindow,
   TokenUsage,
   WebUser,
 } from './types'
@@ -868,15 +869,58 @@ function AgentOperation({ agent, disabled, onToggle }: { agent: Agent; disabled:
   return <div className="agent-operation"><div><strong>{agent.agentId}</strong><small>{agent.status === 'online' ? agent.paused ? '在线 · 已暂停' : agent.busy ? '在线 · 忙碌' : '在线 · 空闲' : '离线'}</small></div><button type="button" disabled={disabled || agent.status !== 'online'} onClick={onToggle}>{agent.paused ? '恢复' : '暂停'}</button></div>
 }
 
+function isPartiallyLimited(quota: QuotaSnapshot | null | undefined) {
+  const groups = new Map<string, number[]>()
+  for (const window of quota?.windows ?? []) {
+    const remaining = quotaRemaining(window)
+    if (remaining == null) continue
+    const group = quotaGroupLabel(window)
+    groups.set(group, [...(groups.get(group) ?? []), remaining])
+  }
+  const groupMinimums = [...groups.values()].map((values) => Math.min(...values))
+  return groupMinimums.some((value) => value <= 0) && groupMinimums.some((value) => value > 0)
+}
+
 function QuotaBadge({ quota }: { quota: QuotaSnapshot | null }) {
   const state = quota?.state ?? 'Unknown'
-  return <span className={`quota-badge ${quota?.stale ? 'stale' : state.toLowerCase()}`}>{quota?.stale ? '陈旧' : state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'}</span>
+  const partiallyLimited = isPartiallyLimited(quota)
+  const style = quota?.stale ? 'stale' : partiallyLimited ? 'partial' : state.toLowerCase()
+  const label = quota?.stale ? '陈旧' : partiallyLimited ? '部分受限' : state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'
+  return <span className={`quota-badge ${style}`}>{label}</span>
 }
 
 function QuotaMeter({ quota }: { quota: QuotaSnapshot | null }) {
-  const window = quota?.windows?.find((item) => item.usedPercent != null)
-  if (!window || window.usedPercent == null) return <div className={`quota-unknown ${quota?.stale ? 'stale' : ''}`}>{quota?.stale ? '最近可信额度已陈旧' : '客户端暂无可读取的额度快照'}<small>来源：{quota?.source ?? 'unavailable'}</small></div>
-  return <div className="quota-meter"><div><span>{window.name}</span><b>已用 {Math.round(window.usedPercent)}%</b></div><progress max="100" value={window.usedPercent} /><small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small></div>
+  const windows = (quota?.windows ?? []).map((window) => ({ window, remaining: quotaRemaining(window) })).filter((item): item is { window: QuotaWindow; remaining: number } => item.remaining != null)
+  if (!windows.length) return <div className={`quota-unknown ${quota?.stale ? 'stale' : ''}`}>{quota?.stale ? '最近可信额度已陈旧' : '客户端暂无可读取的额度快照'}<small>来源：{quota?.source ?? 'unavailable'}</small></div>
+  const groups = new Map<string, typeof windows>()
+  for (const item of windows) {
+    const group = quotaGroupLabel(item.window)
+    groups.set(group, [...(groups.get(group) ?? []), item])
+  }
+  return <div className="quota-groups">{[...groups.entries()].map(([group, items]) => <section className="quota-group" key={group}><strong>{group}</strong>{items.map(({ window, remaining }) => <div className="quota-meter" key={window.id ?? `${window.name}-${window.windowType ?? ''}`}><div><span>{quotaDurationLabel(window)}</span><b>剩余 {Math.round(remaining)}%</b></div><progress aria-label={`${group} ${quotaDurationLabel(window)}剩余额度`} max="100" value={remaining} /><small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small></div>)}</section>)}</div>
+}
+
+function quotaRemaining(window: QuotaWindow) {
+  if (Number.isFinite(window.remainingPercent)) return Math.max(0, Math.min(100, Number(window.remainingPercent)))
+  if (Number.isFinite(window.usedPercent)) return Math.max(0, Math.min(100, 100 - Number(window.usedPercent)))
+  return null
+}
+
+function quotaGroupLabel(window: QuotaWindow) {
+  if (window.quotaGroup) return window.quotaGroup
+  if (/gemini models/i.test(window.name)) return 'Gemini Models'
+  if (/claude and gpt models/i.test(window.name)) return 'Claude and GPT models'
+  if (/codex/i.test(window.name)) return 'Codex'
+  return '额度窗口'
+}
+
+function quotaDurationLabel(window: QuotaWindow) {
+  if (window.durationMinutes === 300) return '5 小时'
+  if (window.durationMinutes === 10_080) return '7 天'
+  const value = `${window.windowType ?? ''} ${window.name}`.toLowerCase()
+  if (/5h|five[ -]?hour|primary/.test(value)) return '5 小时'
+  if (/7d|weekly|secondary/.test(value)) return '7 天'
+  return window.windowType ?? window.name
 }
 
 function acceptsRole(agent: Agent, role: AgentRole) {
@@ -891,7 +935,10 @@ function executorStatus(agent: Agent) {
   if (agent.status !== 'online') return '离线，不可选'
   if (agent.paused) return '已暂停，不可选'
   if (!agent.roles?.includes('executor')) return '角色不匹配'
-  if (agent.quotaSnapshot?.state === 'Exhausted') return '额度耗尽，可能排队'
+  if (agent.quotaSnapshot?.state === 'Exhausted') {
+    if (isPartiallyLimited(agent.quotaSnapshot)) return '部分额度受限'
+    return '额度耗尽，可能排队'
+  }
   if (agent.busy) return '忙碌，创建后排队'
   return '在线可用'
 }

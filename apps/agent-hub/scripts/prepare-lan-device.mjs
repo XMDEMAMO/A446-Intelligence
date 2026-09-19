@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import { mkdir, rename, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
@@ -111,14 +111,38 @@ export function buildHubConfig({ hubIp }) {
   };
 }
 
-export function detectProviders(environment = process.env) {
+export function detectProviderInventory(environment = process.env, dependencies = {}) {
   const detected = [];
-  const codex = commandStatus("codex", ["login", "status"], environment);
-  if (codex.ok) detected.push({ provider: "codex", command: codex.command, detail: codex.detail });
-  const agyCommand = resolveAgyCommand("agy", environment);
-  const antigravity = commandStatus(agyCommand, ["models"], environment, 20000);
-  if (antigravity.ok) detected.push({ provider: "antigravity", command: agyCommand, detail: antigravity.detail });
-  return detected;
+  const runner = dependencies.commandStatus ?? commandStatus;
+  const codexCandidates = dependencies.codexCandidates ?? resolveCodexCandidates(environment);
+  const codex = selectReadyCommand(codexCandidates, ["login", "status"], environment, runner);
+  if (codex.selected) detected.push({ provider: "codex", command: codex.selected.command, detail: codex.selected.detail });
+
+  const agyCommand = dependencies.agyCommand ?? resolveAgyCommand("agy", environment);
+  const antigravity = selectReadyCommand([agyCommand], ["models"], environment, runner, 20000);
+  if (antigravity.selected) detected.push({ provider: "antigravity", command: antigravity.selected.command, detail: antigravity.selected.detail });
+
+  return {
+    providers: detected,
+    diagnostics: [
+      providerDiagnostic("codex", codex, "No discovered Codex executable reported an active login."),
+      providerDiagnostic("antigravity", antigravity, "Antigravity CLI is unavailable or not ready."),
+    ],
+  };
+}
+
+export function detectProviders(environment = process.env, dependencies = {}) {
+  return detectProviderInventory(environment, dependencies).providers;
+}
+
+export function selectReadyCommand(candidates, args, environment, runner = commandStatus, timeout = 10000) {
+  const attempts = [];
+  for (const command of uniqueCommands(candidates)) {
+    const outcome = runner(command, args, environment, timeout);
+    attempts.push(outcome);
+    if (outcome.ok) return { selected: outcome, attempts };
+  }
+  return { selected: null, attempts };
 }
 
 async function prepare(args) {
@@ -128,7 +152,8 @@ async function prepare(args) {
   if (!net.isIPv4(hubIp)) throw new Error("--hub-ip must be an IPv4 address");
   const deviceId = sanitizeDeviceId(args["device-id"] ?? os.hostname());
   const fullAccess = String(args.access ?? "safe").toLowerCase() === "full";
-  const detected = detectProviders();
+  const inventory = detectProviderInventory();
+  const detected = inventory.providers;
   const configRoot = path.join(hubRoot, "var", "lan", "config");
   await mkdir(configRoot, { recursive: true });
   const workers = [];
@@ -152,6 +177,7 @@ async function prepare(args) {
     fullAccess,
     hubConfigFile,
     workers,
+    providerDiagnostics: inventory.diagnostics,
     consoleUrl: `http://${hubIp}:5173`,
     workerUrl: `ws://${hubIp}:8787/worker`,
   };
@@ -163,13 +189,77 @@ async function prepare(args) {
 function commandStatus(command, args, environment, timeout = 10000) {
   const outcome = spawnSync(command, args, { encoding: "utf8", windowsHide: true, shell: false, timeout, env: environment });
   const detail = String(outcome.stdout || outcome.stderr || "").trim().split(/\r?\n/)[0] || null;
-  return { ok: !outcome.error && outcome.status === 0, command, detail, error: outcome.error?.message ?? null };
+  return { ok: !outcome.error && outcome.status === 0, command, detail, error: outcome.error?.message ?? null, exitCode: outcome.status };
+}
+
+export function resolveCodexCandidates(environment = process.env) {
+  const candidates = [];
+  if (environment.A446_CODEX_EXE) candidates.push(String(environment.A446_CODEX_EXE));
+  if (process.platform !== "win32") return uniqueCommands([...candidates, "codex"]);
+
+  if (environment.LOCALAPPDATA) {
+    candidates.push(...findExecutables(path.join(environment.LOCALAPPDATA, "OpenAI", "Codex", "bin"), "codex.exe"));
+  }
+  const located = spawnSync("where.exe", ["codex.exe"], {
+    encoding: "utf8",
+    windowsHide: true,
+    shell: false,
+    timeout: 5000,
+    env: environment,
+  });
+  if (!located.error && located.status === 0) {
+    candidates.push(...String(located.stdout ?? "").split(/\r?\n/).map((value) => value.trim()).filter(Boolean));
+  }
+  // Deliberately avoid codex.cmd here. Worker processes require a directly
+  // spawnable executable so probes and task execution use the same login.
+  return uniqueCommands([...candidates, "codex.exe"]);
 }
 
 function resolveAgyCommand(command, environment) {
   if (process.platform !== "win32" || command.toLowerCase() !== "agy") return command;
   const candidate = environment.LOCALAPPDATA ? path.join(environment.LOCALAPPDATA, "agy", "bin", "agy.exe") : null;
   return candidate && existsSync(candidate) ? candidate : command;
+}
+
+function findExecutables(root, fileName, maxDepth = 4) {
+  if (!root || !existsSync(root)) return [];
+  const found = [];
+  const visit = (directory, depth) => {
+    if (depth > maxDepth) return;
+    let entries;
+    try { entries = readdirSync(directory, { withFileTypes: true }); } catch { return; }
+    for (const entry of entries) {
+      const candidate = path.join(directory, entry.name);
+      if (entry.isDirectory()) visit(candidate, depth + 1);
+      else if (entry.isFile() && entry.name.toLowerCase() === fileName.toLowerCase()) found.push(candidate);
+    }
+  };
+  visit(root, 0);
+  return found.sort((left, right) => fileModifiedAt(right) - fileModifiedAt(left));
+}
+
+function fileModifiedAt(file) {
+  try { return statSync(file).mtimeMs; } catch { return 0; }
+}
+
+function uniqueCommands(values) {
+  const seen = new Set();
+  return values.filter(Boolean).filter((value) => {
+    const key = process.platform === "win32" ? String(value).toLowerCase() : String(value);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function providerDiagnostic(provider, result, fallback) {
+  return {
+    provider,
+    ready: Boolean(result.selected),
+    selectedCommand: result.selected?.command ?? null,
+    attempts: result.attempts,
+    errorSummary: result.selected ? null : result.attempts.length ? fallback : `No ${provider} command candidate was found.`,
+  };
 }
 
 function sanitizeDeviceId(value) {

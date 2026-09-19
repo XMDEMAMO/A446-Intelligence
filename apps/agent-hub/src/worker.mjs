@@ -13,7 +13,7 @@ import { ArtifactClient } from "./artifact-client.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
 import { initialExecutorStatus, probeConfiguredAccount, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
-import { addUsage, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
 import { probeQuota } from "./quota-probe.mjs";
 
 export class AgentWorker {
@@ -113,6 +113,8 @@ export class AgentWorker {
 
   async refreshQuota() {
     if (!this.config.quotaProbe?.command) {
+      this.models = bindModelQuotas(this.models, this.quotaSnapshot);
+      if (this.modelSnapshot) this.modelSnapshot = { ...this.modelSnapshot, items: this.models };
       this.state.quotaSnapshot = this.quotaSnapshot;
       return this.quotaSnapshot;
     }
@@ -134,6 +136,8 @@ export class AgentWorker {
         errorSummary: message,
       });
     }
+    this.models = bindModelQuotas(this.models, this.quotaSnapshot);
+    if (this.modelSnapshot) this.modelSnapshot = { ...this.modelSnapshot, items: this.models };
     this.state.quotaSnapshot = this.quotaSnapshot;
     if (this.resourceSnapshot) this.updateResourceSnapshot();
     return this.quotaSnapshot;

@@ -13,9 +13,14 @@ export function normalizeModels(value, adapter = {}) {
     return {
       id: String(model.id ?? model.name ?? ""),
       label: model.label ? String(model.label) : undefined,
+      family: model.family ? String(model.family) : undefined,
+      quotaGroup: model.quotaGroup ? String(model.quotaGroup) : undefined,
       enabled: model.enabled !== false,
       capabilities: Array.isArray(model.capabilities) ? model.capabilities.map(String) : [],
       reasoningEfforts: Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts.map(String) : [],
+      defaultReasoningEffort: model.defaultReasoningEffort ? String(model.defaultReasoningEffort) : null,
+      inputModalities: Array.isArray(model.inputModalities) ? model.inputModalities.map(String) : [],
+      isDefault: Boolean(model.isDefault),
       quota: normalizeQuotaSnapshot(model.quota),
       availability: ["available", "unavailable", "unknown", "stale"].includes(model.availability) ? model.availability : "unknown",
       source: model.source ? String(model.source) : "config",
@@ -43,12 +48,20 @@ export function normalizeModels(value, adapter = {}) {
 
 export function normalizeQuotaSnapshot(value) {
   if (!value || typeof value !== "object") return null;
-  const windows = Array.isArray(value.windows) ? value.windows.map((window) => ({
-    name: String(window.name ?? "quota"),
-    usedPercent: finiteNumber(window.usedPercent),
-    remainingPercent: finiteNumber(window.remainingPercent),
-    resetsAt: window.resetsAt ? String(window.resetsAt) : null,
-  })) : [];
+  const windows = Array.isArray(value.windows) ? value.windows.map((window) => {
+    const usedPercent = finitePercent(window.usedPercent);
+    const remainingPercent = finitePercent(window.remainingPercent) ?? (usedPercent == null ? null : 100 - usedPercent);
+    return {
+      id: window.id ? String(window.id) : undefined,
+      name: String(window.name ?? "quota"),
+      quotaGroup: window.quotaGroup ? String(window.quotaGroup) : undefined,
+      windowType: window.windowType ? String(window.windowType) : undefined,
+      durationMinutes: finiteNumber(window.durationMinutes),
+      usedPercent: usedPercent ?? (remainingPercent == null ? null : 100 - remainingPercent),
+      remainingPercent,
+      resetsAt: window.resetsAt ? String(window.resetsAt) : null,
+    };
+  }) : [];
   return {
     state: ["Healthy", "Low", "Exhausted", "Unknown"].includes(value.state) ? value.state : "Unknown",
     checkedAt: value.checkedAt ? String(value.checkedAt) : new Date().toISOString(),
@@ -106,7 +119,7 @@ export function chooseAgent(agents, request = {}) {
     if (Number(selected.accountActiveTaskCount ?? 0) >= Number(selected.accountMaxConcurrency ?? selected.account?.maxConcurrency ?? 1)) {
       throw schedulingError("ACCOUNT_AT_CAPACITY", `Account for Agent ${request.targetAgentId} is at capacity`, "account_at_capacity", request.targetAgentId);
     }
-    if (selected.quotaSnapshot?.state === "Exhausted") throw schedulingError("EXECUTOR_QUOTA_UNAVAILABLE", `Agent ${request.targetAgentId} account quota is exhausted`, "quota_exhausted", request.targetAgentId);
+    if (agentQuotaExhausted(selected)) throw schedulingError("EXECUTOR_QUOTA_UNAVAILABLE", `Agent ${request.targetAgentId} account quota is exhausted`, "quota_exhausted", request.targetAgentId);
     const required = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
     const agentCapabilities = new Set(selected.capabilities ?? []);
     if (!required.every((item) => agentCapabilities.has(item) || selected.models?.some((model) => model.capabilities?.includes(item)))) {
@@ -132,7 +145,7 @@ export function chooseAgent(agents, request = {}) {
     if (agent.status !== "online" || agent.paused) return false;
     if (Number(agent.activeTaskCount ?? 0) >= Number(agent.maxConcurrency ?? 1)) return false;
     if (Number(agent.accountActiveTaskCount ?? 0) >= Number(agent.accountMaxConcurrency ?? agent.account?.maxConcurrency ?? 1)) return false;
-    if (agent.quotaSnapshot?.state === "Exhausted") return false;
+    if (agentQuotaExhausted(agent)) return false;
     if (role && (request.requireDeclaredRole ? !agent.roles?.includes(role) : agent.roles?.length && !agent.roles.includes(role))) return false;
     const capabilities = new Set(agent.capabilities ?? []);
     if (!required.every((item) => capabilities.has(item) || agent.models?.some((model) => model.capabilities?.includes(item)))) return false;
@@ -247,6 +260,23 @@ function quotaScore(state) {
   return QUOTA_SCORE[state] ?? QUOTA_SCORE.Unknown;
 }
 
+function agentQuotaExhausted(agent) {
+  if (agent.quotaSnapshot?.state !== "Exhausted") return false;
+  const classified = (agent.models ?? []).filter((model) => model.enabled !== false && model.quotaGroup && model.quota);
+  return !classified.some((model) => model.quota.state !== "Exhausted");
+}
+
+function quotaStateForWindows(windows) {
+  const remaining = windows.map((window) => window.remainingPercent).filter((value) => value != null);
+  if (remaining.some((value) => value <= 0)) return "Exhausted";
+  if (remaining.some((value) => value <= 10)) return "Low";
+  return remaining.length ? "Healthy" : "Unknown";
+}
+
+function sameQuotaGroup(left, right) {
+  return String(left ?? "").trim().toLowerCase() === String(right ?? "").trim().toLowerCase();
+}
+
 function normalizeAssignment(value) {
   if (!value || typeof value !== "object" || !String(value.instructions ?? "").trim()) return null;
   return {
@@ -261,6 +291,27 @@ function normalizeAssignment(value) {
     modelPreference: value.modelPreference ? String(value.modelPreference) : null,
     reasoningEffort: value.reasoningEffort ? String(value.reasoningEffort) : null,
   };
+}
+
+export function bindModelQuotas(models, quotaSnapshot) {
+  const normalizedModels = normalizeModels(models);
+  const quota = normalizeQuotaSnapshot(quotaSnapshot);
+  if (!quota) return normalizedModels;
+  const groups = new Set(quota.windows.map((window) => window.quotaGroup).filter(Boolean));
+  return normalizedModels.map((model) => {
+    const windows = model.quotaGroup
+      ? quota.windows.filter((window) => sameQuotaGroup(window.quotaGroup, model.quotaGroup))
+      : groups.size <= 1 ? quota.windows : [];
+    if (!windows.length) return model;
+    return {
+      ...model,
+      quota: {
+        ...quota,
+        state: quotaStateForWindows(windows),
+        windows,
+      },
+    };
+  });
 }
 
 function normalizeUpstreamIssue(value) {
@@ -318,6 +369,11 @@ function pickNumber(value, keys) {
 function finiteNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function finitePercent(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.min(100, number) : null;
 }
 
 function sumNumbers(...values) {
