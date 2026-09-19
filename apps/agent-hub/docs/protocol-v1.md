@@ -298,4 +298,4 @@ Worker 管理沿用现有路径。同一 `agentId` 最多存在一个 active 凭
 
 现有客户端可以继续只读取 `error`。`details` 不得包含密码、Token、Session Secret、CSRF Secret 或其他敏感值。完整字段、查询摘要规则、冻结错误码和跨账号所有权见 `docs/V0.5_SHARED_CONTRACT.md`。
 
-开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。
+开发 Hub 默认使用 Memory Store；私人 LAN 包可显式使用单进程 JSON 文件 Store 和协调设备本地 Artifact Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。共享 Token 的 LAN Artifact HTTP 请求还携带 `x-a446-agent-id`，但 Hub 仍必须依据当前任务与 Attempt 的所有权校验，不能只相信该请求头。

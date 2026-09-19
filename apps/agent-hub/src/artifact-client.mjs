@@ -9,6 +9,7 @@ import { resolveAllowedPath } from "./local-policy.mjs";
 export class ArtifactClient {
   constructor(config, policy) {
     this.enabled = config.artifacts?.centralStore === true;
+    this.agentId = String(config.agentId ?? "");
     this.policy = policy;
     this.tokenEnv = config.authTokenEnv;
     this.maxFileBytes = Math.max(1, Number(config.artifacts?.maxFileBytes ?? 100 * 1024 * 1024));
@@ -110,7 +111,10 @@ export class ArtifactClient {
   authHeaders() {
     const token = this.tokenEnv ? process.env[this.tokenEnv] : null;
     if (!token) throw new Error(`Artifact transfer requires worker credential environment variable ${this.tokenEnv}`);
-    return { authorization: `Bearer ${token}` };
+    return {
+      authorization: `Bearer ${token}`,
+      ...(this.agentId ? { "x-a446-agent-id": this.agentId } : {}),
+    };
   }
 }
 

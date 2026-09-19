@@ -11,7 +11,7 @@ import { AntigravityAdapter } from "./adapters/antigravity.mjs";
 import { buildArtifactManifest } from "./artifact-manifest.mjs";
 import { ArtifactClient } from "./artifact-client.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
-import { initialExecutorStatus, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
+import { initialExecutorStatus, probeConfiguredAccount, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
 import { addUsage, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
 import { probeQuota } from "./quota-probe.mjs";
@@ -43,6 +43,7 @@ export class AgentWorker {
       usageTotals: null,
       sessions: {},
       observedCapabilities: null,
+      accountSnapshot: null,
       modelSnapshot: null,
       quotaSnapshot: null,
       resourceSnapshot: null,
@@ -56,6 +57,8 @@ export class AgentWorker {
       maxOutputChars: config.checkpoints?.maxOutputChars ?? 200_000,
     });
     this.observedCapabilities = null;
+    this.accountSnapshot = null;
+    this.accountProfile = config.account ?? null;
     this.modelSnapshot = null;
     this.models = normalizeModels(config.models, config.adapter);
     this.dynamicCapabilities = config.capabilities ?? ["task.execute", "pause", "resume", "cancel"];
@@ -81,6 +84,8 @@ export class AgentWorker {
     await this.loadState();
     await this.adapter.start(this.state);
     this.observedCapabilities = this.state.observedCapabilities ?? this.observedCapabilities;
+    this.accountSnapshot = this.state.accountSnapshot ?? this.accountSnapshot;
+    this.accountProfile = this.accountSnapshot?.profile ?? this.accountProfile;
     this.modelSnapshot = this.state.modelSnapshot ?? this.modelSnapshot;
     this.quotaSnapshot = normalizeQuotaSnapshot(this.state.quotaSnapshot) ?? this.quotaSnapshot;
     this.resourceSnapshot = this.state.resourceSnapshot ?? this.resourceSnapshot;
@@ -138,12 +143,15 @@ export class AgentWorker {
     if (this.resourceRefresh) return this.resourceRefresh;
     this.resourceRefresh = (async () => {
       this.observedCapabilities = probeLocalCapabilities(this.config, this.observedCapabilities);
+      this.accountSnapshot = await probeConfiguredAccount(this.config, this.accountSnapshot, { workspace: this.config.workspace });
+      this.accountProfile = this.accountSnapshot.profile ?? this.accountProfile;
       this.modelSnapshot = await probeConfiguredModels(this.config, this.modelSnapshot, { workspace: this.config.workspace });
       this.models = this.modelSnapshot.items;
       await this.refreshQuota();
       this.dynamicCapabilities = schedulingCapabilities(this.config, this.observedCapabilities);
       this.updateResourceSnapshot();
       this.state.observedCapabilities = this.observedCapabilities;
+      this.state.accountSnapshot = this.accountSnapshot;
       this.state.modelSnapshot = this.modelSnapshot;
       this.state.quotaSnapshot = this.quotaSnapshot;
       return this.resourceSnapshot;
@@ -156,7 +164,7 @@ export class AgentWorker {
   }
 
   updateResourceSnapshot() {
-    const sections = [this.observedCapabilities, this.modelSnapshot, this.quotaSnapshot];
+    const sections = [this.observedCapabilities, this.accountSnapshot, this.modelSnapshot, this.quotaSnapshot];
     const stale = sections.some((section) => section?.stale);
     const unavailable = [this.observedCapabilities?.state, this.modelSnapshot?.state].includes("unavailable");
     this.resourceSnapshot = {
@@ -166,6 +174,7 @@ export class AgentWorker {
       stale,
       errorSummary: sections.map((section) => section?.errorSummary).filter(Boolean).join("; ").slice(0, 500) || null,
       capabilities: this.observedCapabilities,
+      account: this.accountSnapshot,
       models: this.modelSnapshot,
       quota: this.quotaSnapshot,
     };
@@ -186,6 +195,7 @@ export class AgentWorker {
         usageTotals: saved.usageTotals ?? null,
         sessions: saved.sessions ?? {},
         observedCapabilities: saved.observedCapabilities ?? null,
+        accountSnapshot: saved.accountSnapshot ?? null,
         modelSnapshot: saved.modelSnapshot ?? null,
         quotaSnapshot: saved.quotaSnapshot ?? null,
         resourceSnapshot: saved.resourceSnapshot ?? null,
@@ -290,6 +300,7 @@ export class AgentWorker {
         usageTotals: this.state.usageTotals,
         quotaSnapshot: this.quotaSnapshot,
         quotaProbeError: this.quotaProbeError,
+        account: this.accountProfile,
       },
     }));
     beat();
@@ -545,11 +556,12 @@ export class AgentWorker {
   agentProfile() {
     return {
       deviceId: this.config.deviceId ?? this.agentId,
-      account: this.config.account && typeof this.config.account === "object" ? {
-        id: this.config.account.id ? String(this.config.account.id) : undefined,
-        provider: this.config.account.provider ? String(this.config.account.provider) : undefined,
-        plan: this.config.account.plan ? String(this.config.account.plan) : undefined,
-        label: this.config.account.label ? String(this.config.account.label) : undefined,
+      account: this.accountProfile && typeof this.accountProfile === "object" ? {
+        id: this.accountProfile.id ? String(this.accountProfile.id) : undefined,
+        provider: this.accountProfile.provider ? String(this.accountProfile.provider) : undefined,
+        plan: this.accountProfile.plan ? String(this.accountProfile.plan) : undefined,
+        label: this.accountProfile.label ? String(this.accountProfile.label) : undefined,
+        maxConcurrency: Number.isFinite(Number(this.accountProfile.maxConcurrency)) ? Math.max(1, Number(this.accountProfile.maxConcurrency)) : 1,
       } : null,
       roles: normalizeRoles(this.config.roles ?? this.config.role),
       models: this.models,

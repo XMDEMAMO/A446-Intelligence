@@ -1,3 +1,7 @@
+import { randomUUID } from "node:crypto";
+import { copyFile, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import path from "node:path";
+
 function emptyState() {
   return {
     tasks: [],
@@ -57,6 +61,59 @@ export class MemoryHubStore {
 
   snapshot() {
     return structuredClone(this.state);
+  }
+}
+
+export class JsonFileHubStore extends MemoryHubStore {
+  constructor(file) {
+    if (!file) throw new Error("JsonFileHubStore requires a state file");
+    super();
+    this.file = path.resolve(file);
+    this.backupFile = `${this.file}.bak`;
+    this.writeChain = Promise.resolve();
+  }
+
+  async init() {
+    await mkdir(path.dirname(this.file), { recursive: true });
+    let loaded = null;
+    try {
+      loaded = JSON.parse(await readFile(this.file, "utf8"));
+    } catch (error) {
+      if (error.code !== "ENOENT" && error.name !== "SyntaxError") throw error;
+      if (error.name === "SyntaxError") {
+        try {
+          loaded = JSON.parse(await readFile(this.backupFile, "utf8"));
+        } catch (backupError) {
+          throw Object.assign(new Error(`Hub state is invalid and no valid backup is available: ${error.message}`), { cause: backupError });
+        }
+      }
+    }
+    this.state = normalizeState(loaded ?? {});
+    if (!loaded) await this.persist();
+  }
+
+  async commit(changes = {}) {
+    await super.commit(changes);
+    await this.persist();
+  }
+
+  async close() {
+    await this.writeChain;
+  }
+
+  async persist() {
+    const snapshot = `${JSON.stringify(this.state, null, 2)}\n`;
+    this.writeChain = this.writeChain.then(async () => {
+      const temp = `${this.file}.${process.pid}.${randomUUID()}.tmp`;
+      await writeFile(temp, snapshot, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      try {
+        await copyFile(this.file, this.backupFile);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
+      await rename(temp, this.file);
+    });
+    return this.writeChain;
   }
 }
 

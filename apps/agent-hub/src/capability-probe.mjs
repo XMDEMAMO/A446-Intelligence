@@ -128,6 +128,53 @@ export async function probeConfiguredModels(config, previous = null, context = {
   }
 }
 
+export async function probeConfiguredAccount(config, previous = null, context = {}) {
+  const checkedAt = new Date().toISOString();
+  const configured = normalizeAccountProfile(config.account);
+  const spec = config.accountProbe ?? config.capabilityProbe?.account;
+  if (!spec?.command) {
+    return {
+      state: configured ? "unknown" : "unavailable",
+      source: configured ? "config" : "unavailable",
+      checkedAt,
+      lastSuccessAt: null,
+      stale: false,
+      errorSummary: null,
+      profile: configured,
+    };
+  }
+  try {
+    const payload = await probeJson(spec, context);
+    const discovered = normalizeAccountProfile(payload?.account ?? payload);
+    if (!discovered) throw new Error("account probe output must contain an account profile");
+    return {
+      state: "available",
+      source: String(payload?.source ?? spec.source ?? "official-client"),
+      checkedAt,
+      lastSuccessAt: checkedAt,
+      stale: false,
+      errorSummary: null,
+      profile: { ...configured, ...discovered },
+      authMode: payload?.account?.authMode ?? payload?.authMode ?? null,
+      identityVerified: payload?.account?.identityVerified ?? payload?.identityVerified ?? null,
+    };
+  } catch (error) {
+    const errorSummary = safeMessage(error);
+    if (previous?.lastSuccessAt && previous.profile) {
+      return { ...previous, state: "stale", checkedAt, stale: true, errorSummary };
+    }
+    return {
+      state: configured ? "unknown" : "unavailable",
+      source: configured ? "config" : String(spec.source ?? "official-client"),
+      checkedAt,
+      lastSuccessAt: null,
+      stale: false,
+      errorSummary,
+      profile: configured,
+    };
+  }
+}
+
 export function schedulingCapabilities(config, observed) {
   const capabilities = new Set((config.capabilities ?? ["task.execute", "pause", "resume", "cancel"]).map(String));
   const resources = [
@@ -417,4 +464,18 @@ function safeDescription(value) {
 
 function safeMessage(value) {
   return String(value?.message ?? value ?? "probe failed").slice(0, 500);
+}
+
+function normalizeAccountProfile(value) {
+  if (!value || typeof value !== "object") return null;
+  const provider = value.provider ? String(value.provider) : null;
+  const id = value.id ? String(value.id) : null;
+  if (!provider && !id) return null;
+  return {
+    ...(id ? { id } : {}),
+    ...(provider ? { provider } : {}),
+    ...(value.plan ? { plan: String(value.plan) } : {}),
+    ...(value.label ? { label: String(value.label) } : {}),
+    ...(Number.isFinite(Number(value.maxConcurrency)) ? { maxConcurrency: Math.max(1, Number(value.maxConcurrency)) } : {}),
+  };
 }

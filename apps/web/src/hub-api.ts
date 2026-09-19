@@ -16,6 +16,7 @@ import type {
 } from './types'
 
 const API_BASE = (import.meta.env.VITE_HUB_API_BASE ?? '/api').replace(/\/$/, '')
+const LAN_MODE = import.meta.env.VITE_LAN_MODE === 'true'
 const DEFAULT_TIMEOUT_MS = 8_000
 let csrfToken = readCookie('a446_csrf') || window.sessionStorage.getItem('a446.csrf') || ''
 
@@ -58,6 +59,8 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }, timeoutMs)
   const headers = new Headers(init.headers)
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json')
+  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  if (lanToken && !headers.has('x-a446-lan-token')) headers.set('x-a446-lan-token', lanToken)
   const method = init.method ?? 'GET'
   if (!['GET', 'HEAD'].includes(method) && csrfToken && !headers.has('x-csrf-token')) headers.set('x-csrf-token', csrfToken)
 
@@ -130,8 +133,36 @@ export function clearLocalSession() {
   window.sessionStorage.removeItem('a446.csrf')
 }
 
-export function artifactDownloadUrl(downloadUrl: string) {
-  return `${API_BASE}${downloadUrl}`
+export function setLanAccessToken(token: string) {
+  const normalized = token.trim()
+  if (normalized) window.sessionStorage.setItem('a446.lan-token', normalized)
+  else window.sessionStorage.removeItem('a446.lan-token')
+}
+
+export async function downloadArtifact(downloadUrl: string, filename: string) {
+  const headers = new Headers()
+  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  if (lanToken) headers.set('x-a446-lan-token', lanToken)
+  const response = await fetch(`${API_BASE}${downloadUrl}`, { credentials: 'include', headers })
+  if (!response.ok) {
+    let message = `成果下载失败（${response.status}）`
+    try {
+      const body = await response.json() as ErrorBody
+      if (body.error) message = body.error
+    } catch {
+      // Keep the status-based fallback when the Hub does not return JSON.
+    }
+    throw new HubApiError(message, response.status, `HTTP_${response.status}`)
+  }
+  const objectUrl = URL.createObjectURL(await response.blob())
+  try {
+    const anchor = document.createElement('a')
+    anchor.href = objectUrl
+    anchor.download = filename
+    anchor.click()
+  } finally {
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000)
+  }
 }
 
 export async function getHubOverview(signal?: AbortSignal): Promise<HubOverview> {

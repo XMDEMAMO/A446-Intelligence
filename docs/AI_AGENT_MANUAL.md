@@ -41,12 +41,13 @@ A446 Intelligence 的目标是通用本地/分布式 Agent 平台。软件项目
 - 动态 Agent/模型调度、任务群聊、Token 与可信额度快照。
 - PostgreSQL 支持的单进程 Server Hub alpha、持久可靠投递、Attempt/Lease 和重启恢复。
 - 启动及运行期统一资源快照、陈旧状态，以及可单次处理并按原节点恢复的持久人工介入。
+- 私人局域网模式的单进程 JSON 文件状态、原子备份和协调设备本地 Artifact Store。
 
 不得声称当前仓库已经具备：
 
 - 多副本高可用调度、自动主从切换或跨实例并发写入。
 - 多租户身份与 RBAC。
-- 跨 Worker 产物存储。
+- 跨 Hub 复制的高可用产物存储。
 - 官方客户端未提供机器可读接口时的精确第三方额度百分比。
 - 黑盒 CLI 单轮内部的细粒度恢复。
 
@@ -65,7 +66,8 @@ apps/web/
 
 apps/agent-hub/
   src/hub.mjs            本地 Hub 与 HTTP 控制面
-  src/hub-store.mjs      Hub Store 契约的内存实现
+  src/hub-store.mjs      Hub Store 契约的内存与 JSON 文件实现
+  src/local-artifact-store.mjs  私人 LAN 协调设备的本地成果对象存储
   src/worker.mjs         Worker 生命周期和任务队列
   src/local-policy.mjs   权限与路径约束
   src/checkpoint-store.mjs
@@ -111,7 +113,7 @@ Local Hub
   └── 其他兼容 Worker
 ~~~
 
-本地 Mock Hub 可在回环或受信开发环境使用 Legacy `HUB_TOKEN`。正式 Server Hub 必须使用独立身份：浏览器通过 HttpOnly Session Cookie 登录，Vite 代理不附加共享 Token；每个 Worker 使用绑定 `agentId/deviceId` 的独立凭据。
+本地 Hub 可在回环或受信私人局域网使用 Legacy `HUB_TOKEN`；LAN Web 还必须由浏览器提交配对令牌，Artifact 请求必须声明 Agent ID 并由任务/Attempt 所有权再次校验。正式 Server Hub 必须使用独立身份：浏览器通过 HttpOnly Session Cookie 登录，Vite 代理不附加共享 Token；每个 Worker 使用绑定 `agentId/deviceId` 的独立凭据。
 
 ## 5. HTTP 控制面
 

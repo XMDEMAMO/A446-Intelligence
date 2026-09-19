@@ -3,9 +3,9 @@ import './App.css'
 import AdminPanel from './AdminPanel'
 import { createDemoSnapshot } from './demo-data'
 import {
-  artifactDownloadUrl,
   clearLocalSession,
   createWorkflow,
+  downloadArtifact,
   getConversationDetail,
   getCurrentUser,
   getHubOverview,
@@ -16,6 +16,7 @@ import {
   resolveIntervention as resolveHubIntervention,
   sendConversationMessage,
   sendHubCommand,
+  setLanAccessToken,
 } from './hub-api'
 import { failedConnectionMode, nextPollDelay, NORMAL_POLL_MS, permitsServerMutation } from './sync-policy.js'
 import type {
@@ -81,6 +82,7 @@ const connectionName: Record<ConnectionMode, string> = {
 
 const activeTaskStatuses = new Set(['queued', 'awaiting_approval', 'dispatched', 'running', 'processing_result'])
 const demoEnabled = import.meta.env.VITE_DEMO_MODE === 'true'
+const lanMode = import.meta.env.VITE_LAN_MODE === 'true'
 
 function emptyDraft(): WorkflowDraft {
   return {
@@ -117,6 +119,7 @@ function App() {
   const [lastError, setLastError] = useState('')
   const [loginName, setLoginName] = useState('')
   const [loginPassword, setLoginPassword] = useState('')
+  const [lanTokenInput, setLanTokenInput] = useState('')
   const [loginRetrySeconds, setLoginRetrySeconds] = useState(0)
   const [authCheckRevision, setAuthCheckRevision] = useState(0)
   const [refreshRevision, setRefreshRevision] = useState(0)
@@ -134,6 +137,7 @@ function App() {
     pollAbortRef.current?.abort()
     pollAbortRef.current = null
     clearLocalSession()
+    if (lanMode) setLanAccessToken('')
     overviewRef.current = null
     setCurrentUser(null)
     setAuthStatus('unauthenticated')
@@ -439,6 +443,17 @@ function App() {
     }
   }
 
+  function submitLanPairing(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    if (!lanTokenInput.trim()) return
+    setLanAccessToken(lanTokenInput)
+    setLanTokenInput('')
+    setLastError('')
+    setAuthStatus('checking')
+    setConnectionMode('loading')
+    setAuthCheckRevision((value) => value + 1)
+  }
+
   async function submitLogout() {
     if (!requireLive()) return
     setWorkingAction('logout')
@@ -562,9 +577,22 @@ function App() {
     }
   }
 
-  if (authStatus === 'checking') return <LoadingGate label="正在检查登录会话" />
+  if (authStatus === 'checking') return <LoadingGate label={lanMode ? '正在连接局域网 Hub' : '正在检查登录会话'} />
 
   if (authStatus === 'unauthenticated') {
+    if (lanMode) {
+      return (
+        <main className="login-shell">
+          <form className="login-card" onSubmit={submitLanPairing}>
+            <div className="brand-mark">A4</div>
+            <div><span>LAN package mode</span><h1>连接私人局域网</h1><p>输入协调设备启动时显示的配对令牌。令牌只保存在当前浏览器会话中。</p></div>
+            <label>配对令牌<input autoComplete="off" autoFocus type="password" value={lanTokenInput} onChange={(event) => setLanTokenInput(event.target.value)} /></label>
+            {lastError && <div className="login-error">{lastError}</div>}
+            <button type="submit" disabled={!lanTokenInput.trim()}>连接</button>
+          </form>
+        </main>
+      )
+    }
     return (
       <main className="login-shell">
         <form className="login-card" onSubmit={submitLogin}>
@@ -605,7 +633,7 @@ function App() {
 
         <nav className="sidebar-nav" aria-label="主导航">
           <button className={mainView === 'conversation' ? 'selected' : ''} type="button" onClick={() => setMainView('conversation')}>协作任务</button>
-          {currentUser?.role === 'admin' && !demoActive && <button className={mainView === 'admin' ? 'selected' : ''} type="button" onClick={() => setMainView('admin')}>系统管理</button>}
+          {currentUser?.role === 'admin' && !demoActive && !lanMode && <button className={mainView === 'admin' ? 'selected' : ''} type="button" onClick={() => setMainView('admin')}>系统管理</button>}
         </nav>
 
         <button className="new-task" type="button" disabled={!canWrite} onClick={() => setModalOpen(true)}>＋ 新建协作任务</button>
@@ -634,12 +662,12 @@ function App() {
         </div>
 
         <div className="identity-card">
-          <div><strong>{currentUser?.username ?? 'unknown'}</strong><small>{currentUser?.role === 'admin' ? '管理员' : '操作者'}</small></div>
-          {demoActive ? <button type="button" onClick={exitDemo}>退出演示</button> : <button type="button" disabled={!canWrite || workingAction === 'logout'} onClick={() => void submitLogout()}>退出</button>}
+          <div><strong>{lanMode ? '局域网控制端' : currentUser?.username ?? 'unknown'}</strong><small>{lanMode ? '私人 LAN · 共享配对令牌' : currentUser?.role === 'admin' ? '管理员' : '操作者'}</small></div>
+          {demoActive ? <button type="button" onClick={exitDemo}>退出演示</button> : !lanMode && <button type="button" disabled={!canWrite || workingAction === 'logout'} onClick={() => void submitLogout()}>退出</button>}
         </div>
       </aside>
 
-      {mainView === 'admin' && currentUser?.role === 'admin' ? (
+      {mainView === 'admin' && currentUser?.role === 'admin' && !lanMode ? (
         <AdminPanel connectionMode={connectionMode} onNotice={setNotice} onUnauthorized={handleUnauthorized} />
       ) : (
         <>
@@ -806,7 +834,7 @@ function MessageBubble({ message, task, agents, loadingFullResult, onLoadFullRes
             <summary><span>▧</span><div><strong>{attachment.label}</strong><small>{attachment.version ?? '成果附件'} · 点击按需加载</small></div><i>⌄</i></summary>
             {loadingFullResult && attachment.type === 'full_result' && attachment.content === undefined && <div className="attachment-loading">正在加载完整成果…</div>}
             {attachment.content !== undefined && <pre>{attachment.content}</pre>}
-            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}>{file.status === 'ready' && file.downloadUrl ? <a href={artifactDownloadUrl(file.downloadUrl)}>{file.path}</a> : <span>{file.path}</span>}<small>{file.status} · {formatBytes(file.size)}</small></div>)}
+            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}>{file.status === 'ready' && file.downloadUrl ? <button type="button" onClick={() => void downloadArtifact(file.downloadUrl!, file.path).catch((error) => window.alert(error instanceof Error ? error.message : '成果下载失败'))}>{file.path}</button> : <span>{file.path}</span>}<small>{file.status} · {formatBytes(file.size)}</small></div>)}
           </details>
         ))}
         {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage) && <div className="message-metrics"><span>{task.model ?? task.execution?.model ?? '默认模型'}</span>{task.usage && <><span>输入 {formatTokens(task.usage.inputTokens)}</span><span>输出 {formatTokens(task.usage.outputTokens)}</span><b>共 {formatTokens(task.usage.totalTokens)} tokens</b></>}</div>}

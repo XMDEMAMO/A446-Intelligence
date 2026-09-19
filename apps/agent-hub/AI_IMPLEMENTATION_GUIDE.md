@@ -43,6 +43,7 @@ The following behavior is implemented and must remain working:
 - Per-turn and cumulative token counts plus an optional machine-readable official-client quota probe.
 - Startup and low-frequency resource refresh with explicit source, last-success, stale, and error metadata.
 - Independently persisted human interventions with one-time decisions and recorded-node/session recovery.
+- Optional single-process JSON file Hub state and a coordinator-local Artifact Store for trusted private-LAN packages.
 
 ## 3 Security invariants
 
@@ -121,7 +122,8 @@ src/artifact-manifest.mjs      Artifact discovery and SHA-256
 src/capability-probe.mjs       Adapter/tool readiness and quota state classification
 src/quota-probe.mjs            optional machine-readable official-client quota snapshots
 src/collaboration.mjs          role contracts, output parsing, usage normalization, scheduling
-src/hub-store.mjs              in-memory Hub Store contract implementation
+src/hub-store.mjs              in-memory and atomic JSON-file Hub Store implementations
+src/local-artifact-store.mjs   private-LAN coordinator Artifact object storage
 src/adapters/codex.mjs         Codex session continuation
 src/adapters/antigravity.mjs   Antigravity persistent stream-json conversation
 src/adapters/stdio-json.mjs    generic persistent JSONL Adapter
@@ -327,7 +329,7 @@ RESOURCE_EXHAUSTED / explicit quota exhaustion    -> Exhausted
 authentication or unsupported-location error      -> executor Unhealthy, quota unchanged
 ```
 
-Do not invent a numeric remaining percentage. Codex Plus and Google AI Pro CLIs do not currently expose a reliable common numeric quota interface to this Worker. If a future official command is added, preserve `Unknown` as the fallback and test the new parser against captured fixtures.
+Do not invent a numeric remaining percentage. The current LAN probe may use Codex App Server `account/rateLimits/read` and Antigravity 1.1.12+ read-only `-p "/usage" --output-format json`. Antigravity versions that cannot prove support for the read-only command must not be probed this way, because older versions could treat `/usage` as a model prompt. Preserve `Unknown` as the fallback and test every parser against captured fixtures.
 
 Every Adapter should return machine-readable per-turn token usage when the official result contains it. The Worker normalizes input, output, cached, reasoning, tool, and total token counts and accumulates them per logical Agent; Hub also aggregates them per Agent and account.
 
@@ -528,7 +530,7 @@ safe next action
 
 ## 18 Current known boundary
 
-The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, refreshable capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, Artifact hashing, and persistent one-time human recovery. The separate `apps/server-hub` alpha adds a single-process PostgreSQL-backed scheduler, durable reliable-delivery records, Attempt/Lease recovery, database-guarded result transitions, independent interventions, and authenticated Artifact transfer without adding PostgreSQL to the Worker runtime.
+The local MVP is complete for Worker communication, local policy, session continuity, stage recovery records, refreshable capability/readiness telemetry, role collaboration, dynamic Agent/model selection, token accounting, optional trusted quota snapshots, one-task conversations, Artifact hashing, single-process JSON Hub persistence, coordinator-local cross-Worker Artifact transfer, and persistent one-time human recovery. The separate `apps/server-hub` alpha adds PostgreSQL-backed identity and scheduling boundaries for a formal deployment without adding PostgreSQL to the Worker runtime.
 
 The following remain outside this local package:
 
@@ -536,7 +538,8 @@ The following remain outside this local package:
 multi-replica/high-availability scheduling and leader coordination
 independent Worker/Web identities, rotation, and RBAC
 durable authenticated storage for the Web UI
-cross-Worker Artifact storage
+replicated/high-availability Artifact storage across Hub instances
+independent per-device credentials and RBAC in the shared-token LAN package
 provider-specific official quota readers where the installed client has no machine-readable interface
 mid-turn recovery inside a black-box CLI model turn
 ```

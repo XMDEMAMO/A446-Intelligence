@@ -494,6 +494,7 @@ export class AgentHub {
         agent.usageTotals = message.payload?.usageTotals ?? agent.usageTotals;
         agent.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot) ?? agent.quotaSnapshot;
         agent.quotaProbeError = message.payload?.quotaProbeError ?? agent.quotaProbeError;
+        agent.account = message.payload?.account ?? agent.account;
         this.markAgent(agent);
       }
       this.renewLeaseFromHeartbeat(agentId, message);
@@ -823,6 +824,7 @@ export class AgentHub {
       contextBundle: {
         objective: input.objective.trim(),
         acceptance: Array.isArray(input.acceptance) ? input.acceptance.map(String) : [],
+        schedulerCatalog: this.schedulerCatalog(),
       },
     });
     await this.queueOrDispatch(task);
@@ -905,6 +907,7 @@ export class AgentHub {
           workflow: task.workflow,
           requiredCapabilities: assignment.requiredCapabilities,
           modelPreference: assignment.modelPreference,
+          reasoningEffort: assignment.reasoningEffort,
           taskSpec: {
             title: assignment.title,
             type: "collaboration_execution",
@@ -1038,7 +1041,7 @@ export class AgentHub {
         permissions_required: { project_workspace: true },
         acceptance: [],
       },
-      contextBundle: details,
+      contextBundle: { ...details, schedulerCatalog: this.schedulerCatalog() },
     });
     await this.queueOrDispatch(planner);
   }
@@ -1246,6 +1249,7 @@ export class AgentHub {
           ...intervention.context,
           humanResponse: response || decision,
           humanDecision: { interventionId, decision, response: response || null },
+          schedulerCatalog: this.schedulerCatalog(),
         },
       });
       await this.queueOrDispatch(resumedTask);
@@ -1314,6 +1318,59 @@ export class AgentHub {
     }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   }
 
+  schedulerCatalog() {
+    this.refreshAccountLoads();
+    return [...this.agents.values()].map((agent) => ({
+      agentId: agent.agentId,
+      deviceId: agent.deviceId,
+      account: agent.account ? {
+        id: agent.account.id,
+        provider: agent.account.provider,
+        plan: agent.account.plan,
+        maxConcurrency: Number(agent.accountMaxConcurrency ?? 1),
+        activeTaskCount: Number(agent.accountActiveTaskCount ?? 0),
+      } : null,
+      roles: agent.roles ?? [],
+      status: agent.status,
+      paused: Boolean(agent.paused),
+      activeTaskCount: Number(agent.activeTaskCount ?? 0),
+      maxConcurrency: Number(agent.maxConcurrency ?? 1),
+      capabilities: agent.capabilities ?? [],
+      models: (agent.models ?? []).map((model) => ({
+        id: model.id,
+        label: model.label,
+        reasoningEfforts: model.reasoningEfforts ?? [],
+        availability: model.availability ?? "unknown",
+        quotaState: model.quota?.state ?? "Unknown",
+      })),
+      quota: agent.quotaSnapshot ? {
+        state: agent.quotaSnapshot.state,
+        windows: (agent.quotaSnapshot.windows ?? []).map((window) => ({
+          name: window.name,
+          remainingPercent: window.remainingPercent,
+          resetsAt: window.resetsAt,
+        })),
+        stale: Boolean(agent.quotaSnapshot.stale),
+      } : { state: "Unknown", windows: [], stale: false },
+      environment: summarizeAgentEnvironment(agent.resourceSnapshot?.capabilities),
+    })).sort((left, right) => left.agentId.localeCompare(right.agentId));
+  }
+
+  refreshAccountLoads() {
+    const loads = new Map();
+    for (const task of this.tasks.values()) {
+      if (!task.activeSlotAgentId || !ACTIVE_SLOT_STATUSES.has(task.status)) continue;
+      const worker = this.agents.get(task.activeSlotAgentId);
+      const key = schedulingAccountKey(worker);
+      if (key) loads.set(key, Number(loads.get(key) ?? 0) + 1);
+    }
+    for (const agent of this.agents.values()) {
+      const key = schedulingAccountKey(agent);
+      agent.accountActiveTaskCount = key ? Number(loads.get(key) ?? 0) : Number(agent.activeTaskCount ?? 0);
+      agent.accountMaxConcurrency = Math.max(1, Number(agent.account?.maxConcurrency ?? 1));
+    }
+  }
+
   async queueOrDispatch(task) {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
     let selection;
@@ -1329,12 +1386,14 @@ export class AgentHub {
           ? "lease_protocol_unsupported" : "artifact_protocol_unsupported";
         throw httpError(409, `Agent ${namedAgent.agentId} does not support this task protocol`, "EXECUTOR_UNAVAILABLE", { reason, agentId: namedAgent.agentId });
       }
+      this.refreshAccountLoads();
       selection = chooseAgent(candidates, {
         targetAgentId: task.targetAgentId,
         role: task.role,
         requireDeclaredRole: task.role === "executor" && Boolean(task.workflow?.enabled),
         requiredCapabilities: task.requiredCapabilities,
         modelPreference: task.modelPreference,
+        reasoningEffort: task.reasoningEffort,
       });
     } catch (error) {
       task.status = "queued";
@@ -1745,8 +1804,22 @@ export class AgentHub {
 
       const artifactRoute = url.pathname.match(/^\/v1\/artifacts\/([0-9a-f-]{36})(?:\/(content))?$/i);
       const artifactRequest = url.pathname === "/v1/artifacts" || Boolean(artifactRoute);
-      let actor = await this.authenticateHttpRequest(request);
-      if (!actor && artifactRequest && this.authService) actor = await this.authService.authenticateWorker(request.headers.authorization);
+      let actor;
+      const legacyArtifactAgentId = artifactRequest && !this.authService
+        ? normalizeLegacyArtifactAgentId(request.headers["x-a446-agent-id"])
+        : null;
+      if (legacyArtifactAgentId && this.authorized(request.headers.authorization)) {
+        actor = {
+          kind: "worker",
+          id: `legacy-worker:${legacyArtifactAgentId}`,
+          role: "worker",
+          agentId: legacyArtifactAgentId,
+          legacy: true,
+        };
+      } else {
+        actor = await this.authenticateHttpRequest(request);
+        if (!actor && artifactRequest && this.authService) actor = await this.authService.authenticateWorker(request.headers.authorization);
+      }
       if (!actor) return json(response, 401, { error: "Unauthorized", code: "AUTH_REQUIRED" });
       requestActor = actor;
 
@@ -2307,6 +2380,37 @@ function summarizeMessage(message) {
   return {
     ...message,
     attachments: (message.attachments ?? []).map(({ content, ...attachment }) => attachment),
+  };
+}
+
+function schedulingAccountKey(agent) {
+  if (!agent) return null;
+  const provider = agent.account?.provider;
+  const id = agent.account?.id;
+  if (provider && id) return `${provider}:${id}`;
+  return `${agent.deviceId ?? agent.agentId}:${provider ?? agent.adapter ?? "unknown"}:${id ?? agent.agentId}`;
+}
+
+function normalizeLegacyArtifactAgentId(value) {
+  const agentId = Array.isArray(value) ? value[0] : value;
+  if (typeof agentId !== "string" || !/^[A-Za-z0-9._:-]{1,128}$/.test(agentId)) return null;
+  return agentId;
+}
+
+function summarizeAgentEnvironment(capabilities) {
+  const device = capabilities?.device ?? {};
+  const availableTools = (capabilities?.tools ?? []).filter((item) => ["available", "stale"].includes(item?.state)).map((item) => ({
+    name: item.name,
+    version: item.version,
+    stale: Boolean(item.stale),
+  }));
+  return {
+    platform: capabilities?.platform ?? device.system?.platform ?? null,
+    arch: capabilities?.arch ?? device.system?.arch ?? null,
+    node: capabilities?.node ?? device.node?.version ?? null,
+    python: ["available", "stale"].includes(device.python?.state) ? device.python.version ?? "available" : null,
+    gpu: ["available", "stale"].includes(device.gpu?.state) ? device.gpu.version ?? device.gpu.description ?? "available" : null,
+    tools: availableTools,
   };
 }
 

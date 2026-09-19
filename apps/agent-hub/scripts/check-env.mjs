@@ -41,7 +41,9 @@ if (args.config) {
   results.push({
     check: "quota telemetry",
     ok: true,
-    detail: "Unknown before execution; runtime reports Healthy/Low/Exhausted from trusted outcomes",
+    detail: config.quotaProbe?.command
+      ? `trusted runtime probe configured (${config.quotaProbe.source ?? "official-client"}); Unknown remains the failure fallback`
+      : "no trusted snapshot probe configured; runtime outcomes report Healthy/Low/Exhausted with Unknown fallback",
   });
 }
 

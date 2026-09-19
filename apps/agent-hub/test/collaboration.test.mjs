@@ -47,6 +47,10 @@ test("a named executor is a hard scheduling constraint with stable failure codes
   executor.activeTaskCount = 1;
   assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_AT_CAPACITY");
   executor.activeTaskCount = 0;
+  executor.accountActiveTaskCount = 1;
+  executor.accountMaxConcurrency = 1;
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "ACCOUNT_AT_CAPACITY");
+  executor.accountActiveTaskCount = 0;
   executor.quotaSnapshot = { state: "Exhausted" };
   assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_QUOTA_UNAVAILABLE");
   executor.quotaSnapshot = { state: "Unknown" };
@@ -69,6 +73,23 @@ test("a queued named executor reports an unsupported lease protocol without drif
   assert.equal(task.schedulingErrorDetails.reason, "lease_protocol_unsupported");
 });
 
+test("two Agent identities sharing one login are serialized at account level", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: false } });
+  const first = agent("account-agent-a", "executor");
+  const second = agent("account-agent-b", "executor");
+  first.account = { id: "shared", provider: "openai", maxConcurrency: 1 };
+  second.account = { id: "shared", provider: "openai", maxConcurrency: 1 };
+  hub.agents = new Map([[first.agentId, first], [second.agentId, second]]);
+  const active = hub.createTask({ input: "already running", targetAgentId: first.agentId, role: "executor" });
+  active.status = "running";
+  active.activeSlotAgentId = first.agentId;
+  const queued = hub.createTask({ input: "must wait", targetAgentId: second.agentId, role: "executor" });
+  await hub.queueOrDispatch(queued);
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.schedulingErrorCode, "ACCOUNT_AT_CAPACITY");
+  assert.equal(queued.schedulingErrorDetails.reason, "account_at_capacity");
+});
+
 test("workflow creation binds an explicit executor and revisions keep its session", async () => {
   const hub = new AgentHub({ logs: { includePayloads: false } });
   hub.agents = new Map([
@@ -89,11 +110,13 @@ test("workflow creation binds an explicit executor and revisions keep its sessio
   hub.agents.get("chosen").paused = false;
   const root = await hub.createWorkflow({ objective: "work", plannerAgentId: "planner", executorAgentId: "chosen" });
   assert.equal(root.workflow.executorAgentId, "chosen");
-  root.submission = { brief: "plan", assignments: [{ title: "part", instructions: "do work", targetAgentId: "other" }] };
+  assert.ok(root.contextBundle.schedulerCatalog.some((entry) => entry.agentId === "chosen"));
+  root.submission = { brief: "plan", assignments: [{ title: "part", instructions: "do work", targetAgentId: "other", reasoningEffort: "high" }] };
   await hub.advanceWorkflow(root);
   const execution = [...hub.tasks.values()].find((task) => task.role === "executor");
   assert.equal(execution.requestedAgentId, "chosen");
   assert.equal(execution.targetAgentId, "chosen");
+  assert.equal(execution.reasoningEffort, "high");
   assert.equal(execution.sessionScopeId, execution.taskId);
   assert.ok(hub.log.recent(100).some((event) => event.type === "workflow.executor_override"));
   const review = hub.createTask({

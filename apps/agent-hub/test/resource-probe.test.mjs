@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities } from "../src/capability-probe.mjs";
+import { probeConfiguredAccount, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities } from "../src/capability-probe.mjs";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
 import { delay } from "../src/common.mjs";
@@ -57,6 +57,27 @@ test("model discovery uses trusted JSON, then marks the last successful list sta
   assert.equal(stale.state, "stale");
   assert.equal(stale.items[0].id, "live-model");
   assert.equal(stale.items[0].availability, "stale");
+});
+
+test("account discovery replaces manual labels and retains the last trusted identity as stale", async () => {
+  const discovered = await probeConfiguredAccount({
+    account: { id: "manual", provider: "openai", label: "manual label" },
+    accountProbe: {
+      command: process.execPath,
+      args: ["-e", `process.stdout.write(JSON.stringify({source:'official-client',account:{id:'detected',provider:'openai',plan:'plus',label:'detected account',identityVerified:true}}))`],
+    },
+  });
+  assert.equal(discovered.state, "available");
+  assert.equal(discovered.profile.id, "detected");
+  assert.equal(discovered.profile.plan, "plus");
+  assert.equal(discovered.identityVerified, true);
+
+  const stale = await probeConfiguredAccount({
+    accountProbe: { command: process.execPath, args: ["-e", "process.exit(3)"] },
+  }, discovered);
+  assert.equal(stale.state, "stale");
+  assert.equal(stale.profile.id, "detected");
+  assert.ok(stale.errorSummary);
 });
 
 test("quota refresh keeps the last trusted snapshot stale instead of guessing a replacement", async () => {

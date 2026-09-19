@@ -58,6 +58,7 @@ export interface AccountProfile {
   provider?: string
   plan?: string
   label?: string
+  maxConcurrency?: number
 }
 
 export interface ModelProfile {
@@ -126,6 +127,17 @@ export interface ResourceSnapshot {
   stale: boolean
   errorSummary?: string | null
   capabilities?: ObservedCapabilities
+  account?: {
+    state: ResourceState
+    source: string
+    checkedAt: string
+    lastSuccessAt?: string | null
+    stale?: boolean
+    errorSummary?: string | null
+    profile?: AccountProfile | null
+    authMode?: string | null
+    identityVerified?: boolean | null
+  }
   models?: {
     state: ResourceState
     source: string

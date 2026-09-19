@@ -353,8 +353,8 @@
 .attachment-loading { padding: 18px; border-top: 1px solid var(--line); color: var(--muted); background: #f8faf9; font-size: 10px; text-align: center; }
 .artifact-file { display: flex; justify-content: space-between; gap: 20px; padding: 10px 13px; border-top: 1px solid var(--line); font-family: var(--mono); font-size: 10px; }
 .artifact-file small { color: var(--muted); }
-.artifact-file a { color: #08758a; font-weight: 700; text-decoration: none; }
-.artifact-file a:hover { text-decoration: underline; }
+.artifact-file button { appearance: none; border: 0; padding: 0; background: transparent; color: #08758a; font: inherit; font-weight: 700; text-align: left; cursor: pointer; }
+.artifact-file button:hover { text-decoration: underline; }
 
 .login-shell { display: grid; min-height: 100vh; place-items: center; padding: 24px; background: radial-gradient(circle at top, #eaf7f8, #edf1f1 48%, #dce5e6); }
 .login-card { display: grid; width: min(410px, 100%); gap: 15px; padding: 34px; border: 1px solid #d2dfe1; border-radius: 18px; background: #fff; box-shadow: 0 25px 70px rgba(12, 39, 44, 0.16); }

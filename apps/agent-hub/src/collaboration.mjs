@@ -103,6 +103,9 @@ export function chooseAgent(agents, request = {}) {
     if (Number(selected.activeTaskCount ?? 0) >= Number(selected.maxConcurrency ?? 1)) {
       throw schedulingError("EXECUTOR_AT_CAPACITY", `Agent ${request.targetAgentId} is at capacity`, "at_capacity", request.targetAgentId);
     }
+    if (Number(selected.accountActiveTaskCount ?? 0) >= Number(selected.accountMaxConcurrency ?? selected.account?.maxConcurrency ?? 1)) {
+      throw schedulingError("ACCOUNT_AT_CAPACITY", `Account for Agent ${request.targetAgentId} is at capacity`, "account_at_capacity", request.targetAgentId);
+    }
     if (selected.quotaSnapshot?.state === "Exhausted") throw schedulingError("EXECUTOR_QUOTA_UNAVAILABLE", `Agent ${request.targetAgentId} account quota is exhausted`, "quota_exhausted", request.targetAgentId);
     const required = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
     const agentCapabilities = new Set(selected.capabilities ?? []);
@@ -128,6 +131,7 @@ export function chooseAgent(agents, request = {}) {
   const candidates = [...agents.values()].filter((agent) => {
     if (agent.status !== "online" || agent.paused) return false;
     if (Number(agent.activeTaskCount ?? 0) >= Number(agent.maxConcurrency ?? 1)) return false;
+    if (Number(agent.accountActiveTaskCount ?? 0) >= Number(agent.accountMaxConcurrency ?? agent.account?.maxConcurrency ?? 1)) return false;
     if (agent.quotaSnapshot?.state === "Exhausted") return false;
     if (role && (request.requireDeclaredRole ? !agent.roles?.includes(role) : agent.roles?.length && !agent.roles.includes(role))) return false;
     const capabilities = new Set(agent.capabilities ?? []);
@@ -143,7 +147,7 @@ export function chooseAgent(agents, request = {}) {
 export function buildRolePrompt(role, input, payload = {}) {
   if (!ROLE_SET.has(role)) return String(input ?? "");
   const contract = role === "planner"
-    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"]}],"needsHuman":false,"humanQuestion":null}. Do not execute or review the work. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
+    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"],"targetAgentId":null,"modelPreference":null,"reasoningEffort":null}],"needsHuman":false,"humanQuestion":null}. Use the schedulerCatalog when selecting an Agent, model, or reasoning effort; leave a field null when automatic scheduling is preferable. Do not execute or review the work. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
     : role === "executor"
       ? `Return JSON only: {"brief":"short task brief","fullResult":"complete result","upstreamIssue":null}. If an upstream result is wrong, set upstreamIssue to {"summary":"...","evidence":["..."],"impact":"...","recommendation":"..."}; do not silently correct upstream work.`
       : `Return JSON only: {"verdict":"approved|rejected|upstream_confirmed|upstream_denied","brief":"review summary","issues":[],"correctionBrief":null}. Review only the submitted full result against the acceptance criteria.`;
@@ -206,6 +210,7 @@ function chooseModel(agent, request, strict = true) {
   const configuredModels = agent.models ?? [];
   const models = configuredModels.filter((model) => {
     if (model.enabled === false || model.quota?.state === "Exhausted") return false;
+    if (request.reasoningEffort && model.reasoningEfforts?.length && !model.reasoningEfforts.includes(String(request.reasoningEffort))) return false;
     const modelCapabilities = new Set(model.capabilities ?? []);
     return requiredCapabilities.every((capability) => agentCapabilities.has(capability) || modelCapabilities.has(capability));
   });
@@ -254,6 +259,7 @@ function normalizeAssignment(value) {
       : [],
     targetAgentId: value.targetAgentId ? String(value.targetAgentId) : null,
     modelPreference: value.modelPreference ? String(value.modelPreference) : null,
+    reasoningEffort: value.reasoningEffort ? String(value.reasoningEffort) : null,
   };
 }
 
