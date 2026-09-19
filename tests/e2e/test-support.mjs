@@ -6,7 +6,9 @@ import { chromium } from "playwright-core";
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const projectRoot = path.resolve(currentDirectory, "..", "..");
-const webRoot = path.join(projectRoot, "apps", "web", "dist");
+const webRoot = process.env.A446_E2E_WEB_ROOT?.trim()
+  ? path.resolve(process.env.A446_E2E_WEB_ROOT.trim())
+  : path.join(projectRoot, "apps", "web", "dist");
 
 export async function launchBrowser() {
   const executablePath = await resolveBrowserExecutable();
@@ -71,25 +73,23 @@ async function handleRequest(request, response, state) {
     return;
   }
   const pathname = url.pathname.slice(4) || "/";
+  state.requests.push({ method: request.method ?? "GET", pathname, search: url.search });
   if (pathname === "/health") {
     sendJson(response, 200, { ok: true, protocolVersion: 1, now: new Date().toISOString() });
     return;
   }
   const body = await readJsonBody(request);
   if (pathname === "/v1/auth/login" && request.method === "POST") {
-    const role = body.username === "fixture-admin" && body.password === "fixture-admin-password"
-      ? "admin"
-      : body.username === "fixture-operator" && body.password === "fixture-operator-password"
-        ? "operator"
-        : null;
-    if (!role) {
+    const user = state.users.find((item) => item.username === body.username && item.password === body.password && item.status === "active");
+    if (!user) {
       sendJson(response, 401, { error: "AUTH_INVALID_CREDENTIALS", code: "AUTH_INVALID_CREDENTIALS" });
       return;
     }
-    const sessionId = `${role}-session`;
-    state.sessions.set(sessionId, role);
+    const sessionId = `fixture-session-${state.nextSession++}`;
+    state.sessions.set(sessionId, user.id);
+    user.lastLoginAt = new Date().toISOString();
     response.setHeader("set-cookie", `a446_session=${sessionId}; HttpOnly; SameSite=Strict; Path=/`);
-    sendJson(response, 200, { user: actorFor(role), csrfToken: `${role}-csrf` });
+    sendJson(response, 200, { user: publicUser(user, state), csrfToken: `${user.role}-csrf` });
     return;
   }
   const actor = authenticate(request, state);
@@ -98,7 +98,7 @@ async function handleRequest(request, response, state) {
     return;
   }
   if (!["GET", "HEAD"].includes(request.method ?? "GET") && request.headers["x-csrf-token"] !== `${actor.role}-csrf`) {
-    sendJson(response, 403, { error: "CSRF_INVALID", code: "CSRF_INVALID" });
+    sendJson(response, 403, { error: "CSRF validation failed", code: "CSRF_FAILED" });
     return;
   }
   if (pathname === "/v1/auth/me" && request.method === "GET") {
@@ -110,11 +110,25 @@ async function handleRequest(request, response, state) {
   } else if (pathname === "/v1/agents" && request.method === "GET") {
     sendJson(response, 200, { agents: state.agents });
   } else if (pathname === "/v1/tasks" && request.method === "GET") {
-    sendJson(response, 200, { tasks: state.tasks });
+    const rootTaskId = url.searchParams.get("rootTaskId");
+    const tasks = state.tasks
+      .filter((item) => !rootTaskId || item.rootTaskId === rootTaskId)
+      .map((item) => url.searchParams.get("view") === "summary" ? summarizeTask(item) : item);
+    sendJson(response, 200, { tasks });
+  } else if (/^\/v1\/tasks\/[^/]+$/.test(pathname) && request.method === "GET") {
+    const task = state.tasks.find((item) => item.taskId === decodeURIComponent(pathname.split("/")[3]));
+    task ? sendJson(response, 200, { task }) : sendJson(response, 404, { error: "Task not found", code: "NOT_FOUND" });
   } else if (pathname === "/v1/conversations" && request.method === "GET") {
     sendJson(response, 200, { conversations: state.conversations });
   } else if (pathname === "/v1/messages" && request.method === "GET") {
-    sendJson(response, 200, { messages: state.messages });
+    const rootTaskId = url.searchParams.get("rootTaskId");
+    const messages = state.messages
+      .filter((item) => !rootTaskId || item.rootTaskId === rootTaskId)
+      .map((item) => url.searchParams.get("view") === "summary" ? summarizeMessage(item) : item);
+    sendJson(response, 200, { messages });
+  } else if (/^\/v1\/messages\/[^/]+$/.test(pathname) && request.method === "GET") {
+    const message = state.messages.find((item) => item.messageId === decodeURIComponent(pathname.split("/")[3]));
+    message ? sendJson(response, 200, { message }) : sendJson(response, 404, { error: "Message not found", code: "NOT_FOUND" });
   } else if (pathname === "/v1/interventions" && request.method === "GET") {
     sendJson(response, 200, { interventions: state.interventions.filter((item) => item.status === "pending") });
   } else if (pathname === "/v1/usage" && request.method === "GET") {
@@ -127,8 +141,16 @@ async function handleRequest(request, response, state) {
     applyCommand(response, state, body, actor);
   } else if (/^\/v1\/interventions\/[^/]+\/resolve$/.test(pathname) && request.method === "POST") {
     resolveIntervention(response, state, pathname.split("/")[3], body, actor);
+  } else if (pathname === "/v1/admin/users" && request.method === "GET") {
+    requireAdmin(response, actor, () => sendJson(response, 200, { users: state.users.map((item) => publicUser(item, state)) }));
+  } else if (pathname === "/v1/admin/users" && request.method === "POST") {
+    requireAdmin(response, actor, () => createUser(response, state, body));
+  } else if (/^\/v1\/admin\/users\/[^/]+$/.test(pathname) && request.method === "PATCH") {
+    requireAdmin(response, actor, () => setUserStatus(response, state, decodeURIComponent(pathname.split("/")[4]), body));
+  } else if (/^\/v1\/admin\/users\/[^/]+\/revoke-sessions$/.test(pathname) && request.method === "POST") {
+    requireAdmin(response, actor, () => revokeUserSessions(response, state, decodeURIComponent(pathname.split("/")[4])));
   } else if (pathname === "/v1/admin/workers" && request.method === "GET") {
-    requireAdmin(response, actor, () => sendJson(response, 200, { workers: state.credentials.map(publicCredential) }));
+    requireAdmin(response, actor, () => sendJson(response, 200, { credentials: state.credentials.map(publicCredential) }));
   } else if (pathname === "/v1/admin/workers" && request.method === "POST") {
     requireAdmin(response, actor, () => createCredential(response, state, body));
   } else if (/^\/v1\/admin\/workers\/[^/]+\/rotate$/.test(pathname) && request.method === "POST") {
@@ -187,7 +209,7 @@ function applyCommand(response, state, body, actor) {
     return;
   }
   if (actor.role !== "admin") {
-    sendJson(response, 403, { error: "ADMIN_REQUIRED", code: "ADMIN_REQUIRED" });
+    sendJson(response, 403, { error: "Administrator role required", code: "FORBIDDEN" });
     return;
   }
   const task = state.tasks.find((item) => item.taskId === body.taskId);
@@ -211,7 +233,7 @@ function resolveIntervention(response, state, interventionId, body, actor) {
     return;
   }
   if (["approve", "reject"].includes(body.decision) && actor.role !== "admin") {
-    sendJson(response, 403, { error: "ADMIN_REQUIRED", code: "ADMIN_REQUIRED" });
+    sendJson(response, 403, { error: "Administrator role required", code: "FORBIDDEN" });
     return;
   }
   intervention.status = "resolved";
@@ -222,6 +244,90 @@ function resolveIntervention(response, state, interventionId, body, actor) {
   sendJson(response, 200, { ok: true, intervention });
 }
 
+function createUser(response, state, body) {
+  if (body.role === "admin") {
+    sendJson(response, 403, { error: "Administrators cannot be created over HTTP", code: "ADMIN_HTTP_CREATION_FORBIDDEN" });
+    return;
+  }
+  if (body.role != null && body.role !== "operator") {
+    sendJson(response, 400, { error: "role must be operator", code: "VALIDATION_ERROR" });
+    return;
+  }
+  if (typeof body.username !== "string" || !body.username.trim() || typeof body.password !== "string" || body.password.length < 12) {
+    sendJson(response, 400, { error: "username and a password of at least 12 characters are required", code: "VALIDATION_ERROR" });
+    return;
+  }
+  if (state.users.some((item) => item.username === body.username.trim())) {
+    sendJson(response, 409, { error: "User already exists", code: "STATE_CONFLICT" });
+    return;
+  }
+  const now = new Date().toISOString();
+  const user = {
+    id: `fixture-user-${state.nextUser++}`,
+    username: body.username.trim(),
+    password: body.password,
+    role: "operator",
+    status: "active",
+    createdAt: now,
+    updatedAt: now,
+    lastLoginAt: null,
+  };
+  state.users.push(user);
+  sendJson(response, 201, { user: publicUser(user, state) });
+}
+
+function setUserStatus(response, state, userId, body) {
+  if (!["active", "disabled"].includes(body.status)) {
+    sendJson(response, 400, { error: "status must be active or disabled", code: "VALIDATION_ERROR" });
+    return;
+  }
+  const user = state.users.find((item) => item.id === userId);
+  if (!user) {
+    sendJson(response, 404, { error: "User not found", code: "NOT_FOUND" });
+    return;
+  }
+  if (user.role !== "operator") {
+    sendJson(response, 403, { error: "Administrator status cannot be changed through HTTP", code: "FORBIDDEN" });
+    return;
+  }
+  user.status = body.status;
+  user.updatedAt = new Date().toISOString();
+  if (body.status === "disabled") revokeSessionsForUser(state, user.id);
+  sendJson(response, 200, { user: publicUser(user, state) });
+}
+
+function revokeUserSessions(response, state, userId) {
+  const user = state.users.find((item) => item.id === userId);
+  if (!user) {
+    sendJson(response, 404, { error: "User not found", code: "NOT_FOUND" });
+    return;
+  }
+  sendJson(response, 200, { ok: true, revokedSessions: revokeSessionsForUser(state, userId) });
+}
+
+function revokeSessionsForUser(state, userId) {
+  let revokedSessions = 0;
+  for (const [sessionId, currentUserId] of state.sessions) {
+    if (currentUserId !== userId) continue;
+    state.sessions.delete(sessionId);
+    revokedSessions += 1;
+  }
+  return revokedSessions;
+}
+
+function publicUser(user, state) {
+  return {
+    id: user.id,
+    username: user.username,
+    role: user.role,
+    status: user.status,
+    createdAt: user.createdAt,
+    updatedAt: user.updatedAt,
+    lastLoginAt: user.lastLoginAt,
+    activeSessionCount: [...state.sessions.values()].filter((userId) => userId === user.id).length,
+  };
+}
+
 function createCredential(response, state, body) {
   if (state.credentials.some((item) => item.agentId === body.agentId && item.status === "active")) {
     sendJson(response, 409, { error: "ACTIVE_CREDENTIAL_EXISTS", code: "ACTIVE_CREDENTIAL_EXISTS" });
@@ -229,9 +335,10 @@ function createCredential(response, state, body) {
   }
   const credentialId = `fixture-credential-${state.credentials.length + 1}`;
   const token = `fixture_token_${state.nextToken++}`;
-  const credential = { credentialId, agentId: body.agentId, deviceId: body.deviceId, status: "active", tokenHash: `hash-${token}` };
+  const now = new Date().toISOString();
+  const credential = { credentialId, agentId: body.agentId, deviceId: body.deviceId, status: "active", tokenHash: `hash-${token}`, createdAt: now, lastUsedAt: null, revokedAt: null };
   state.credentials.push(credential);
-  sendJson(response, 201, { credential: publicCredential(credential), token });
+  sendJson(response, 201, { credential: { ...publicCredential(credential), token } });
 }
 
 function rotateCredential(response, state, credentialId) {
@@ -241,10 +348,11 @@ function rotateCredential(response, state, credentialId) {
     return;
   }
   current.status = "revoked";
+  current.revokedAt = new Date().toISOString();
   const token = `fixture_token_${state.nextToken++}`;
-  const replacement = { ...current, credentialId: `${credentialId}-rotated`, status: "active", tokenHash: `hash-${token}` };
+  const replacement = { ...current, credentialId: `${credentialId}-rotated`, status: "active", tokenHash: `hash-${token}`, createdAt: new Date().toISOString(), lastUsedAt: null, revokedAt: null };
   state.credentials.push(replacement);
-  sendJson(response, 200, { credential: publicCredential(replacement), token });
+  sendJson(response, 200, { credential: { ...publicCredential(replacement), token } });
 }
 
 function revokeCredential(response, state, credentialId) {
@@ -254,12 +362,13 @@ function revokeCredential(response, state, credentialId) {
     return;
   }
   credential.status = "revoked";
+  credential.revokedAt = new Date().toISOString();
   sendJson(response, 200, { ok: true, credential: publicCredential(credential) });
 }
 
 function requireAdmin(response, actor, operation) {
   if (actor.role !== "admin") {
-    sendJson(response, 403, { error: "ADMIN_REQUIRED", code: "ADMIN_REQUIRED" });
+    sendJson(response, 403, { error: "Administrator role required", code: "FORBIDDEN" });
     return;
   }
   operation();
@@ -271,16 +380,41 @@ function publicCredential(credential) {
     agentId: credential.agentId,
     deviceId: credential.deviceId,
     status: credential.status,
+    createdAt: credential.createdAt,
+    lastUsedAt: credential.lastUsedAt,
+    revokedAt: credential.revokedAt,
+  };
+}
+
+function summarizeTask(task) {
+  const summary = { ...task };
+  delete summary.output;
+  if (summary.submission) {
+    const { fullResult: _fullResult, ...submission } = summary.submission;
+    summary.submission = submission;
+  }
+  if (summary.contextBundle) {
+    const { fullResult: _fullResult, ...contextBundle } = summary.contextBundle;
+    summary.contextBundle = contextBundle;
+  }
+  return summary;
+}
+
+function summarizeMessage(message) {
+  return {
+    ...message,
+    attachments: message.attachments.map((attachment) => {
+      if (attachment.type !== "full_result") return { ...attachment };
+      const { content: _content, ...summary } = attachment;
+      return summary;
+    }),
   };
 }
 
 function authenticate(request, state) {
-  const role = state.sessions.get(cookieValue(request, "a446_session"));
-  return role ? actorFor(role) : null;
-}
-
-function actorFor(role) {
-  return { id: `fixture-${role}-id`, username: `fixture-${role}`, role };
+  const userId = state.sessions.get(cookieValue(request, "a446_session"));
+  const user = state.users.find((item) => item.id === userId && item.status === "active");
+  return user ? publicUser(user, state) : null;
 }
 
 function cookieValue(request, name) {
@@ -337,8 +471,15 @@ function fixtureState() {
   const rootTaskId = "fixture-root-1";
   return {
     sessions: new Map(),
+    nextSession: 1,
+    nextUser: 1,
     nextToken: 1,
     lastWorkflowBody: null,
+    requests: [],
+    users: [
+      { id: "fixture-admin-id", username: "fixture-admin", password: "fixture-admin-password", role: "admin", status: "active", createdAt: now, updatedAt: now, lastLoginAt: null },
+      { id: "fixture-operator-id", username: "fixture-operator", password: "fixture-operator-password", role: "operator", status: "active", createdAt: now, updatedAt: now, lastLoginAt: null },
+    ],
     agents,
     tasks: [{
       taskId: "fixture-task-1",
@@ -352,6 +493,9 @@ function fixtureState() {
       taskSpec: { title: "Fixture release acceptance", acceptance: ["result is reviewed"] },
       model: "fixture-model",
       usage: { ...zeroUsage, inputTokens: 8, outputTokens: 2, totalTokens: 10 },
+      output: "fixture private output",
+      submission: { brief: "Fixture result is ready", fullResult: "fixture full result" },
+      contextBundle: { objective: "produce fixture result", fullResult: "fixture private context" },
       createdAt: now,
     }],
     conversations: [{
@@ -389,7 +533,7 @@ function fixtureState() {
       allowedActions: ["approve", "reject"],
       requestedAt: now,
     }],
-    credentials: [{ credentialId: "fixture-credential-1", agentId: "fixture-executor", deviceId: "fixture-device", status: "active", tokenHash: "fixture-hash" }],
+    credentials: [{ credentialId: "fixture-credential-1", agentId: "fixture-executor", deviceId: "fixture-device", status: "active", tokenHash: "fixture-hash", createdAt: now, lastUsedAt: null, revokedAt: null }],
     usage: { totals: { ...zeroUsage, inputTokens: 8, outputTokens: 2, totalTokens: 10 }, byAgent: [] },
     events: [],
   };

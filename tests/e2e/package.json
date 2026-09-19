@@ -7,7 +7,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "test": "node --test --test-concurrency=1 browser-foundation.test.mjs browser-contract-api.test.mjs",
+    "test": "node --test --test-concurrency=1 browser-foundation.test.mjs browser-contract-api.test.mjs browser-admin-ui.test.mjs",
     "test:live": "node --test --test-concurrency=1 browser-live-release.test.mjs"
   },
   "devDependencies": {

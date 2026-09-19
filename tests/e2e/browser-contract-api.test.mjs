@@ -36,21 +36,53 @@ test("browser E2E: executor constraint, RBAC, one-time credential, cancellation,
     assert.equal(cancelled.status, 200);
     assert.equal(cancelled.body.task.status, "cancelled");
 
+    const taskSummary = await browserRequest(page, "GET", "/api/v1/tasks?rootTaskId=fixture-root-1&view=summary");
+    assert.equal(taskSummary.status, 200);
+    assert.equal(taskSummary.body.tasks.length, 1);
+    assert.equal(Object.hasOwn(taskSummary.body.tasks[0], "output"), false);
+    assert.equal(Object.hasOwn(taskSummary.body.tasks[0].submission, "fullResult"), false);
+    assert.equal(JSON.stringify(taskSummary.body).includes("fixture private"), false);
+    const taskDetail = await browserRequest(page, "GET", "/api/v1/tasks/fixture-task-1");
+    assert.equal(taskDetail.body.task.output, "fixture private output");
+    assert.equal(taskDetail.body.task.submission.fullResult, "fixture full result");
+
+    const messageSummary = await browserRequest(page, "GET", "/api/v1/messages?rootTaskId=fixture-root-1&view=summary");
+    assert.equal(messageSummary.status, 200);
+    assert.equal(Object.hasOwn(messageSummary.body.messages[0].attachments[0], "content"), false);
+    const messageDetail = await browserRequest(page, "GET", "/api/v1/messages/fixture-message-1");
+    assert.equal(messageDetail.body.message.attachments[0].content, "fixture full result");
+
+    const csrfFailure = await page.evaluate(async () => {
+      const response = await fetch("/api/v1/admin/users", {
+        method: "POST",
+        credentials: "include",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ username: "csrf-blocked", password: "fixture-password-123", role: "operator" }),
+      });
+      return { status: response.status, body: await response.json() };
+    });
+    assert.equal(csrfFailure.status, 403);
+    assert.equal(csrfFailure.body.code, "CSRF_FAILED");
+
     const created = await browserRequest(page, "POST", "/api/v1/admin/workers", { agentId: "fixture-new-executor", deviceId: "fixture-new-device" });
     assert.equal(created.status, 201);
-    assert.match(created.body.token, /^fixture_token_/);
-    const firstToken = created.body.token;
+    assert.equal(Object.hasOwn(created.body, "token"), false, "worker token follows the frozen nested credential response");
+    assert.match(created.body.credential.token, /^fixture_token_/);
+    const firstToken = created.body.credential.token;
     const listed = await browserRequest(page, "GET", "/api/v1/admin/workers");
     assert.equal(listed.status, 200);
     assert.equal(JSON.stringify(listed.body).includes(firstToken), false, "worker token is not returned by list APIs");
-    assert.equal(listed.body.workers.some((item) => Object.hasOwn(item, "token") || Object.hasOwn(item, "tokenHash")), false);
+    assert.equal(Array.isArray(listed.body.credentials), true);
+    assert.equal(Object.hasOwn(listed.body, "workers"), false);
+    assert.equal(listed.body.credentials.some((item) => Object.hasOwn(item, "token") || Object.hasOwn(item, "tokenHash")), false);
 
     const rotated = await browserRequest(page, "POST", `/api/v1/admin/workers/${created.body.credential.credentialId}/rotate`, {});
     assert.equal(rotated.status, 200);
-    assert.match(rotated.body.token, /^fixture_token_/);
-    assert.notEqual(rotated.body.token, firstToken);
+    assert.equal(Object.hasOwn(rotated.body, "token"), false);
+    assert.match(rotated.body.credential.token, /^fixture_token_/);
+    assert.notEqual(rotated.body.credential.token, firstToken);
     const afterRotate = await browserRequest(page, "GET", "/api/v1/admin/workers");
-    assert.equal(JSON.stringify(afterRotate.body).includes(rotated.body.token), false, "rotated token is displayed only in its success response");
+    assert.equal(JSON.stringify(afterRotate.body).includes(rotated.body.credential.token), false, "rotated token is displayed only in its success response");
 
     const resolved = await browserRequest(page, "POST", "/api/v1/interventions/fixture-intervention-1/resolve", { decision: "approve" });
     assert.equal(resolved.status, 200);
@@ -66,7 +98,7 @@ test("browser E2E: executor constraint, RBAC, one-time credential, cancellation,
     await login(page, "fixture-operator", "fixture-operator-password");
     const forbidden = await browserRequest(page, "POST", "/api/v1/admin/workers", { agentId: "operator-forbidden", deviceId: "operator-device" });
     assert.equal(forbidden.status, 403);
-    assert.equal(forbidden.body.code, "ADMIN_REQUIRED");
+    assert.equal(forbidden.body.code, "FORBIDDEN");
   } finally {
     await page.close();
     await browser.close();

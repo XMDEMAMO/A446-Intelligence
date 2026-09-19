@@ -56,7 +56,11 @@ Invoke-ProjectStep -Name 'Running combined end-to-end smoke test...' -Reproduce 
   & (Join-Path $ProjectRoot 'scripts\smoke-e2e.ps1')
 }
 
-Invoke-ProjectStep -Name 'Running browser contract E2E...' -Reproduce 'cd tests\e2e; npm.cmd ci --ignore-scripts; npm.cmd test' -Action {
+Invoke-ProjectStep -Name 'Installing locked browser E2E dependencies...' -Reproduce 'cd tests\e2e; npm.cmd ci --ignore-scripts' -Action {
+  Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'tests\e2e') -Arguments @('ci', '--ignore-scripts')
+}
+
+Invoke-ProjectStep -Name 'Running browser contract E2E...' -Reproduce 'cd tests\e2e; npm.cmd test' -Action {
   Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'tests\e2e') -Arguments @('test')
 }
 
