@@ -89,7 +89,7 @@ try {
     throw 'LAN runtime test Agents did not all become ready.'
   }
 
-  $Processes += Start-TestProcess -Arguments @('node_modules/vite/bin/vite.js', '--host', $HubIp, '--port', '5173') -WorkingDirectory $WebRoot -Name 'web'
+  $Processes += Start-TestProcess -Arguments @('node_modules/vite/bin/vite.js', '--host', '0.0.0.0', '--port', '5173') -WorkingDirectory $WebRoot -Name 'web'
   $unpairedStatus = $null
   for ($attempt = 0; $attempt -lt 60; $attempt += 1) {
     try { $unpairedStatus = Get-HttpStatus -Uri "http://${HubIp}:5173/api/health" } catch {}
@@ -99,6 +99,8 @@ try {
   if ($unpairedStatus -ne 401) { throw "LAN Web guard expected HTTP 401, received $unpairedStatus." }
   $pairedStatus = Get-HttpStatus -Uri "http://${HubIp}:5173/api/health" -Headers @{ 'x-a446-lan-token' = $Token }
   if ($pairedStatus -ne 200) { throw "Paired LAN Web proxy expected HTTP 200, received $pairedStatus." }
+  $loopbackStatus = Get-HttpStatus -Uri 'http://127.0.0.1:5173/api/health' -Headers @{ 'x-a446-lan-token' = $Token }
+  if ($loopbackStatus -ne 200) { throw "Loopback LAN Web proxy expected HTTP 200, received $loopbackStatus." }
 
   [pscustomobject]@{
     result = 'PASS'
@@ -108,6 +110,7 @@ try {
     quotaStates = @($agents | ForEach-Object { $_.quotaSnapshot.state }) -join ','
     unpairedWebStatus = $unpairedStatus
     pairedWebStatus = $pairedStatus
+    loopbackWebStatus = $loopbackStatus
     realModelTasksExecuted = 0
   } | Format-List
 } finally {

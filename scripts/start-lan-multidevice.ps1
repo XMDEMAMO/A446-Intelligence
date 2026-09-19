@@ -339,9 +339,12 @@ function Start-Coordinator {
     Wait-HubReady -HubProcess $hubProcess -BaseUrl $baseUrl -Token $Token
     $workers = @(Start-ManifestWorkers -Manifest $Manifest)
     Wait-WorkersOnline -Manifest $Manifest -Processes $workers -BaseUrl $baseUrl -Token $Token
+    $localConsoleUrl = "http://127.0.0.1:$WebPort"
+    $lanConsoleUrl = "http://${Address}:$WebPort"
     Write-Host ''
     Write-Host 'A446 multi-device LAN is ready.'
-    Write-Host "Console:       http://${Address}:$WebPort"
+    Write-Host "Local console: $localConsoleUrl"
+    Write-Host "LAN console:   $lanConsoleUrl"
     Write-Host "Pairing token: $Token"
     Write-Host "Local Agents:  $(@($Manifest.workers).Count)"
     Write-Host 'Other devices: run the same package and select Worker Device.'
@@ -350,10 +353,10 @@ function Start-Coordinator {
     Write-Host ''
     $env:HUB_HTTP_URL = $baseUrl
     $env:VITE_LAN_MODE = 'true'
-    Start-Process "http://${Address}:$WebPort" | Out-Null
+    Start-Process $localConsoleUrl | Out-Null
     Push-Location $WebRoot
     try {
-      & node 'node_modules/vite/bin/vite.js' --host $Address --port $WebPort
+      & node 'node_modules/vite/bin/vite.js' --host '0.0.0.0' --port $WebPort
       if ($LASTEXITCODE -ne 0) { throw "Web console exited with code $LASTEXITCODE." }
     } finally { Pop-Location }
   } finally {
