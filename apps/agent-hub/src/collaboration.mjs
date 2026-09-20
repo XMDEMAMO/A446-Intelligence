@@ -273,7 +273,7 @@ export function taskContextBundle(task, extra = {}) {
   };
 }
 
-const WINDOWS_RESERVED_DEVICE_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$|CLOCK\$)(?:\..*|:.*)?$/i;
+const WINDOWS_RESERVED_DEVICE_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9¹²³]|LPT[1-9¹²³]|CONIN\$|CONOUT\$|CLOCK\$)(?:\..*|:.*)?$/i;
 const WINDOWS_ILLEGAL_CHARS = /[<>:"|?*\x00-\x1f]/;
 
 export function isPathSafe(filePath) {

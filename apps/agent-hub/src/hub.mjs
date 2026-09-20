@@ -2515,8 +2515,50 @@ export class AgentHub {
       }
       if (request.method === "POST" && url.pathname === "/v1/tasks") {
         const body = await readBody(request);
-        if (typeof body.input !== "string" || (!body.targetAgentId && !body.role)) return json(response, 400, { error: "string input and targetAgentId or role are required" });
-        const task = this.createTask({ ...body, sourceAgentId: actor.id });
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          return json(response, 400, { error: "Request body must be a JSON object" });
+        }
+        if (typeof body.input !== "string" || !body.input.trim() || (!body.targetAgentId && !body.role)) {
+          return json(response, 400, { error: "string input and targetAgentId or role are required" });
+        }
+
+        let root = null;
+        if (body.rootTaskId) {
+          root = this.tasks.get(String(body.rootTaskId));
+          if (!root) {
+            return json(response, 404, { error: `Unknown rootTaskId: ${body.rootTaskId}` });
+          }
+          if (root.status === "completed" || root.status === "cancelled" || root.forceCompleted) {
+            return json(response, 400, { error: "Cannot add task to a completed or cancelled workflow" });
+          }
+        }
+
+        const task = this.createTask({
+          input: body.input.trim(),
+          targetAgentId: body.targetAgentId ? String(body.targetAgentId) : null,
+          role: body.role ? String(body.role) : null,
+          rootTaskId: root ? root.taskId : null,
+          parentTaskId: root ? root.taskId : null,
+          workflow: root?.workflow ?? null,
+          quotaReserved: false,
+          forceCompleted: null,
+          superseded: false,
+          revision: 1,
+          reviewCycle: 0,
+          attemptNumber: 0,
+          currentAttemptId: null,
+          recoveryCount: 0,
+          status: body.requiresApproval ? "awaiting_approval" : "queued",
+          sourceAgentId: actor.id,
+          sourceRole: actor.role === "admin" || actor.id === "human" || actor.id.startsWith("user:") ? "human" : "agent",
+          requiredCapabilities: Array.isArray(body.requiredCapabilities) ? body.requiredCapabilities.map(String) : [],
+          modelPreference: body.modelPreference ?? body.model ?? null,
+          reasoningEffort: body.reasoningEffort ?? null,
+          taskSpec: body.taskSpec && typeof body.taskSpec === "object" ? body.taskSpec : null,
+          metadata: body.metadata && typeof body.metadata === "object" ? body.metadata : {},
+          route: Array.isArray(body.route) ? body.route.map(String) : [],
+          requiresApproval: Boolean(body.requiresApproval),
+        });
         await this.queueOrDispatch(task);
         await this.commitAndDispatch();
         return json(response, 202, { task });

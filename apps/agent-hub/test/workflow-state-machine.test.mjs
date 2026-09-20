@@ -769,6 +769,112 @@ test("preview13: 50th invocation result with decision 'complete' is processed an
   assert.equal(hub.isWorkflowComplete(root.taskId), true);
 });
 
+test("preview14: HTTP POST /v1/tasks enforces strict whitelist DTO and blocks 50-limit bypass", async () => {
+  const hub = new AgentHub({
+    host: "127.0.0.1",
+    port: 0,
+    delivery: { ackTimeoutMs: 50, maxAttemptsPerConnection: 2 },
+    logs: { includePayloads: true },
+  });
+  await hub.start();
+
+  try {
+    const executor = agent("executor-http-1", "executor");
+    hub.agents.set("executor-http-1", executor);
+
+    // Root workflow already reached 50 invocations and is currently active
+    const root = hub.createTask({
+      input: "Maxed out workflow",
+      role: "planner",
+      workflow: { enabled: true, totalInvocations: 50, executorAgentId: "executor-http-1" },
+    });
+    root.status = "running";
+
+    // 1. Client attempts to forge quotaReserved: true and workflow.enabled: true via HTTP POST /v1/tasks
+    const res1 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: root.taskId,
+        input: "attempt to bypass quota via quotaReserved",
+        targetAgentId: "executor-http-1",
+        workflow: { enabled: true },
+        quotaReserved: true,
+      }),
+    });
+    assert.equal(res1.status, 202);
+    const data1 = await res1.json();
+    const created1 = hub.tasks.get(data1.task.taskId);
+    assert.ok(created1);
+    assert.equal(created1.quotaReserved, false, "Client cannot forge quotaReserved: true");
+    assert.equal(created1.status, "failed", "Task failed due to 50 invocation circuit breaker");
+    assert.equal(created1.error?.name, "CircuitBreakerError");
+    assert.equal(root.workflow.totalInvocations, 50, "Total invocations capped at 50");
+    const intervention1 = [...hub.interventions.values()].find((i) => i.taskId === created1.taskId && i.question?.includes("50次"));
+    assert.ok(intervention1, "Human intervention created on circuit breaker");
+
+    // 2. Client attempts to bypass workflow via workflow.enabled: false
+    const res2 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: root.taskId,
+        input: "attempt to bypass workflow via enabled: false",
+        targetAgentId: "executor-http-1",
+        workflow: { enabled: false },
+      }),
+    });
+    assert.equal(res2.status, 202);
+    const data2 = await res2.json();
+    const created2 = hub.tasks.get(data2.task.taskId);
+    assert.ok(created2);
+    assert.equal(created2.workflow?.enabled, true, "Workflow configuration strictly inherited from root");
+    assert.equal(created2.status, "failed", "Task halted by circuit breaker");
+    assert.equal(root.workflow.totalInvocations, 50, "Total invocations did not exceed 50");
+
+    // 3. Client attempts to forge internal fields (forceCompleted, superseded, revision, status)
+    const res3 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        input: "standalone task with forged state",
+        targetAgentId: "executor-http-1",
+        forceCompleted: true,
+        superseded: true,
+        revision: 99,
+        attemptNumber: 10,
+        currentAttemptId: "fake-id",
+        status: "completed",
+      }),
+    });
+    assert.equal(res3.status, 202);
+    const data3 = await res3.json();
+    const created3 = hub.tasks.get(data3.task.taskId);
+    assert.ok(created3);
+    assert.equal(created3.forceCompleted, null, "forceCompleted cannot be forged");
+    assert.equal(created3.superseded, false, "superseded cannot be forged");
+    assert.equal(created3.revision, 1, "revision reset to 1");
+    assert.notEqual(created3.status, "completed", "status cannot be forged to completed");
+
+    // 4. Client attempts to add task to a completed workflow -> HTTP 400
+    root.status = "completed";
+    const res4 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: root.taskId,
+        input: "attempt to add task to completed workflow",
+        targetAgentId: "executor-http-1",
+      }),
+    });
+    assert.equal(res4.status, 400);
+    const data4 = await res4.json();
+    assert.match(data4.error, /Cannot add task to a completed or cancelled workflow/);
+  } finally {
+    await hub.stop();
+  }
+});
+
 function agent(agentId, role) {
   return {
     agentId,

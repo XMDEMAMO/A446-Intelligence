@@ -550,3 +550,30 @@ test("preview13: isPathSafe blocks NTFS ADS, reserved devices, and illegal Windo
   assert.equal(isPathSafe("README.md"), true);
 });
 
+test("preview14: isPathSafe blocks Windows superscript device names COM¹/²/³ and LPT¹/²/³", () => {
+  // Direct names with superscript digits 1, 2, 3
+  assert.equal(isPathSafe("COM¹"), false);
+  assert.equal(isPathSafe("COM²"), false);
+  assert.equal(isPathSafe("COM³"), false);
+  assert.equal(isPathSafe("LPT¹"), false);
+  assert.equal(isPathSafe("LPT²"), false);
+  assert.equal(isPathSafe("LPT³"), false);
+
+  // Case insensitivity
+  assert.equal(isPathSafe("com¹"), false);
+  assert.equal(isPathSafe("lpt²"), false);
+
+  // With extensions
+  assert.equal(isPathSafe("COM¹.txt"), false);
+  assert.equal(isPathSafe("com².json"), false);
+  assert.equal(isPathSafe("LPT³.log"), false);
+
+  // Nested in directories
+  assert.equal(isPathSafe("sub/nested/COM¹.txt"), false);
+  assert.equal(isPathSafe("dir/LPT².data"), false);
+
+  // Normal safe filenames that are not COM/LPT
+  assert.equal(isPathSafe("test¹.txt"), true);
+  assert.equal(isPathSafe("common.txt"), true);
+});
+
