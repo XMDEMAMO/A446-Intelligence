@@ -1008,13 +1008,28 @@ export class AgentHub {
     });
   }
 
+  getCanonicalRootTask(taskIdOrTask) {
+    if (!taskIdOrTask) return null;
+    let current = typeof taskIdOrTask === "string" ? this.tasks.get(taskIdOrTask) : taskIdOrTask;
+    if (!current) return null;
+    const visited = new Set();
+    while (current && current.rootTaskId && current.rootTaskId !== current.taskId && !visited.has(current.taskId)) {
+      visited.add(current.taskId);
+      const parent = this.tasks.get(current.rootTaskId);
+      if (!parent) break;
+      current = parent;
+    }
+    return current;
+  }
+
   reserveWorkflowInvocations(rootTaskId, count = 1) {
-    const root = this.tasks.get(rootTaskId);
+    const root = this.getCanonicalRootTask(rootTaskId);
     if (!root) return { ok: true, current: 0, requested: count };
     if (!root.workflow?.enabled) return { ok: true, current: 0, requested: count };
 
     root.workflow = { ...(root.workflow ?? {}) };
-    const childTasks = [...this.tasks.values()].filter((t) => t.rootTaskId === rootTaskId && t.taskId !== rootTaskId);
+    const canonicalRootTaskId = root.taskId;
+    const childTasks = [...this.tasks.values()].filter((t) => (t.rootTaskId === canonicalRootTaskId || this.getCanonicalRootTask(t)?.taskId === canonicalRootTaskId) && t.taskId !== canonicalRootTaskId);
     const current = Math.max(childTasks.length, Number(root.workflow.totalInvocations ?? 0));
     if (current + count > 50) {
       return {
@@ -1030,7 +1045,7 @@ export class AgentHub {
   }
 
   refundWorkflowInvocation(rootTaskId, count = 1) {
-    const root = this.tasks.get(rootTaskId);
+    const root = this.getCanonicalRootTask(rootTaskId);
     if (!root?.workflow?.enabled) return;
     const current = Number(root.workflow.totalInvocations ?? 0);
     root.workflow = { ...(root.workflow ?? {}) };
@@ -1404,7 +1419,7 @@ export class AgentHub {
   }
 
   createIntervention(task, options = {}) {
-    const root = this.tasks.get(task.rootTaskId) ?? task;
+    const root = this.getCanonicalRootTask(task.rootTaskId ?? task) ?? task;
     const kind = String(options.kind ?? "workflow_input");
     const duplicate = [...this.interventions.values()].find((item) => (
       item.taskId === task.taskId && item.kind === kind && item.status === "pending"
@@ -1454,8 +1469,10 @@ export class AgentHub {
   }
 
   currentIntervention(rootTaskId) {
+    const root = this.getCanonicalRootTask(rootTaskId);
+    const targetId = root ? root.taskId : rootTaskId;
     const matching = [...this.interventions.values()]
-      .filter((item) => item.rootTaskId === rootTaskId)
+      .filter((item) => item.rootTaskId === targetId)
       .sort((a, b) => Date.parse(b.requestedAt) - Date.parse(a.requestedAt));
     return matching.find((item) => item.status === "pending") ?? matching[0] ?? null;
   }
@@ -1478,9 +1495,9 @@ export class AgentHub {
   }
 
   syncRootIntervention(rootTaskId) {
-    const root = this.tasks.get(rootTaskId);
+    const root = this.getCanonicalRootTask(rootTaskId);
     if (!root) return;
-    root.humanIntervention = this.publicIntervention(this.currentIntervention(rootTaskId), true);
+    root.humanIntervention = this.publicIntervention(this.currentIntervention(root.taskId), true);
     this.markTask(root);
   }
 
@@ -1673,19 +1690,20 @@ export class AgentHub {
   }
 
   isWorkflowComplete(rootTaskId) {
-    const root = this.tasks.get(rootTaskId);
+    const root = this.getCanonicalRootTask(rootTaskId);
     if (!root) return false;
     if (root.forceCompleted) return true;
     if (!root.workflow?.enabled) {
       return root.status === "completed";
     }
 
-    const tasks = [...this.tasks.values()].filter((t) => t.rootTaskId === rootTaskId);
+    const canonicalRootTaskId = root.taskId;
+    const tasks = [...this.tasks.values()].filter((t) => t.rootTaskId === canonicalRootTaskId || this.getCanonicalRootTask(t)?.taskId === canonicalRootTaskId);
     const activeTasks = tasks.filter((t) => !t.superseded);
 
     // Pillar 4: No active tasks, no pending interventions, no failed/rejected tasks among non-superseded tasks
     if (activeTasks.some((t) => ACTIVE_TASK_STATUSES.has(t.status))) return false;
-    const currentIntervention = this.currentIntervention(rootTaskId);
+    const currentIntervention = this.currentIntervention(canonicalRootTaskId);
     if (currentIntervention && currentIntervention.status === "pending") return false;
     if (activeTasks.some((t) => ["failed", "rejected"].includes(t.status))) return false;
 
@@ -1716,14 +1734,14 @@ export class AgentHub {
   }
 
   checkAndFinalizeWorkflow(rootTaskId) {
-    const root = this.tasks.get(rootTaskId);
+    const root = this.getCanonicalRootTask(rootTaskId);
     if (!root) return;
-    if (this.isWorkflowComplete(rootTaskId)) {
+    if (this.isWorkflowComplete(root.taskId)) {
       root.status = "completed";
       root.completedAt = new Date().toISOString();
       this.finishTaskActivity(root);
       this.markTask(root);
-      this.queueEvent("workflow.completed", { rootTaskId });
+      this.queueEvent("workflow.completed", { rootTaskId: root.taskId });
     }
   }
 
@@ -1791,7 +1809,7 @@ export class AgentHub {
   async queueOrDispatch(task) {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
     if (task.workflow?.enabled && !task.quotaReserved) {
-      const root = this.tasks.get(task.rootTaskId) ?? task;
+      const root = this.getCanonicalRootTask(task.rootTaskId ?? task) ?? task;
       const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
       if (!reservation.ok) {
         task.status = "failed";
@@ -2524,10 +2542,16 @@ export class AgentHub {
 
         let root = null;
         if (body.rootTaskId) {
-          root = this.tasks.get(String(body.rootTaskId));
-          if (!root) {
+          const referenced = this.tasks.get(String(body.rootTaskId));
+          if (!referenced) {
             return json(response, 404, { error: `Unknown rootTaskId: ${body.rootTaskId}` });
           }
+          if ((referenced.rootTaskId && referenced.rootTaskId !== referenced.taskId) || Boolean(referenced.parentTaskId)) {
+            return json(response, 400, {
+              error: `Task ${body.rootTaskId} is a child task, not a root task. rootTaskId must reference the root workflow task.`,
+            });
+          }
+          root = this.getCanonicalRootTask(referenced) ?? referenced;
           if (root.status === "completed" || root.status === "cancelled" || root.forceCompleted) {
             return json(response, 400, { error: "Cannot add task to a completed or cancelled workflow" });
           }

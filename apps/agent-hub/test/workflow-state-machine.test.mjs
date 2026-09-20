@@ -875,6 +875,93 @@ test("preview14: HTTP POST /v1/tasks enforces strict whitelist DTO and blocks 50
   }
 });
 
+test("preview15: HTTP POST /v1/tasks blocks child task ID spoofing and enforces canonical root 50-limit circuit breaker", async () => {
+  const hub = new AgentHub({
+    host: "127.0.0.1",
+    port: 0,
+    delivery: { ackTimeoutMs: 50, maxAttemptsPerConnection: 2 },
+    logs: { includePayloads: true },
+  });
+  await hub.start();
+
+  try {
+    const executor = agent("executor-spoof-1", "executor");
+    hub.agents.set("executor-spoof-1", executor);
+
+    // Authoritative root workflow already reached 50 invocations and is active
+    const root = hub.createTask({
+      input: "Canonical root workflow",
+      role: "planner",
+      workflow: { enabled: true, totalInvocations: 50, executorAgentId: "executor-spoof-1" },
+    });
+    root.status = "running";
+
+    // Existing child task under the root (has stale totalInvocations snapshot of 1)
+    const child = hub.createTask({
+      input: "Child task under canonical root",
+      role: "executor",
+      rootTaskId: root.taskId,
+      parentTaskId: root.taskId,
+      workflow: { ...root.workflow, totalInvocations: 1 },
+    });
+    child.status = "failed";
+
+    // 1. Client attempts to spoof child task ID as rootTaskId -> HTTP 400
+    const res1 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: child.taskId,
+        input: "attempt to bypass 50 quota by passing child taskId as rootTaskId",
+        targetAgentId: "executor-spoof-1",
+      }),
+    });
+    assert.equal(res1.status, 400, "Child task ID must be rejected as rootTaskId");
+    const data1 = await res1.json();
+    assert.match(data1.error, /is a child task, not a root task/);
+    assert.equal(root.workflow.totalInvocations, 50, "Canonical root invocation count untouched");
+    const childrenOfChild = [...hub.tasks.values()].filter((t) => t.rootTaskId === child.taskId);
+    assert.equal(childrenOfChild.length, 0, "No new task created under child task");
+
+    // 2. Client passes non-existent rootTaskId -> HTTP 404
+    const res2 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: "non-existent-task-id",
+        input: "attempt with non-existent root",
+        targetAgentId: "executor-spoof-1",
+      }),
+    });
+    assert.equal(res2.status, 404);
+    const data2 = await res2.json();
+    assert.match(data2.error, /Unknown rootTaskId/);
+
+    // 3. Client passes legitimate canonical rootTaskId -> 50-limit circuit breaker triggers
+    const res3 = await fetch(`${hub.url()}/v1/tasks`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        rootTaskId: root.taskId,
+        input: "task under legitimate canonical root",
+        targetAgentId: "executor-spoof-1",
+      }),
+    });
+    assert.equal(res3.status, 202);
+    const data3 = await res3.json();
+    const created = hub.tasks.get(data3.task.taskId);
+    assert.ok(created);
+    assert.equal(created.rootTaskId, root.taskId);
+    assert.equal(created.status, "failed", "Task immediately marked failed by 50-limit circuit breaker");
+    assert.equal(created.error?.name, "CircuitBreakerError");
+    assert.equal(root.workflow.totalInvocations, 50, "Total invocations remain capped at 50");
+    const intervention = [...hub.interventions.values()].find((i) => i.rootTaskId === root.taskId && i.question?.includes("50次"));
+    assert.ok(intervention, "Human intervention created on canonical root task");
+  } finally {
+    await hub.stop();
+  }
+});
+
 function agent(agentId, role) {
   return {
     agentId,
