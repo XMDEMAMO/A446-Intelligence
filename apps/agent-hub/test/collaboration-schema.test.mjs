@@ -457,3 +457,96 @@ test("preview12: duplicate task fingerprint includes requiredCapabilities and re
   assert.match(sameEverything.error, /完全重复的子任务规划/);
 });
 
+test("preview13: strict schema rejects non-array assignments and mutually exclusive human fields", () => {
+  // 1. assignments as object instead of array in planning rejected
+  const objAssignmentsPlanning = parseRoleSubmission("planner", "planning", JSON.stringify({
+    brief: "Object assignments",
+    assignments: { "0": { title: "T", instructions: "I" } },
+  }));
+  assert.equal(objAssignmentsPlanning.ok, false);
+  assert.match(objAssignmentsPlanning.error, /assignments.*必须为数组/);
+
+  // 2. assignments as object with needsHuman: true in planning rejected
+  const objAssignmentsWithHuman = parseRoleSubmission("planner", "planning", JSON.stringify({
+    brief: "Object assignments with human",
+    needsHuman: true,
+    assignments: { "0": { title: "T", instructions: "I" } },
+  }));
+  assert.equal(objAssignmentsWithHuman.ok, false);
+  assert.match(objAssignmentsWithHuman.error, /assignments.*必须为数组/);
+
+  // 3. result_intake decision 'complete' with needsHuman rejected
+  const completeWithNeedsHuman = parseRoleSubmission("planner", "result_intake", JSON.stringify({
+    decision: "complete",
+    brief: "All done",
+    needsHuman: true,
+  }));
+  assert.equal(completeWithNeedsHuman.ok, false);
+  assert.match(completeWithNeedsHuman.error, /不得声明 needsHuman/);
+
+  // 4. result_intake decision 'complete' with humanQuestion rejected
+  const completeWithHumanQuestion = parseRoleSubmission("planner", "result_intake", JSON.stringify({
+    decision: "complete",
+    brief: "All done",
+    humanQuestion: "Should I do something else?",
+  }));
+  assert.equal(completeWithHumanQuestion.ok, false);
+  assert.match(completeWithHumanQuestion.error, /不得提供 humanQuestion/);
+
+  // 5. result_intake decision 'complete' with object assignments rejected
+  const completeWithObjAssignments = parseRoleSubmission("planner", "result_intake", JSON.stringify({
+    decision: "complete",
+    brief: "All done",
+    assignments: { key: "val" },
+  }));
+  assert.equal(completeWithObjAssignments.ok, false);
+  assert.match(completeWithObjAssignments.error, /assignments.*必须为数组/);
+
+  // 6. result_intake decision 'needs_human' with object assignments rejected
+  const humanWithObjAssignments = parseRoleSubmission("planner", "result_intake", JSON.stringify({
+    decision: "needs_human",
+    brief: "Help needed",
+    assignments: { key: "val" },
+  }));
+  assert.equal(humanWithObjAssignments.ok, false);
+  assert.match(humanWithObjAssignments.error, /assignments.*必须为数组/);
+
+  // 7. planning stage with humanQuestion when needsHuman is false rejected
+  const planningQuestionWithoutNeedsHuman = parseRoleSubmission("planner", "planning", JSON.stringify({
+    brief: "Plan with stray question",
+    needsHuman: false,
+    humanQuestion: "Is this correct?",
+    assignments: [{ title: "T", instructions: "I" }],
+  }));
+  assert.equal(planningQuestionWithoutNeedsHuman.ok, false);
+  assert.match(planningQuestionWithoutNeedsHuman.error, /未声明 needsHuman: true 时不得提供 humanQuestion/);
+});
+
+test("preview13: isPathSafe blocks NTFS ADS, reserved devices, and illegal Windows chars", () => {
+  // NTFS Alternate Data Streams (colon)
+  assert.equal(isPathSafe("safe.txt:secret"), false);
+  assert.equal(isPathSafe("dir/safe.txt:secret"), false);
+
+  // Reserved DOS devices
+  assert.equal(isPathSafe("CON:stream"), false);
+  assert.equal(isPathSafe("CONIN$"), false);
+  assert.equal(isPathSafe("CONOUT$"), false);
+  assert.equal(isPathSafe("CLOCK$"), false);
+  assert.equal(isPathSafe("conin$"), false);
+  assert.equal(isPathSafe("NUL.txt"), false);
+  assert.equal(isPathSafe("sub/COM1.dat"), false);
+  assert.equal(isPathSafe("LPT1"), false);
+
+  // Windows illegal path characters
+  assert.equal(isPathSafe("foo?.txt"), false);
+  assert.equal(isPathSafe("foo*bar"), false);
+  assert.equal(isPathSafe("foo<bar>"), false);
+  assert.equal(isPathSafe("foo\"bar"), false);
+  assert.equal(isPathSafe("foo|bar"), false);
+
+  // Legitimate paths remain safe
+  assert.equal(isPathSafe("valid/path/file.txt"), true);
+  assert.equal(isPathSafe("src/components/Button.tsx"), true);
+  assert.equal(isPathSafe("README.md"), true);
+});
+

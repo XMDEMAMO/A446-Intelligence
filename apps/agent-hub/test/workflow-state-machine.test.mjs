@@ -640,6 +640,135 @@ test("preview12: workflow.force_complete cancels active child tasks, closes inte
   assert.equal(afterConv.status, "completed");
 });
 
+test("preview13: lease retry consumes quota, reaching 50 causes circuit breaker and human intervention", async () => {
+  const hub = new AgentHub({
+    host: "127.0.0.1",
+    port: 0,
+    delivery: { ackTimeoutMs: 50, maxAttemptsPerConnection: 2 },
+    leases: { enabled: true, ttlMs: 1000, scanIntervalMs: 60_000 },
+    logs: { includePayloads: false },
+  });
+
+  const worker = {
+    ...agent("executor-lease-1", "executor"),
+    protocolFeatures: ["attempt-lease-v1"],
+  };
+  hub.agents.set("executor-lease-1", worker);
+
+  const root = hub.createTask({
+    input: "Workflow with lease retry",
+    role: "planner",
+    workflow: { enabled: true, totalInvocations: 49 },
+  });
+
+  const task = hub.createTask({
+    targetAgentId: worker.agentId,
+    rootTaskId: root.taskId,
+    role: "executor",
+    input: "Retry safe task",
+    taskSpec: { execution_policy: { side_effects: "none", on_lease_expiry: "retry" } },
+    workflow: root.workflow,
+  });
+
+  // First dispatch: 49 -> 50
+  await hub.queueOrDispatch(task);
+  assert.equal(task.status, "dispatched");
+  assert.equal(root.workflow.totalInvocations, 50);
+  assert.equal(task.quotaReserved, false, "quotaReserved was reset after dispatch");
+
+  const attempt = hub.attempts.get(task.currentAttemptId);
+  assert.ok(attempt);
+  attempt.leaseExpiresAt = new Date(Date.now() - 100).toISOString();
+
+  // Lease expires and tries to re-dispatch attempt 2
+  // But quota is already 50, so next attempt 50 + 1 = 51 is blocked by circuit breaker!
+  await hub.reapExpiredLeases();
+
+  // Task should have failed with CircuitBreakerError and human intervention triggered
+  assert.equal(task.status, "failed");
+  assert.equal(task.error?.name, "CircuitBreakerError");
+  assert.equal(root.workflow.totalInvocations, 50, "Did not exceed 50 invocations");
+
+  const intervention = [...hub.interventions.values()].find((i) => i.question?.includes("上限（50次）"));
+  assert.ok(intervention, "Circuit breaker created human intervention on lease retry");
+});
+
+test("preview13: 50th invocation result with decision 'complete' is processed and finalizes workflow", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  const planner = agent("planner-1", "planner");
+  const executor = agent("executor-1", "executor");
+  const reviewer = agent("reviewer-1", "reviewer");
+  hub.agents.set("planner-1", planner);
+  hub.agents.set("executor-1", executor);
+  hub.agents.set("reviewer-1", reviewer);
+
+  const root = hub.createTask({
+    input: "Finish on 50th invocation",
+    role: "planner",
+    workflow: {
+      enabled: true,
+      plannerAgentId: "planner-1",
+      executorAgentId: "executor-1",
+      reviewerAgentId: "reviewer-1",
+      totalInvocations: 49,
+    },
+  });
+  root.status = "completed";
+
+  // Create an approved executor task
+  const exec = hub.createTask({
+    input: "Exec subtask",
+    rootTaskId: root.taskId,
+    role: "executor",
+    targetAgentId: "executor-1",
+    workflow: root.workflow,
+  });
+  exec.status = "completed";
+  exec.reviewStatus = "approved";
+  exec.submission = { brief: "done", fullResult: "code ready" };
+
+  // Create reviewer task confirming approval
+  const rev = hub.createTask({
+    input: "Review subtask",
+    rootTaskId: root.taskId,
+    parentTaskId: exec.taskId,
+    role: "reviewer",
+    targetAgentId: "reviewer-1",
+    workflow: root.workflow,
+  });
+  rev.status = "completed";
+  rev.submission = { verdict: "approved", brief: "looks good" };
+
+  // Create the 50th task: planner result_intake
+  const intakeTask = hub.createTask({
+    input: "Intake task",
+    rootTaskId: root.taskId,
+    parentTaskId: exec.taskId,
+    role: "planner",
+    stage: "result_intake",
+    targetAgentId: "planner-1",
+    workflow: root.workflow,
+  });
+
+  // Set totalInvocations to 50
+  root.workflow.totalInvocations = 50;
+
+  intakeTask.submission = {
+    decision: "complete",
+    brief: "All deliverables verified, complete workflow",
+    assignments: [],
+  };
+  intakeTask.status = "completed";
+
+  // advanceWorkflow should NOT be blocked by >= 50, but should accept complete and finalize!
+  await hub.advanceWorkflow(intakeTask);
+
+  assert.equal(intakeTask.workflowDecision, "complete");
+  assert.equal(root.status, "completed", "Root workflow marked completed on 50th invocation");
+  assert.equal(root.workflow.totalInvocations, 50, "Invocations capped at 50");
+  assert.equal(hub.isWorkflowComplete(root.taskId), true);
+});
+
 function agent(agentId, role) {
   return {
     agentId,

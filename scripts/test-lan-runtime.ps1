@@ -102,12 +102,15 @@ try {
   $loopbackStatus = Get-HttpStatus -Uri 'http://127.0.0.1:5173/api/health' -Headers @{ 'x-a446-lan-token' = $Token }
   if ($loopbackStatus -ne 200) { throw "Loopback LAN Web proxy expected HTTP 200, received $loopbackStatus." }
 
+  $onlineAgents = @($agents | Where-Object { $_.status -eq 'online' })
   [pscustomobject]@{
     result = 'PASS'
-    agents = @($agents).Count
-    providers = @($agents | ForEach-Object { $_.account.provider }) -join ','
-    modelCounts = @($agents | ForEach-Object { @($_.models).Count }) -join ','
-    quotaStates = @($agents | ForEach-Object { $_.quotaSnapshot.state }) -join ','
+    configuredWorkers = @($manifest.workers).Count
+    onlineWorkers = @($onlineAgents).Count
+    historicalRecords = @($agents).Count
+    providers = @($onlineAgents | ForEach-Object { $_.account.provider }) -join ','
+    modelCounts = @($onlineAgents | ForEach-Object { @($_.models).Count }) -join ','
+    quotaStates = @($onlineAgents | ForEach-Object { $_.quotaSnapshot.state }) -join ','
     unpairedWebStatus = $unpairedStatus
     pairedWebStatus = $pairedStatus
     loopbackWebStatus = $loopbackStatus

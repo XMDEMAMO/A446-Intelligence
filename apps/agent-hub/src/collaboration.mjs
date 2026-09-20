@@ -273,13 +273,15 @@ export function taskContextBundle(task, extra = {}) {
   };
 }
 
-const WINDOWS_RESERVED_DEVICE_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\..*)?$/i;
+const WINDOWS_RESERVED_DEVICE_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$|CLOCK\$)(?:\..*|:.*)?$/i;
+const WINDOWS_ILLEGAL_CHARS = /[<>:"|?*\x00-\x1f]/;
 
 export function isPathSafe(filePath) {
   if (!filePath || typeof filePath !== "string") return false;
   if (filePath.trim() !== filePath) return false;
   const trimmed = filePath.trim();
   if (!trimmed) return false;
+  if (WINDOWS_ILLEGAL_CHARS.test(trimmed)) return false;
   if (/^[a-zA-Z]:/i.test(trimmed) || trimmed.startsWith("/") || trimmed.startsWith("\\")) {
     return false;
   }
@@ -291,7 +293,7 @@ export function isPathSafe(filePath) {
   for (const seg of segments) {
     if (!seg || seg === ".." || seg === ".") return false;
     if (WINDOWS_RESERVED_DEVICE_NAMES.test(seg)) return false;
-    if (/[\s.]$/.test(seg)) return false;
+    if (/[\s.]$/.test(seg) || /^\s/.test(seg)) return false;
   }
   return true;
 }
@@ -370,6 +372,14 @@ export function validateRoleSubmission(role, stage, parsed) {
   }
 
   if (role === "planner") {
+    if (parsed.assignments !== undefined && parsed.assignments !== null && !Array.isArray(parsed.assignments)) {
+      return {
+        ok: false,
+        value: null,
+        error: "Planner submission 的 'assignments' 必须为数组，不能为对象或其他类型",
+      };
+    }
+
     if (stage === "result_intake") {
       const allowedDecisions = new Set(["complete", "continue", "needs_human"]);
       const decision = String(parsed.decision ?? "").toLowerCase().trim();
@@ -385,6 +395,20 @@ export function validateRoleSubmission(role, stage, parsed) {
         return { ok: false, value: null, error: "result_intake submission must contain a non-empty 'brief'" };
       }
       if (decision === "complete") {
+        if (parsed.needsHuman || parsed.needs_human) {
+          return {
+            ok: false,
+            value: null,
+            error: "decision 为 'complete' 时不得声明 needsHuman；如需人工介入请使用 decision: 'needs_human'。",
+          };
+        }
+        if (parsed.humanQuestion || parsed.human_question) {
+          return {
+            ok: false,
+            value: null,
+            error: "decision 为 'complete' 时不得提供 humanQuestion；如需人工介入请使用 decision: 'needs_human'。",
+          };
+        }
         if (Array.isArray(parsed.assignments) && parsed.assignments.length > 0) {
           return {
             ok: false,
@@ -411,7 +435,11 @@ export function validateRoleSubmission(role, stage, parsed) {
             error: "decision 为 'needs_human' 时不得附带任何子任务分配；请求人工介入与下发子任务不可混用。",
           };
         }
-        const humanQuestion = parsed.humanQuestion ? cleanText(parsed.humanQuestion, 2000) : brief;
+        const humanQuestion = parsed.humanQuestion
+          ? cleanText(parsed.humanQuestion, 2000)
+          : parsed.human_question
+            ? cleanText(parsed.human_question, 2000)
+            : brief;
         return {
           ok: true,
           value: {
@@ -429,6 +457,13 @@ export function validateRoleSubmission(role, stage, parsed) {
           ok: false,
           value: null,
           error: "decision 为 'continue' 时不得声明 needsHuman；如需人工介入请使用 decision: 'needs_human'。",
+        };
+      }
+      if (parsed.humanQuestion || parsed.human_question) {
+        return {
+          ok: false,
+          value: null,
+          error: "decision 为 'continue' 时不得提供 humanQuestion；如需人工介入请使用 decision: 'needs_human'。",
         };
       }
       const assignmentsResult = validateAssignments(parsed.assignments);
@@ -474,6 +509,13 @@ export function validateRoleSubmission(role, stage, parsed) {
           needsHuman: true,
           humanQuestion: humanQuestion || brief,
         },
+      };
+    }
+    if (humanQuestion) {
+      return {
+        ok: false,
+        value: null,
+        error: "未声明 needsHuman: true 时不得提供 humanQuestion；如需请求人工介入请声明 needsHuman: true。",
       };
     }
     const assignmentsResult = validateAssignments(parsed.assignments);

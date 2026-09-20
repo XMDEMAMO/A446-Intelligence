@@ -1014,7 +1014,8 @@ export class AgentHub {
     if (!root.workflow?.enabled) return { ok: true, current: 0, requested: count };
 
     root.workflow = { ...(root.workflow ?? {}) };
-    const current = Number(root.workflow.totalInvocations ?? 0);
+    const childTasks = [...this.tasks.values()].filter((t) => t.rootTaskId === rootTaskId && t.taskId !== rootTaskId);
+    const current = Math.max(childTasks.length, Number(root.workflow.totalInvocations ?? 0));
     if (current + count > 50) {
       return {
         ok: false,
@@ -1040,14 +1041,6 @@ export class AgentHub {
   async advanceWorkflow(task) {
     const submission = task.submission ?? {};
     const root = this.tasks.get(task.rootTaskId) ?? task;
-
-    // Resource limits: Max 50 agent calls per workflow
-    const workflowTasks = [...this.tasks.values()].filter((t) => t.rootTaskId === task.rootTaskId);
-    const currentInvocations = Math.max(workflowTasks.length, Number(root.workflow?.totalInvocations ?? 0));
-    if (currentInvocations >= 50) {
-      this.requireHuman(task, `工作流累计任务调用已达上限（50次），当前已执行 ${currentInvocations} 次，已自动熔断暂停。请人工介入审查。`);
-      return;
-    }
 
     if (task.role === "planner") {
       if (task.stage === "result_intake") {
@@ -1855,6 +1848,7 @@ export class AgentHub {
     task.schedulingErrorDetails = null;
     task.status = "dispatched";
     task.dispatchedAt = new Date().toISOString();
+    task.quotaReserved = false;
     if (!task.activeSlotAgentId) {
       task.activeSlotAgentId = agent.agentId;
       agent.activeTaskCount = Number(agent.activeTaskCount ?? 0) + 1;
