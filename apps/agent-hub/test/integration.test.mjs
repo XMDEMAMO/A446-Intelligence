@@ -119,6 +119,40 @@ test("workflow creation reports invalid explicit executors without creating task
   }
 });
 
+test("multi-task conversation status preserves cancellation and failure precedence", async () => {
+  const hub = await new AgentHub({ host: "127.0.0.1", port: 0, logs: { includePayloads: false } }).start();
+  const createPair = (label) => {
+    const root = hub.createTask({ input: `${label} root` });
+    const child = hub.createTask({ input: `${label} child`, rootTaskId: root.taskId, parentTaskId: root.taskId });
+    return { root, child };
+  };
+  const conversationStatus = (rootTaskId) => hub.conversations().find((item) => item.rootTaskId === rootTaskId)?.status;
+  try {
+    const allCancelled = createPair("all cancelled");
+    await hub.handleCommand({ type: "task.cancel", taskId: allCancelled.root.taskId });
+    assert.equal(conversationStatus(allCancelled.root.taskId), "active");
+    await hub.handleCommand({ type: "task.cancel", taskId: allCancelled.child.taskId });
+    assert.equal(conversationStatus(allCancelled.root.taskId), "cancelled");
+
+    const failed = createPair("failed child");
+    await hub.handleCommand({ type: "task.cancel", taskId: failed.root.taskId });
+    failed.child.status = "failed";
+    failed.child.completedAt = new Date().toISOString();
+    hub.markTask(failed.child);
+    assert.equal(conversationStatus(failed.root.taskId), "failed");
+
+    const completedUpstream = createPair("completed upstream");
+    completedUpstream.root.status = "completed";
+    completedUpstream.root.completedAt = new Date().toISOString();
+    hub.markTask(completedUpstream.root);
+    assert.equal(conversationStatus(completedUpstream.root.taskId), "active");
+    await hub.handleCommand({ type: "task.cancel", taskId: completedUpstream.child.taskId });
+    assert.equal(conversationStatus(completedUpstream.root.taskId), "completed");
+  } finally {
+    await hub.stop();
+  }
+});
+
 test("conversation cancellation and summary reads preserve full-result detail", async () => {
   const hub = await new AgentHub({ host: "127.0.0.1", port: 0, logs: { includePayloads: false } }).start();
   try {
@@ -129,10 +163,15 @@ test("conversation cancellation and summary reads preserve full-result detail", 
     const message = hub.addMessage(task, { text: "result", attachments: [{ type: "full_result", content: "private attachment", taskId: task.taskId }] });
     const taskList = await (await fetch(`${hub.url()}/v1/tasks?rootTaskId=${task.taskId}&view=summary`)).json();
     assert.equal(taskList.tasks.length, 1);
+    assert.equal(Object.hasOwn(taskList.tasks[0], "output"), false);
+    assert.equal(Object.hasOwn(taskList.tasks[0].submission, "fullResult"), false);
+    assert.equal(Object.hasOwn(taskList.tasks[0].contextBundle, "fullResult"), false);
     assert.equal(JSON.stringify(taskList).includes("private"), false);
     const fullTask = await (await fetch(`${hub.url()}/v1/tasks/${task.taskId}`)).json();
     assert.equal(fullTask.task.submission.fullResult, "private result");
     const messageList = await (await fetch(`${hub.url()}/v1/messages?rootTaskId=${task.taskId}&view=summary`)).json();
+    const summarizedMessage = messageList.messages.find((item) => item.messageId === message.messageId);
+    assert.equal(Object.hasOwn(summarizedMessage.attachments[0], "content"), false);
     assert.equal(JSON.stringify(messageList).includes("private attachment"), false);
     const fullMessage = await (await fetch(`${hub.url()}/v1/messages/${message.messageId}`)).json();
     assert.equal(fullMessage.message.attachments[0].content, "private attachment");
@@ -151,27 +190,61 @@ test("conversation cancellation and summary reads preserve full-result detail", 
 test("identity HTTP routes pass trusted client IP and enforce administrator boundaries", async () => {
   const calls = [];
   const userId = "11111111-1111-4111-8111-111111111111";
+  const credentialId = "22222222-2222-4222-8222-222222222222";
+  const rotatedCredentialId = "33333333-3333-4333-8333-333333333333";
+  const publicUser = (overrides = {}) => ({
+    userId,
+    username: "admin",
+    role: "admin",
+    status: "active",
+    createdAt: "2026-09-18T00:00:00.000Z",
+    updatedAt: "2026-09-18T01:00:00.000Z",
+    lastLoginAt: null,
+    activeSessionCount: 1,
+    passwordHash: "must-not-leak",
+    ...overrides,
+  });
   const service = {
     async init() {},
     async login(username, _password, context) {
       calls.push(["login", username, context.clientIp]);
       if (username === "limited") throw Object.assign(new Error("Try again later"), {
-        statusCode: 429, code: "AUTH_RATE_LIMITED", retryAfterMs: 2000, headers: { "retry-after": "2" },
+        statusCode: 429, code: "AUTH_RATE_LIMITED", details: { scope: "ip" }, retryAfterMs: 2000, headers: { "retry-after": "2" },
       });
       return { actor: { kind: "web", id: "user:admin", userId, username, role: "admin" }, csrfToken: "csrf", expiresAt: new Date().toISOString(), cookie: "session=x", csrfCookie: "csrf=x" };
     },
     async authenticateWeb(request) {
       const role = request.headers["x-test-role"];
-      return role ? { kind: "web", id: `user:${role}`, userId, username: role, role } : null;
+      return role ? { kind: "web", id: `user:${role}`, userId, username: role, role, sessionId: "session-1" } : null;
     },
     verifyCsrf(request) {
       if (request.headers["x-csrf-token"] !== "csrf") throw Object.assign(new Error("CSRF failed"), { statusCode: 403 });
     },
-    async listUsers() { calls.push(["list"]); return [{ userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z", passwordHash: "must-not-leak" }]; },
+    async logout(actor) {
+      calls.push(["logout", actor.sessionId]);
+      return { sessionCookie: "a446_session=; Max-Age=0", csrfCookie: "a446_csrf=; Max-Age=0" };
+    },
+    async listUsers() { calls.push(["list"]); return [publicUser()]; },
     async createUser() { throw new Error("Direct user creation must not be used by HTTP"); },
-    async createOperator(input) { calls.push(["create", input.role]); return { userId, username: input.username, role: input.role }; },
-    async setUserStatus(id, status) { calls.push(["status", id, status]); return { userId: id, status }; },
-    async revokeUserSessions(id) { calls.push(["revoke", id]); return 2; },
+    async createOperator(input) { calls.push(["create", input.role]); return publicUser({ username: input.username, role: input.role, activeSessionCount: 0 }); },
+    async setUserStatus(id, status) { calls.push(["status", id, status]); return publicUser({ userId: id, username: "operator", role: "operator", status }); },
+    async revokeUserSessions(id) { calls.push(["revoke", id]); return { userId: id, revokedSessions: 2 }; },
+    async listWorkerCredentials() {
+      calls.push(["worker-list"]);
+      return [{ credentialId, agentId: "worker-01", deviceId: "device-01", status: "active", createdAt: "2026-09-18T00:00:00.000Z" }];
+    },
+    async createWorkerCredential(input) {
+      calls.push(["worker-create", input.agentId, input.deviceId]);
+      return { credentialId, ...input, status: "active", token: "one-time-create-token" };
+    },
+    async rotateWorkerCredential(id) {
+      calls.push(["worker-rotate", id]);
+      return { credentialId: rotatedCredentialId, agentId: "worker-01", deviceId: "device-01", status: "active", token: "one-time-rotate-token" };
+    },
+    async revokeWorkerCredential(id) {
+      calls.push(["worker-revoke", id]);
+      return { credentialId: id, agentId: "worker-01", deviceId: "device-01", status: "revoked" };
+    },
   };
   const hub = await new AgentHub({
     host: "127.0.0.1", port: 0, auth: { mode: "identity", trustedProxyIps: ["127.0.0.1"] },
@@ -207,14 +280,33 @@ test("identity HTTP routes pass trusted client IP and enforce administrator boun
     });
     assert.equal(limited.status, 429);
     assert.equal(limited.headers.get("retry-after"), "2");
-    assert.equal((await limited.json()).retryAfterMs, 2000);
+    const limitedBody = await limited.json();
+    assert.equal(limitedBody.code, "AUTH_RATE_LIMITED");
+    assert.deepEqual(limitedBody.details, { scope: "ip" });
+    assert.equal(limitedBody.retryAfterMs, 2000);
     assert.equal((await request("/v1/admin/users", "operator")).status, 403);
     const me = await request("/v1/auth/me", "admin");
     assert.equal(me.status, 200);
-    assert.deepEqual((await me.json()).user, { id: userId, username: "admin", role: "admin", status: "active", createdAt: "2026-09-18T00:00:00.000Z" });
+    assert.deepEqual((await me.json()).user, {
+      id: userId,
+      username: "admin",
+      role: "admin",
+      status: "active",
+      createdAt: "2026-09-18T00:00:00.000Z",
+      updatedAt: "2026-09-18T01:00:00.000Z",
+      lastLoginAt: null,
+      activeSessionCount: 1,
+    });
+    const logout = await request("/v1/auth/logout", "admin", "POST");
+    assert.equal(logout.status, 200);
+    assert.deepEqual(await logout.json(), { ok: true });
+    assert.match(logout.headers.get("set-cookie"), /Max-Age=0/);
+    assert.ok(calls.some((item) => item[0] === "logout" && item[1] === "session-1"));
     const users = await request("/v1/admin/users", "admin");
     assert.equal(users.status, 200);
-    assert.equal((await users.json()).users[0].id, userId);
+    const usersBody = await users.json();
+    assert.equal(usersBody.users[0].id, userId);
+    assert.equal(JSON.stringify(usersBody).includes("passwordHash"), false);
     const csrfFailure = await fetch(`${hub.url()}/v1/admin/users`, {
       method: "POST", headers: { "x-test-role": "admin", "content-type": "application/json" },
       body: JSON.stringify({ username: "operator", password: "secret" }),
@@ -233,6 +325,25 @@ test("identity HTTP routes pass trusted client IP and enforce administrator boun
     assert.equal((await changed.json()).user.id, userId);
     const revoked = await request(`/v1/admin/users/${userId}/revoke-sessions`, "admin", "POST");
     assert.equal((await revoked.json()).revokedSessions, 2);
+
+    const credentials = await request("/v1/admin/workers", "admin");
+    assert.equal(credentials.status, 200);
+    const credentialsBody = await credentials.json();
+    assert.equal(credentialsBody.credentials[0].credentialId, credentialId);
+    assert.equal("workers" in credentialsBody, false);
+    assert.equal(JSON.stringify(credentialsBody).includes("token"), false);
+    const workerCreated = await request("/v1/admin/workers", "admin", "POST", { agentId: "worker-01", deviceId: "device-01" });
+    assert.equal(workerCreated.status, 201);
+    assert.equal((await workerCreated.json()).credential.token, "one-time-create-token");
+    const workerRotated = await request(`/v1/admin/workers/${credentialId}/rotate`, "admin", "POST");
+    assert.equal(workerRotated.status, 200);
+    assert.equal((await workerRotated.json()).credential.token, "one-time-rotate-token");
+    const workerRevoked = await request(`/v1/admin/workers/${rotatedCredentialId}`, "admin", "DELETE");
+    assert.equal(workerRevoked.status, 200);
+    assert.equal((await workerRevoked.json()).credential.status, "revoked");
+    assert.ok(calls.some((item) => item[0] === "worker-create"));
+    assert.ok(calls.some((item) => item[0] === "worker-rotate" && item[1] === credentialId));
+    assert.ok(calls.some((item) => item[0] === "worker-revoke" && item[1] === rotatedCredentialId));
   } finally {
     await hub.stop();
   }
