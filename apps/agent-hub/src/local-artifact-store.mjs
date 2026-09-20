@@ -24,7 +24,7 @@ export class LocalArtifactStore {
   }
 
   async receive(request, artifact) {
-    if (artifact.size > this.maxFileBytes) throw httpError(413, `Artifact exceeds ${this.maxFileBytes} byte limit`);
+    if (artifact.size != null && artifact.size > this.maxFileBytes) throw httpError(413, `Artifact exceeds ${this.maxFileBytes} byte limit`);
     const finalPath = this.resolveStorageKey(artifact.storageKey);
     const tempPath = path.join(this.rootDirectory, ".tmp", `${artifact.artifactId}.${randomUUID()}.upload`);
     await mkdir(path.dirname(finalPath), { recursive: true, mode: 0o700 });
@@ -34,7 +34,9 @@ export class LocalArtifactStore {
     const verifier = async function* (source) {
       for await (const chunk of source) {
         size += chunk.length;
-        if (size > artifact.size || size > this.maxFileBytes) throw httpError(413, "Artifact upload is larger than declared or allowed");
+        if ((artifact.size != null && size > artifact.size) || size > this.maxFileBytes) {
+          throw httpError(413, "Artifact upload is larger than declared or allowed");
+        }
         hash.update(chunk);
         yield chunk;
       }
@@ -42,10 +44,12 @@ export class LocalArtifactStore {
     try {
       await pipeline(request, verifier, sink);
       const digest = hash.digest("hex");
-      if (size !== artifact.size) throw httpError(422, `Artifact size mismatch: expected ${artifact.size}, received ${size}`);
-      if (digest !== artifact.sha256) throw httpError(422, "Artifact SHA-256 mismatch");
+      if (artifact.size != null && size !== artifact.size) throw httpError(422, `Artifact size mismatch: expected ${artifact.size}, received ${size}`);
+      if (artifact.sha256 != null && digest !== artifact.sha256) throw httpError(422, "Artifact SHA-256 mismatch");
       await rename(tempPath, finalPath);
       await chmod(finalPath, 0o600).catch(() => {});
+      artifact.size = size;
+      artifact.sha256 = digest;
       return { size, sha256: digest };
     } catch (error) {
       sink.destroy();

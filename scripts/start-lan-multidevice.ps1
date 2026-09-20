@@ -87,21 +87,37 @@ function Add-CodexToPathIfInstalled {
 }
 
 function Normalize-DeviceId {
-  param([string]$Value)
-  $normalized = ([string]$Value).Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-'
+  param([string]$Value, [string]$Fallback = '')
+  $raw = ([string]$Value).Trim().ToLowerInvariant()
+  $normalized = $raw -replace '[^a-z0-9._-]+', '-'
   $normalized = $normalized.Trim('-')
-  if (-not $normalized) { throw 'Device ID cannot be empty.' }
+  if (-not $normalized) {
+    if ($Fallback) {
+      $normalized = Normalize-DeviceId -Value $Fallback
+    } else {
+      $fallbackDefault = (([string]$env:COMPUTERNAME).Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
+      if (-not $fallbackDefault) { $fallbackDefault = 'device' }
+      Write-Host "Notice: Device ID '$Value' contains no valid ASCII letters/digits. Falling back to '$fallbackDefault'." -ForegroundColor Yellow
+      $normalized = $fallbackDefault
+    }
+  } elseif ($raw -ne $normalized) {
+    Write-Host "Notice: Non-ASCII characters in device name were sanitized to: $normalized" -ForegroundColor Yellow
+  }
   if ($normalized.Length -gt 64) { $normalized = $normalized.Substring(0, 64) }
   return $normalized
 }
 
 function Resolve-DeviceId {
   param([string]$Requested, [object]$Saved)
-  if ($Requested) { return Normalize-DeviceId $Requested }
-  if ($Saved -and $Saved.deviceId) { return Normalize-DeviceId ([string]$Saved.deviceId) }
-  $default = Normalize-DeviceId $env:COMPUTERNAME
-  $entered = Read-TrimmedHost "Unique device name [$default]"
-  return Normalize-DeviceId $(if ($entered) { $entered } else { $default })
+  $default = if ($Saved -and $Saved.deviceId) {
+    Normalize-DeviceId -Value ([string]$Saved.deviceId) -Fallback $env:COMPUTERNAME
+  } else {
+    Normalize-DeviceId -Value $env:COMPUTERNAME -Fallback 'device'
+  }
+  if ($Requested) { return Normalize-DeviceId -Value $Requested -Fallback $default }
+  $entered = Read-TrimmedHost "Unique device name [$default] (English/digits only)"
+  $target = if ($entered) { $entered } else { $default }
+  return Normalize-DeviceId -Value $target -Fallback $default
 }
 
 function Test-IPv4 {
@@ -262,7 +278,7 @@ function Show-ProviderSummaries {
     $cache = Join-Path $LanRoot "provider-cache\preflight-$($Manifest.deviceId)-$provider.json"
     Push-Location $HubRoot
     try {
-      & node 'scripts/provider-probe.mjs' --provider $provider --command ([string]$worker.command) --kind all --cache-file $cache --max-age-ms 30000 --timeout-ms 20000
+      & node 'scripts/provider-probe.mjs' --provider $provider --command ([string]$worker.command) --kind all --cache-file $cache --max-age-ms 300000 --timeout-ms 20000
       if ($LASTEXITCODE -ne 0) { Write-Warning "Provider details are temporarily unavailable for $provider."; continue }
       $snapshot = $null
       if (Test-Path -LiteralPath $cache) {
@@ -317,7 +333,9 @@ function Wait-WorkersOnline {
   param([object]$Manifest, [System.Diagnostics.Process[]]$Processes, [string]$BaseUrl, [string]$Token)
   $expected = @($Manifest.workers | ForEach-Object { [string]$_.agentId })
   $headers = @{ Authorization = "Bearer $Token" }
-  for ($attempt = 0; $attempt -lt 80; $attempt += 1) {
+  Write-Host "Waiting for local Agent(s) to connect ($($expected -join ', ')) ..."
+  $online = @()
+  for ($attempt = 0; $attempt -lt 240; $attempt += 1) {
     foreach ($process in $Processes) {
       if ($process.HasExited) { throw "A local Agent exited during startup with code $($process.ExitCode)." }
     }
@@ -328,7 +346,7 @@ function Wait-WorkersOnline {
     } catch {}
     Start-Sleep -Milliseconds 250
   }
-  throw 'Local Agents did not all become ready within 20 seconds.'
+  throw "Local Agents did not all become ready within 60 seconds ($($online.Count)/$($expected.Count) online). Check var\lan\logs for details."
 }
 
 function Start-ManifestWorkers {

@@ -177,8 +177,9 @@ test("workflow creation binds an explicit executor and revisions keep its sessio
   assert.equal(revisedTask.sessionScopeId, execution.sessionScopeId);
 });
 
-test("role output parser defaults an unstructured review to rejection", () => {
-  assert.equal(parseRoleSubmission("reviewer", "looks okay").verdict, "rejected");
+test("role output parser rejects unstructured review and accepts structured executor", () => {
+  assert.equal(parseRoleSubmission("reviewer", "looks okay").ok, false);
+  assert.equal(parseRoleSubmission("executor", '{"brief":"done","fullResult":"complete"}').ok, true);
   assert.equal(parseRoleSubmission("executor", '{"brief":"done","fullResult":"complete"}').fullResult, "complete");
 });
 
@@ -245,6 +246,61 @@ test("a repeatedly denied upstream-error claim stops for human intervention", as
   assert.equal([...hub.tasks.values()].some((task) => task.stage === "revision"), false);
 });
 
+test("workflow creation accepts initial attachments and propagates them to executor subtasks", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-01", agent("planner-01", "planner"));
+  hub.agents.set("executor-01", agent("executor-01", "executor"));
+
+  const artifactId = "11111111-2222-3333-4444-555555555555";
+  hub.artifacts.set(artifactId, {
+    artifactId,
+    path: "spec.pdf",
+    originalName: "spec.pdf",
+    size: 2048,
+    sha256: "a".repeat(64),
+    status: "ready",
+  });
+
+  const task = await hub.createWorkflow({
+    title: "Task with attachment",
+    objective: "Analyze spec.pdf",
+    plannerAgentId: "planner-01",
+    executorAgentId: "executor-01",
+    attachments: [artifactId],
+  });
+
+  assert.equal(task.artifacts.files.length, 1);
+  assert.equal(task.artifacts.files[0].artifactId, artifactId);
+  assert.equal(task.taskSpec.inputs.length, 1);
+  assert.equal(task.taskSpec.inputs[0].path, "spec.pdf");
+  assert.equal(task.contextBundle.artifactReferences.length, 1);
+  assert.equal(task.contextBundle.artifactReferences[0].artifactId, artifactId);
+
+  const initialMessage = hub.messages.find((msg) => msg.rootTaskId === task.rootTaskId && msg.attachments?.length);
+  assert.ok(initialMessage);
+  assert.equal(initialMessage.attachments[0].type, "artifacts");
+  assert.equal(initialMessage.attachments[0].artifacts.files[0].path, "spec.pdf");
+
+  task.submission = {
+    brief: "Planned the execution",
+    assignments: [
+      {
+        title: "Execute spec analysis",
+        targetAgentId: "executor-01",
+        instructions: "Read spec.pdf and report",
+      },
+    ],
+  };
+  await hub.advanceWorkflow(task);
+
+  const executorTask = [...hub.tasks.values()].find((t) => t.role === "executor" && t.parentTaskId === task.taskId);
+  assert.ok(executorTask);
+  assert.equal(executorTask.taskSpec.inputs.length, 1);
+  assert.equal(executorTask.taskSpec.inputs[0].path, "spec.pdf");
+  assert.equal(executorTask.contextBundle.artifactReferences.length, 1);
+  assert.equal(executorTask.contextBundle.artifactReferences[0].artifactId, artifactId);
+});
+
 test("planner, executor, and reviewer form one minimal-context task conversation", { timeout: 15000 }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-collaboration-test-"));
   const hub = new AgentHub({
@@ -264,7 +320,7 @@ test("planner, executor, and reviewer form one minimal-context task conversation
         models: [{ id: "plan-model", capabilities: ["reasoning"], quota: { state: "Healthy" } }],
         roleOutputs: {
           "planner:planning": { brief: "split once", assignments: [{ title: "draft", instructions: "produce result", acceptance: ["complete"], targetAgentId: "unavailable-executor" }], needsHuman: false },
-          planner: { brief: "accepted result", assignments: [], needsHuman: false },
+          planner: { decision: "complete", brief: "accepted result", assignments: [], needsHuman: false },
         },
       },
       {

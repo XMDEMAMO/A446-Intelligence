@@ -12,7 +12,7 @@
     "hub": "node src/mock-hub-cli.mjs --config config/hub.local.json",
     "worker:a": "node src/worker-cli.mjs --config config/agent-a.mock.json",
     "worker:b": "node src/worker-cli.mjs --config config/agent-b.mock.json",
-    "test": "node --test test/antigravity-adapter.test.mjs test/collaboration.test.mjs test/fault-injection.test.mjs test/human-intervention.test.mjs test/integration.test.mjs test/json-file-store.test.mjs test/lan-device-config.test.mjs test/lan-hub-restart.test.mjs test/local-artifact-store.test.mjs test/local-mvp.test.mjs test/persistence-lease.test.mjs test/provider-probe.test.mjs test/quota-probe.test.mjs test/resource-probe.test.mjs"
+    "test": "node --test test/antigravity-adapter.test.mjs test/collaboration-schema.test.mjs test/collaboration.test.mjs test/fault-injection.test.mjs test/human-intervention.test.mjs test/integration.test.mjs test/json-file-store.test.mjs test/lan-device-config.test.mjs test/lan-hub-restart.test.mjs test/local-artifact-store.test.mjs test/local-mvp.test.mjs test/persistence-lease.test.mjs test/provider-probe.test.mjs test/quota-probe.test.mjs test/resource-probe.test.mjs test/workflow-state-machine.test.mjs"
   },
   "dependencies": {
     "ws": "8.21.3"

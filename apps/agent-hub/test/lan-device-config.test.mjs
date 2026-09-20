@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import path from "node:path";
 import test from "node:test";
-import { buildHubConfig, buildWorkerConfig, detectProviderInventory, selectReadyCommand } from "../scripts/prepare-lan-device.mjs";
+import { buildHubConfig, buildWorkerConfig, detectProviderInventory, sanitizeDeviceId, selectReadyCommand } from "../scripts/prepare-lan-device.mjs";
 
 test("multi-device LAN config gives one account slot one concurrent task and trusted probes", () => {
   const root = path.resolve("C:/a446-test");
@@ -46,3 +46,13 @@ test("Codex discovery skips a stale entry and keeps the ready executable absolut
   assert.equal(inventory.providers.find((provider) => provider.provider === "codex").command, ready);
   assert.equal(inventory.diagnostics.find((item) => item.provider === "codex").selectedCommand, ready);
 });
+
+test("sanitizeDeviceId filters non-ASCII characters and falls back safely", () => {
+  assert.equal(sanitizeDeviceId("laptop-01"), "laptop-01");
+  assert.equal(sanitizeDeviceId("LAPTOP_02.test"), "laptop_02.test");
+  assert.equal(sanitizeDeviceId("laptop-小明"), "laptop");
+  assert.equal(sanitizeDeviceId("纯中文设备名"), "device");
+  assert.equal(sanitizeDeviceId(""), "device");
+  assert.equal(sanitizeDeviceId(null), "device");
+});
+

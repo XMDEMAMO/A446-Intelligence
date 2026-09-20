@@ -21,7 +21,7 @@ export function buildWorkerConfig({ provider, command, mode, hubIp, deviceId, fu
   const probeScript = path.join(root, "scripts", "provider-probe.mjs");
   const providerName = provider === "codex" ? "openai" : "google";
   const roles = mode === "coordinator" ? ["planner", "executor", "reviewer"] : ["executor", "reviewer"];
-  const probeBase = [probeScript, "--provider", provider, "--command", command, "--cache-file", cacheFile, "--max-age-ms", "30000", "--timeout-ms", "20000"];
+  const probeBase = [probeScript, "--provider", provider, "--command", command, "--cache-file", cacheFile, "--max-age-ms", "300000", "--timeout-ms", "20000"];
   const policy = fullAccess ? {
     requireTaskSpec: false,
     defaultDenyUnknownPermissions: true,
@@ -262,9 +262,9 @@ function providerDiagnostic(provider, result, fallback) {
   };
 }
 
-function sanitizeDeviceId(value) {
-  const normalized = String(value ?? "device").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
-  if (!normalized) throw new Error("device ID is empty after normalization");
+export function sanitizeDeviceId(value) {
+  let normalized = String(value ?? "device").trim().toLowerCase().replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!normalized) normalized = "device";
   return normalized.slice(0, 64);
 }
 

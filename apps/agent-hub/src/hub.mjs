@@ -1,12 +1,13 @@
 import http from "node:http";
 import https from "node:https";
 import { isIP } from "node:net";
+import path from "node:path";
 import { readFile } from "node:fs/promises";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
-import { addUsage, bindModelQuotas, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
@@ -577,6 +578,84 @@ export class AgentHub {
         await this.recordLateAttemptMessage(task, agentId, message);
       } else {
       const artifactError = this.validateTaskArtifacts(task, message);
+      let formatValidation = null;
+      if (message.type === "task.result" && !artifactError && task.workflow?.enabled && task.role && ROLE_SET.has(task.role)) {
+        formatValidation = parseRoleSubmission(task.role, message.payload?.output, task.stage);
+      }
+      const formatError = formatValidation && !formatValidation.ok ? formatValidation.error : null;
+      if (formatError) {
+        task.formatRetryCount = Number(task.formatRetryCount ?? 0);
+        if (task.formatRetryCount === 0) {
+          const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
+          if (!reservation.ok) {
+            task.status = "failed";
+            task.completedAt = new Date().toISOString();
+            task.error = { name: "CircuitBreakerError", message: "工作流累计 Agent 调用已达上限（50次），格式修正重试被熔断" };
+            task.diagnosis = {
+              formatError,
+              rawOutput: formatValidation.raw,
+              failedAt: new Date().toISOString(),
+              retried: false,
+              circuitBroken: true,
+            };
+            this.completeAttempt(task, "failed", message);
+            this.finishTaskActivity(task);
+            this.markTask(task);
+            await this.recordEvent("workflow.format_failed", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, error: "Circuit breaker limit reached (50 invocations)" });
+            this.requireHuman(task, "工作流累计 Agent 调用已达上限（50次），格式修正重试被熔断。请人工介入审查。");
+            await this.retryQueuedTasks();
+            if (reliable) this.markInbound(agentId, message);
+            await this.commitAndDispatch();
+            if (reliable) this.sendAck(agentId, message.id);
+            return;
+          }
+          task.quotaReserved = true;
+          task.formatRetryCount = 1;
+          task.status = "queued";
+          task.diagnosis = {
+            formatError,
+            rawOutput: formatValidation.raw,
+            failedAt: new Date().toISOString(),
+          };
+          task.originalInput = task.originalInput ?? task.input;
+          task.input = `${task.originalInput}\n\n【格式错误需修正】上一次回复未通过服务端格式校验：${formatError}。请严格按照角色与阶段的 JSON 契约重新输出，切勿输出多余解释或损坏字符。`;
+          task.contextBundle = {
+            ...(task.contextBundle ?? {}),
+            formatErrorFeedback: formatError,
+          };
+          this.completeAttempt(task, "failed", message);
+          this.finishTaskActivity(task);
+          this.markTask(task);
+          await this.recordEvent("workflow.format_retry", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, error: formatError });
+          await this.queueOrDispatch(task);
+          await this.retryQueuedTasks();
+          if (reliable) this.markInbound(agentId, message);
+          await this.commitAndDispatch();
+          if (reliable) this.sendAck(agentId, message.id);
+          return;
+        } else {
+          task.status = "failed";
+          task.completedAt = new Date().toISOString();
+          task.error = { name: "FormatValidationError", message: `两次输出均无法通过格式校验: ${formatError}` };
+          task.diagnosis = {
+            formatError,
+            rawOutput: formatValidation.raw,
+            failedAt: new Date().toISOString(),
+            retried: true,
+          };
+          this.completeAttempt(task, "failed", message);
+          this.finishTaskActivity(task);
+          this.markTask(task);
+          await this.recordEvent("workflow.format_failed", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, error: formatError });
+          this.requireHuman(task, `任务格式校验失败（已自动重试 1 次仍失败）：${formatError}。请检查诊断详情并处理。`);
+          await this.retryQueuedTasks();
+          if (reliable) this.markInbound(agentId, message);
+          await this.commitAndDispatch();
+          if (reliable) this.sendAck(agentId, message.id);
+          return;
+        }
+      }
+
       const acceptedResult = message.type === "task.result" && !artifactError;
       const terminalStatus = acceptedResult ? "completed" : (message.payload?.cancelled ? "cancelled" : "failed");
       task.status = "processing_result";
@@ -589,7 +668,7 @@ export class AgentHub {
       task.model = message.payload?.model ?? task.execution?.model ?? null;
       task.usage = message.payload?.usage ?? null;
       task.quotaSnapshot = normalizeQuotaSnapshot(message.payload?.quotaSnapshot);
-      task.submission = message.payload?.submission ?? parseRoleSubmission(task.role, task.output);
+      task.submission = formatValidation?.ok ? formatValidation.value : (message.payload?.submission ?? parseRoleSubmission(task.role, task.output, task.stage).value ?? message.payload?.submission);
       this.markTask(task, this.taskAttemptGuard(message));
       if (task.usage) {
         this.usageTotals = addUsage(this.usageTotals, task.usage);
@@ -636,6 +715,9 @@ export class AgentHub {
         this.finishTaskActivity(task);
         this.markTask(task);
         await this.retryQueuedTasks();
+      }
+      if (task.workflow?.enabled) {
+        this.checkAndFinalizeWorkflow(task.rootTaskId);
       }
       }
     } else if (reliable && !task) {
@@ -746,11 +828,17 @@ export class AgentHub {
       requiredCapabilities: Array.isArray(input.requiredCapabilities) ? input.requiredCapabilities.map(String) : [],
       modelPreference: input.modelPreference ?? input.model ?? null,
       reasoningEffort: input.reasoningEffort ?? null,
+      workUnitId: input.workUnitId ?? null,
+      revision: Number(input.revision ?? 1),
+      superseded: Boolean(input.superseded),
+      supersededBy: input.supersededBy ?? null,
       reviewCycle: Number(input.reviewCycle ?? 0),
       attemptNumber: Number(input.attemptNumber ?? 0),
       currentAttemptId: input.currentAttemptId ?? null,
       recoveryCount: Number(input.recoveryCount ?? 0),
       requiresApproval: Boolean(input.requiresApproval),
+      quotaReserved: Boolean(input.quotaReserved),
+      forceCompleted: input.forceCompleted ?? null,
       status: input.requiresApproval ? "awaiting_approval" : "queued",
       createdAt: new Date().toISOString(),
     };
@@ -800,6 +888,20 @@ export class AgentHub {
       reviewerAgentId: input.reviewerAgentId ?? null,
       maxReviewCycles: Math.max(0, Number(input.maxReviewCycles ?? 2)),
     };
+
+    const initialArtifacts = [];
+    const initialReferences = [];
+    const initialInputs = [];
+    for (const item of input.attachments ?? []) {
+      const artifactId = typeof item === "string" ? item : item?.artifactId;
+      if (!artifactId) continue;
+      const artifact = this.artifacts.get(artifactId);
+      if (!artifact || artifact.status !== "ready") continue;
+      initialArtifacts.push(artifact);
+      initialReferences.push(toArtifactReference(artifact));
+      initialInputs.push({ path: artifact.path });
+    }
+
     const task = this.createTask({
       targetAgentId: workflow.plannerAgentId,
       sourceAgentId: input.sourceAgentId ?? "human",
@@ -815,7 +917,7 @@ export class AgentHub {
         title: String(input.title ?? input.objective).trim().slice(0, 200),
         type: "collaboration_workflow",
         priority: input.priority ?? "P1",
-        inputs: [],
+        inputs: initialInputs,
         expected_outputs: [],
         permissions_required: input.permissionsRequired ?? { project_workspace: true },
         checkpoint_policy: { mode: "stage" },
@@ -825,8 +927,36 @@ export class AgentHub {
         objective: input.objective.trim(),
         acceptance: Array.isArray(input.acceptance) ? input.acceptance.map(String) : [],
         schedulerCatalog: this.schedulerCatalog(),
+        artifactReferences: initialReferences,
       },
     });
+
+    for (const artifact of initialArtifacts) {
+      artifact.taskId = task.taskId;
+      artifact.rootTaskId = task.rootTaskId;
+      this.markArtifact(artifact);
+    }
+
+    if (initialArtifacts.length > 0) {
+      task.artifacts = {
+        files: initialArtifacts.map((item) => this.publicArtifact(item)),
+      };
+      this.addMessage(task, {
+        senderId: input.sourceAgentId ?? "human",
+        senderRole: "human",
+        kind: "task_brief",
+        text: `创建了协作任务，并附带 ${initialArtifacts.length} 个附件。`,
+        attachments: [{
+          type: "artifacts",
+          label: "初始任务附件",
+          taskId: task.taskId,
+          artifacts: {
+            files: initialArtifacts.map((item) => this.publicArtifact(item)),
+          },
+        }],
+      });
+    }
+
     await this.queueOrDispatch(task);
     return task;
   }
@@ -878,67 +1008,142 @@ export class AgentHub {
     });
   }
 
+  reserveWorkflowInvocations(rootTaskId, count = 1) {
+    const root = this.tasks.get(rootTaskId);
+    if (!root) return { ok: true, current: 0, requested: count };
+    if (!root.workflow?.enabled) return { ok: true, current: 0, requested: count };
+
+    root.workflow = { ...(root.workflow ?? {}) };
+    const current = Number(root.workflow.totalInvocations ?? 0);
+    if (current + count > 50) {
+      return {
+        ok: false,
+        error: `工作流累计任务调用已达上限（50次）：当前已执行/预留 ${current} 次，拟增加 ${count} 次，超过硬上限 50 次。`,
+        current,
+        requested: count,
+      };
+    }
+    root.workflow.totalInvocations = current + count;
+    this.markTask(root);
+    return { ok: true, current: root.workflow.totalInvocations, requested: count };
+  }
+
+  refundWorkflowInvocation(rootTaskId, count = 1) {
+    const root = this.tasks.get(rootTaskId);
+    if (!root?.workflow?.enabled) return;
+    const current = Number(root.workflow.totalInvocations ?? 0);
+    root.workflow = { ...(root.workflow ?? {}) };
+    root.workflow.totalInvocations = Math.max(0, current - count);
+    this.markTask(root);
+  }
+
   async advanceWorkflow(task) {
     const submission = task.submission ?? {};
+    const root = this.tasks.get(task.rootTaskId) ?? task;
+
+    // Resource limits: Max 50 agent calls per workflow
+    const workflowTasks = [...this.tasks.values()].filter((t) => t.rootTaskId === task.rootTaskId);
+    const currentInvocations = Math.max(workflowTasks.length, Number(root.workflow?.totalInvocations ?? 0));
+    if (currentInvocations >= 50) {
+      this.requireHuman(task, `工作流累计任务调用已达上限（50次），当前已执行 ${currentInvocations} 次，已自动熔断暂停。请人工介入审查。`);
+      return;
+    }
+
     if (task.role === "planner") {
+      if (task.stage === "result_intake") {
+        const decision = submission.decision;
+        if (decision === "needs_human") {
+          this.requireHuman(task, submission.humanQuestion || submission.brief || "规划 Agent 在接收成果后请求人工介入");
+          return;
+        }
+        if (decision === "continue") {
+          const assignments = submission.assignments ?? [];
+          if (assignments.length === 0) {
+            this.requireHuman(task, "规划 Agent 决定继续任务，但未提供任何子任务分配。请人工确认。");
+            return;
+          }
+          await this.dispatchAssignments(task, assignments);
+          return;
+        }
+        if (decision === "complete") {
+          task.workflowDecision = "complete";
+          this.markTask(task);
+          this.checkAndFinalizeWorkflow(root.taskId);
+          return;
+        }
+        this.requireHuman(task, `规划 Agent 返回未知的结案决策: ${decision}`);
+        return;
+      }
+
+      // stage === "planning" or "replan"
       if (submission.needsHuman) {
         this.requireHuman(task, submission.humanQuestion || submission.brief || "规划 Agent 请求人工介入");
         return;
       }
-      for (const assignment of submission.assignments ?? []) {
-        const boundExecutorId = task.workflow?.executorAgentId ?? null;
-        if (boundExecutorId && assignment.targetAgentId && assignment.targetAgentId !== boundExecutorId) {
-          this.queueEvent("workflow.executor_override", {
-            rootTaskId: task.rootTaskId,
-            plannerTaskId: task.taskId,
-            requestedByPlanner: assignment.targetAgentId,
-            executorAgentId: boundExecutorId,
-          });
-        }
-        const child = this.createTask({
-          targetAgentId: boundExecutorId ?? assignment.targetAgentId,
-          requestedAgentId: boundExecutorId ?? assignment.targetAgentId ?? null,
-          input: assignment.instructions,
-          rootTaskId: task.rootTaskId,
-          parentTaskId: task.taskId,
-          sourceAgentId: task.targetAgentId,
-          role: "executor",
-          stage: "execution",
-          workflow: task.workflow,
-          requiredCapabilities: assignment.requiredCapabilities,
-          modelPreference: assignment.modelPreference,
-          reasoningEffort: assignment.reasoningEffort,
-          taskSpec: {
-            title: assignment.title,
-            type: "collaboration_execution",
-            priority: task.taskSpec?.priority ?? "P1",
-            inputs: [],
-            expected_outputs: assignment.expectedOutputs ?? [],
-            permissions_required: task.taskSpec?.permissions_required ?? { project_workspace: true },
-            checkpoint_policy: { mode: "stage" },
-            acceptance: assignment.acceptance?.length ? assignment.acceptance : task.taskSpec?.acceptance ?? [],
-          },
-          contextBundle: {
-            objective: task.contextBundle?.objective ?? task.input,
-            plannerBrief: submission.brief,
-            acceptance: assignment.acceptance ?? [],
-          },
-        });
-        await this.queueOrDispatch(child);
+      const assignments = submission.assignments ?? [];
+      if (assignments.length === 0) {
+        this.requireHuman(task, "规划 Agent 未生成任何有效子任务，需要人工确认或补充规划。");
+        return;
       }
+      await this.dispatchAssignments(task, assignments);
       return;
     }
 
     if (task.role === "executor") {
       const reviewKind = submission.upstreamIssue ? "upstream_review" : "result_review";
+
+      // Prohibit self-review: reviewer MUST NOT be the executor
+      let reviewerAgentId = task.workflow?.reviewerAgentId;
+      if (reviewerAgentId === task.targetAgentId) {
+        reviewerAgentId = null;
+      }
+      if (!reviewerAgentId) {
+        // Exclude executor and ensure formal scheduler constraints
+        const candidateAgents = new Map(
+          [...this.agents.entries()].filter(([id, a]) => (
+            id !== task.targetAgentId &&
+            (!this.leasesEnabled() || a.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
+          ))
+        );
+        this.refreshAccountLoads();
+        try {
+          const selection = chooseAgent(candidateAgents, {
+            role: "reviewer",
+            requireDeclaredRole: false,
+          });
+          reviewerAgentId = selection.agent.agentId;
+        } catch {
+          reviewerAgentId = null;
+        }
+      }
+
+      if (!reviewerAgentId) {
+        task.reviewStatus = "waiting_for_human_review";
+        this.markTask(task);
+        this.createIntervention(task, {
+          kind: "workflow_input",
+          question: "当前没有可立即调度的独立 Reviewer 节点（严禁由 Executor 自行审核）。成果已提交，请人工进行审核确认。",
+          allowedActions: ["approve", "reject"],
+          continuation: { type: "human_review", taskId: task.taskId },
+        });
+        return;
+      }
+
+      const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
+      if (!reservation.ok) {
+        this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法调度 Reviewer：${reservation.error}`);
+        return;
+      }
+
       const reviewer = this.createTask({
-        targetAgentId: task.workflow?.reviewerAgentId,
+        targetAgentId: reviewerAgentId,
         input: reviewKind === "upstream_review" ? "审核执行 Agent 提交的上游错误报告。" : "审核执行 Agent 提交的完整成果。",
         rootTaskId: task.rootTaskId,
         parentTaskId: task.taskId,
         sourceAgentId: task.targetAgentId,
         role: "reviewer",
         stage: reviewKind,
+        quotaReserved: true,
         workflow: task.workflow,
         reviewCycle: task.reviewCycle,
         taskSpec: {
@@ -991,6 +1196,18 @@ export class AgentHub {
       return;
     }
     if (verdict === "upstream_confirmed") {
+      const root = this.tasks.get(task.rootTaskId) ?? task;
+      const replanDepth = Number(root.workflow?.replanDepth ?? reviewed.workflow?.replanDepth ?? 0) + 1;
+      if (replanDepth > 10) {
+        this.requireHuman(task, "工作流重新规划深度已达上限（10层），已自动暂停。请人工介入审查。");
+        return;
+      }
+      if (root.workflow) {
+        root.workflow.replanDepth = replanDepth;
+        this.markTask(root);
+      }
+      reviewed.superseded = true;
+      this.markTask(reviewed);
       await this.createPlannerIntake(task, reviewed, "replan", {
         upstreamIssueConfirmed: true,
         correctionBrief: submission.correctionBrief ?? submission.brief,
@@ -1000,7 +1217,7 @@ export class AgentHub {
     }
     if (verdict === "upstream_denied") {
       const nextCycle = reviewed.reviewCycle + 1;
-      const maxCycles = Number(task.workflow?.maxReviewCycles ?? 2);
+      const maxCycles = Math.min(5, Math.max(0, Number(task.workflow?.maxReviewCycles ?? 2)));
       if (nextCycle > maxCycles) {
         this.requireHuman(task, `同一上游错误报告连续 ${nextCycle} 次未获审核认可：${submission.brief}`);
         return;
@@ -1010,7 +1227,7 @@ export class AgentHub {
     }
 
     const nextCycle = reviewed.reviewCycle + 1;
-    const maxCycles = Number(task.workflow?.maxReviewCycles ?? 2);
+    const maxCycles = Math.min(5, Math.max(0, Number(task.workflow?.maxReviewCycles ?? 2)));
     if (nextCycle > maxCycles) {
       this.requireHuman(task, `成果连续 ${nextCycle} 次未通过审核：${submission.brief}`);
       return;
@@ -1022,8 +1239,102 @@ export class AgentHub {
     }, nextCycle);
   }
 
+  async dispatchAssignments(task, assignments) {
+    const reservation = this.reserveWorkflowInvocations(task.rootTaskId, assignments.length);
+    if (!reservation.ok) {
+      this.requireHuman(
+        task,
+        `工作流累计任务调用已达上限（50次），当前已执行 ${reservation.current} 次，本次拟下发 ${assignments.length} 次，已自动熔断暂停。请人工介入审查。`
+      );
+      return;
+    }
+
+    const boundExecutorId = task.workflow?.executorAgentId ?? null;
+    let assignmentIndex = 0;
+    for (const assignment of assignments) {
+      assignmentIndex++;
+      if (boundExecutorId && assignment.targetAgentId && assignment.targetAgentId !== boundExecutorId) {
+        this.queueEvent("workflow.executor_override", {
+          rootTaskId: task.rootTaskId,
+          plannerTaskId: task.taskId,
+          requestedByPlanner: assignment.targetAgentId,
+          executorAgentId: boundExecutorId,
+        });
+      }
+      const workUnitId = `wu-${task.taskId}-${assignmentIndex}`;
+      const child = this.createTask({
+        targetAgentId: boundExecutorId ?? assignment.targetAgentId,
+        requestedAgentId: boundExecutorId ?? assignment.targetAgentId ?? null,
+        input: assignment.instructions,
+        rootTaskId: task.rootTaskId,
+        parentTaskId: task.taskId,
+        sourceAgentId: task.targetAgentId,
+        role: "executor",
+        stage: "execution",
+        quotaReserved: true,
+        workflow: task.workflow,
+        workUnitId,
+        revision: 1,
+        superseded: false,
+        requiredCapabilities: assignment.requiredCapabilities,
+        modelPreference: assignment.modelPreference,
+        reasoningEffort: assignment.reasoningEffort,
+        taskSpec: {
+          title: assignment.title,
+          type: "collaboration_execution",
+          priority: task.taskSpec?.priority ?? "P1",
+          inputs: (task.taskSpec?.inputs ?? []).map((item) => (typeof item === "string" ? { path: item } : item)),
+          expected_outputs: assignment.expectedOutputs ?? [],
+          permissions_required: task.taskSpec?.permissions_required ?? { project_workspace: true },
+          checkpoint_policy: { mode: "stage" },
+          acceptance: assignment.acceptance?.length ? assignment.acceptance : task.taskSpec?.acceptance ?? [],
+        },
+        contextBundle: {
+          objective: task.contextBundle?.objective ?? task.input,
+          plannerBrief: task.submission?.brief,
+          acceptance: assignment.acceptance ?? [],
+          artifactReferences: task.contextBundle?.artifactReferences ?? [],
+        },
+      });
+      await this.queueOrDispatch(child);
+      if (child.status === "queued" && child.schedulingErrorCode && child.schedulingErrorCode !== "EXECUTOR_AT_CAPACITY" && child.schedulingErrorCode !== "ACCOUNT_AT_CAPACITY") {
+        await this.handleSchedulingFailure(task, child);
+      }
+    }
+  }
+
+  async handleSchedulingFailure(plannerTask, childTask) {
+    const root = this.tasks.get(plannerTask.rootTaskId) ?? plannerTask;
+    root.schedulingRetryCount = Number(root.schedulingRetryCount ?? 0);
+    if (root.schedulingRetryCount === 0) {
+      root.schedulingRetryCount = 1;
+      this.markTask(root);
+      childTask.status = "cancelled";
+      childTask.superseded = true;
+      this.markTask(childTask);
+      this.refundWorkflowInvocation(plannerTask.rootTaskId, 1);
+      await this.createPlannerIntake(plannerTask, childTask, "replan", {
+        schedulingFailure: {
+          assignmentTitle: childTask.taskSpec?.title,
+          targetAgentId: childTask.targetAgentId,
+          requestedModel: childTask.modelPreference,
+          errorCode: childTask.schedulingErrorCode,
+          errorReason: childTask.schedulingError,
+        },
+        failureMessage: `子任务 '${childTask.taskSpec?.title}' 调度失败 (${childTask.schedulingError})。请根据可用调度资源重新分配节点或模型。`,
+      });
+    } else {
+      this.requireHuman(childTask, `子任务 '${childTask.taskSpec?.title}' 调度失败（重新规划后仍无法调度）：${childTask.schedulingError}。请人工介入选择执行节点。`);
+    }
+  }
+
   async createPlannerIntake(reviewTask, reviewed, stage, details) {
     const root = this.tasks.get(reviewTask.rootTaskId);
+    const reservation = this.reserveWorkflowInvocations(reviewTask.rootTaskId, 1);
+    if (!reservation.ok) {
+      this.requireHuman(reviewTask, `工作流累计任务调用已达上限（50次），无法调度 Planner：${reservation.error}`);
+      return;
+    }
     const planner = this.createTask({
       targetAgentId: reviewTask.workflow?.plannerAgentId,
       input: stage === "replan" ? "根据已确认的上游错误重新安排后续任务。" : "接收已审核通过的任务简报，并决定是否继续安排任务。",
@@ -1032,7 +1343,8 @@ export class AgentHub {
       sourceAgentId: reviewTask.targetAgentId,
       role: "planner",
       stage,
-      workflow: reviewTask.workflow,
+      quotaReserved: true,
+      workflow: root?.workflow ?? reviewTask.workflow,
       sessionScopeId: root?.sessionScopeId ?? reviewTask.rootTaskId,
       taskSpec: {
         title: stage === "replan" ? "重新规划" : "接收审核结果",
@@ -1047,6 +1359,12 @@ export class AgentHub {
   }
 
   async createRevisionTask(reviewTask, reviewed, details, reviewCycle = reviewed.reviewCycle) {
+    const root = this.tasks.get(reviewTask.rootTaskId);
+    const reservation = this.reserveWorkflowInvocations(reviewTask.rootTaskId, 1);
+    if (!reservation.ok) {
+      this.requireHuman(reviewTask, `工作流累计任务调用已达上限（50次），无法调度返工任务：${reservation.error}`);
+      return;
+    }
     const revision = this.createTask({
       targetAgentId: reviewed.targetAgentId,
       requestedAgentId: reviewed.requestedAgentId ?? reviewed.targetAgentId,
@@ -1056,7 +1374,11 @@ export class AgentHub {
       sourceAgentId: reviewTask.targetAgentId,
       role: "executor",
       stage: "revision",
-      workflow: reviewTask.workflow,
+      quotaReserved: true,
+      workflow: root?.workflow ?? reviewTask.workflow,
+      workUnitId: reviewed.workUnitId ?? reviewed.taskId,
+      revision: Number(reviewed.revision ?? 1) + 1,
+      superseded: false,
       sessionScopeId: reviewed.sessionScopeId,
       reviewCycle,
       taskSpec: reviewed.taskSpec,
@@ -1066,6 +1388,9 @@ export class AgentHub {
         ...details,
       },
     });
+    reviewed.superseded = true;
+    reviewed.supersededBy = revision.taskId;
+    this.markTask(reviewed);
     await this.queueOrDispatch(revision);
   }
 
@@ -1272,6 +1597,28 @@ export class AgentHub {
         await this.retryQueuedTasks();
         resumedTask = task;
       }
+    } else if (intervention.continuation?.type === "human_review") {
+      const task = origin;
+      if (decision === "approve") {
+        task.reviewStatus = "approved";
+        task.reviewedAt = resolvedAt;
+        task.reviewBrief = response || "人工审核通过";
+        this.markTask(task);
+        await this.createPlannerIntake(task, task, "result_intake", {
+          approved: true,
+          executorBrief: task.submission?.brief,
+          reviewBrief: task.reviewBrief,
+          artifactReferences: (task.artifacts?.files ?? []).map(toArtifactReference),
+        });
+        resumedTask = task;
+      } else {
+        task.reviewStatus = "rejected";
+        task.reviewedAt = resolvedAt;
+        task.reviewBrief = response || "人工审核驳回";
+        this.markTask(task);
+        await this.createRevisionTask(task, task, { reviewBrief: task.reviewBrief }, (task.reviewCycle ?? 0) + 1);
+        resumedTask = task;
+      }
     }
 
     await this.recordEvent("intervention.resolved", {
@@ -1298,11 +1645,25 @@ export class AgentHub {
     return roots.map((root) => {
       const tasks = [...this.tasks.values()].filter((task) => task.rootTaskId === root.taskId);
       const messages = this.messages.filter((message) => message.rootTaskId === root.taskId);
-      const active = tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
-      const failed = tasks.some((task) => ["failed", "rejected"].includes(task.status));
+      const activeTasks = tasks.filter((task) => !task.superseded);
+      const active = activeTasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
+      const failed = activeTasks.some((task) => ["failed", "rejected"].includes(task.status));
       const currentIntervention = this.currentIntervention(root.taskId);
-      const cancelled = tasks.length > 0 && tasks.every((task) => task.status === "cancelled");
-      const status = currentIntervention?.status === "pending" ? "needs_human" : active ? "active" : failed ? "failed" : cancelled ? "cancelled" : "completed";
+      const isCancelled = root.status === "cancelled" || (activeTasks.length > 0 && activeTasks.every((task) => task.status === "cancelled"));
+      const isComplete = this.isWorkflowComplete(root.taskId);
+      const status = root.forceCompleted
+        ? "completed"
+        : currentIntervention?.status === "pending"
+          ? "needs_human"
+          : active
+            ? "active"
+            : failed
+              ? "failed"
+              : isCancelled
+                ? "cancelled"
+                : isComplete
+                  ? "completed"
+                  : "stalled";
       const participants = [...new Set(tasks.flatMap((task) => [task.sourceAgentId, task.targetAgentId]).filter(Boolean))];
       return {
         rootTaskId: root.taskId,
@@ -1316,6 +1677,61 @@ export class AgentHub {
         humanIntervention: this.publicIntervention(currentIntervention, true),
       };
     }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+  }
+
+  isWorkflowComplete(rootTaskId) {
+    const root = this.tasks.get(rootTaskId);
+    if (!root) return false;
+    if (root.forceCompleted) return true;
+    if (!root.workflow?.enabled) {
+      return root.status === "completed";
+    }
+
+    const tasks = [...this.tasks.values()].filter((t) => t.rootTaskId === rootTaskId);
+    const activeTasks = tasks.filter((t) => !t.superseded);
+
+    // Pillar 4: No active tasks, no pending interventions, no failed/rejected tasks among non-superseded tasks
+    if (activeTasks.some((t) => ACTIVE_TASK_STATUSES.has(t.status))) return false;
+    const currentIntervention = this.currentIntervention(rootTaskId);
+    if (currentIntervention && currentIntervention.status === "pending") return false;
+    if (activeTasks.some((t) => ["failed", "rejected"].includes(t.status))) return false;
+
+    // Pillar 1: All active execution tasks completed and have valid deliverable fullResult/output
+    const executionTasks = activeTasks.filter((t) => t.role === "executor");
+    if (executionTasks.length === 0) return false;
+    for (const execTask of executionTasks) {
+      if (execTask.status !== "completed") return false;
+      if (!execTask.submission?.fullResult && !execTask.output) return false;
+    }
+
+    // Pillar 2: Every active execution task approved by an independent reviewer (or human)
+    for (const execTask of executionTasks) {
+      if (execTask.reviewStatus !== "approved") return false;
+      const reviewTask = tasks.find((t) => t.parentTaskId === execTask.taskId && t.role === "reviewer");
+      if (reviewTask && reviewTask.targetAgentId === execTask.targetAgentId) {
+        return false;
+      }
+    }
+
+    // Pillar 3: Planner explicitly decided 'complete' in result_intake stage
+    const intakeTask = tasks.filter((t) => t.role === "planner" && t.stage === "result_intake" && t.status === "completed").at(-1);
+    if (!intakeTask || intakeTask.submission?.decision !== "complete") {
+      return false;
+    }
+
+    return true;
+  }
+
+  checkAndFinalizeWorkflow(rootTaskId) {
+    const root = this.tasks.get(rootTaskId);
+    if (!root) return;
+    if (this.isWorkflowComplete(rootTaskId)) {
+      root.status = "completed";
+      root.completedAt = new Date().toISOString();
+      this.finishTaskActivity(root);
+      this.markTask(root);
+      this.queueEvent("workflow.completed", { rootTaskId });
+    }
   }
 
   schedulerCatalog() {
@@ -1381,6 +1797,20 @@ export class AgentHub {
 
   async queueOrDispatch(task) {
     if (task.requiresApproval && task.status === "awaiting_approval") return;
+    if (task.workflow?.enabled && !task.quotaReserved) {
+      const root = this.tasks.get(task.rootTaskId) ?? task;
+      const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
+      if (!reservation.ok) {
+        task.status = "failed";
+        task.completedAt = new Date().toISOString();
+        task.error = { name: "CircuitBreakerError", message: reservation.error };
+        this.finishTaskActivity(task);
+        this.markTask(task);
+        this.requireHuman(task, `工作流累计任务调用已达上限（50次），已自动熔断暂停。请人工介入审查。`);
+        return;
+      }
+      task.quotaReserved = true;
+    }
     let selection;
     try {
       const requiresArtifacts = Boolean(this.artifactStore && extractArtifactPaths(task.taskSpec).length);
@@ -1811,7 +2241,7 @@ export class AgentHub {
       }
 
       const artifactRoute = url.pathname.match(/^\/v1\/artifacts\/([0-9a-f-]{36})(?:\/(content))?$/i);
-      const artifactRequest = url.pathname === "/v1/artifacts" || Boolean(artifactRoute);
+      const artifactRequest = url.pathname === "/v1/artifacts" || url.pathname === "/v1/attachments" || Boolean(artifactRoute);
       let actor;
       const legacyArtifactAgentId = artifactRequest && !this.authService
         ? normalizeLegacyArtifactAgentId(request.headers["x-a446-agent-id"])
@@ -1845,6 +2275,48 @@ export class AgentHub {
         return json(response, 200, { ok: true }, { "set-cookie": [cookies.sessionCookie, cookies.csrfCookie] });
       }
 
+      if (request.method === "POST" && url.pathname === "/v1/attachments") {
+        if (!this.artifactStore) throw httpError(503, "Artifact storage is not enabled", "STORAGE_NOT_CONFIGURED");
+        if (actor.kind !== "web" && actor.role !== "admin" && actor.role !== "operator") {
+          throw httpError(403, "Web operator session required to upload attachments", "FORBIDDEN");
+        }
+        if (this.authService) this.requireWebMutation(request, actor);
+        const rawFilename = url.searchParams.get("filename") ?? request.headers["x-file-name"] ?? "attachment.bin";
+        const cleanName = path.posix.basename(String(rawFilename).replace(/[\r\n\0]/g, "")).trim() || "attachment.bin";
+        const artifactId = randomUUID();
+        const storageKey = this.artifactStore.createStorageKey();
+        const artifact = {
+          artifactId,
+          taskId: null,
+          rootTaskId: null,
+          attemptId: null,
+          workerId: null,
+          uploadedBy: actor.id ?? actor.username ?? "web",
+          path: cleanName,
+          originalName: cleanName,
+          status: "uploading",
+          storageKey,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        };
+        const result = await this.artifactStore.receive(request, artifact);
+        artifact.size = result.size;
+        artifact.sha256 = result.sha256;
+        artifact.status = "ready";
+        artifact.readyAt = new Date().toISOString();
+        artifact.updatedAt = artifact.readyAt;
+        this.artifacts.set(artifactId, artifact);
+        this.markArtifact(artifact);
+        await this.recordEvent("artifact.attachment_uploaded", {
+          actor: actor.id,
+          artifactId,
+          path: cleanName,
+          size: result.size,
+          sha256: result.sha256,
+        });
+        await this.flushState();
+        return json(response, 201, { artifact: this.publicArtifact(artifact) });
+      }
       if (request.method === "POST" && url.pathname === "/v1/artifacts") {
         const artifact = await this.registerArtifact(await readBody(request), actor);
         return json(response, 201, { artifact });
@@ -2183,6 +2655,122 @@ export class AgentHub {
       await this.recordEvent("task.cancelled", { actor: actor.id, taskId: task.taskId, agentId: task.targetAgentId, attemptId: task.currentAttemptId ?? null });
       await this.retryQueuedTasks();
       return { ok: true, task };
+    }
+    if (command.type === "workflow.replan") {
+      const root = this.tasks.get(command.rootTaskId);
+      if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
+      if (root.status === "completed" || root.status === "cancelled" || root.forceCompleted) {
+        throw httpError(400, "Cannot replan a completed or cancelled workflow");
+      }
+      const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
+      if (!reservation.ok) {
+        throw httpError(400, `工作流累计任务调用已达上限（50次），无法重新规划：${reservation.error}`);
+      }
+
+      // Cancel and supersede any active child tasks from previous plan
+      for (const t of this.tasks.values()) {
+        if (t.rootTaskId === root.taskId && t.taskId !== root.taskId && ACTIVE_TASK_STATUSES.has(t.status)) {
+          t.status = "cancelled";
+          t.superseded = true;
+          t.completedAt = new Date().toISOString();
+          this.finishTaskActivity(t);
+          this.markTask(t);
+          if (t.targetAgentId) {
+            this.deliver(t.targetAgentId, makeEnvelope("task.cancel", {
+              agentId: t.targetAgentId,
+              taskId: t.taskId,
+              payload: { attemptId: t.currentAttemptId ?? null },
+            }));
+          }
+        }
+      }
+      const plannerId = root.workflow?.plannerAgentId ?? (root.role === "planner" ? root.targetAgentId : null);
+      if (!plannerId) {
+        this.refundWorkflowInvocation(root.taskId, 1);
+        throw httpError(400, "Workflow does not specify a planner Agent");
+      }
+      const replanTask = this.createTask({
+        targetAgentId: plannerId,
+        input: command.instructions || "用户要求对当前工作流重新进行任务规划。",
+        rootTaskId: root.taskId,
+        parentTaskId: root.taskId,
+        sourceAgentId: actor.id,
+        role: "planner",
+        stage: "replan",
+        quotaReserved: true,
+        workflow: root.workflow,
+        sessionScopeId: root.sessionScopeId ?? root.taskId,
+        taskSpec: {
+          title: "人工触发重新规划",
+          type: "replan",
+          priority: "P1",
+          permissions_required: { project_workspace: true },
+          acceptance: [],
+        },
+        contextBundle: {
+          reason: command.reason || "workflow_stalled",
+          requestedBy: actor.id,
+          schedulerCatalog: this.schedulerCatalog(),
+        },
+      });
+      await this.queueOrDispatch(replanTask);
+      await this.recordEvent("workflow.manual_replan", { actor: actor.id, rootTaskId: root.taskId, taskId: replanTask.taskId });
+      return { ok: true, task: replanTask };
+    }
+    if (command.type === "workflow.force_complete") {
+      if (actor.role !== "admin") throw httpError(403, "Administrator role required for force completion");
+      const root = this.tasks.get(command.rootTaskId);
+      if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
+      const resolvedAt = new Date().toISOString();
+
+      const workflowTasks = [...this.tasks.values()].filter((t) => t.rootTaskId === root.taskId && t.taskId !== root.taskId);
+      for (const t of workflowTasks) {
+        if (!TERMINAL_TASK_STATUSES.has(t.status)) {
+          t.status = "cancelled";
+          t.completedAt = resolvedAt;
+          if (t.currentAttemptId) {
+            const attempt = this.attempts.get(t.currentAttemptId);
+            if (attempt && !TERMINAL_TASK_STATUSES.has(attempt.status)) {
+              attempt.status = "cancelled";
+              attempt.completedAt = resolvedAt;
+              this.markAttempt(attempt);
+            }
+          }
+          this.finishTaskActivity(t);
+          this.markTask(t);
+          if (t.targetAgentId) {
+            this.deliver(t.targetAgentId, makeEnvelope("task.cancel", {
+              agentId: t.targetAgentId,
+              taskId: t.taskId,
+              payload: { attemptId: t.currentAttemptId ?? null },
+            }));
+          }
+        }
+      }
+
+      for (const intervention of this.interventions.values()) {
+        if (intervention.rootTaskId !== root.taskId || intervention.status !== "pending") continue;
+        intervention.status = "resolved";
+        intervention.decision = "reject";
+        intervention.response = "Workflow force-completed by administrator";
+        intervention.resolvedAt = resolvedAt;
+        intervention.resolvedBy = actor.id;
+        intervention.updatedAt = resolvedAt;
+        this.markIntervention(intervention, { allowedStatuses: ["pending"] });
+      }
+      this.syncRootIntervention(root.taskId);
+
+      root.status = "completed";
+      root.completedAt = resolvedAt;
+      root.workflowDecision = "complete";
+      root.forceCompleted = { completedAt: resolvedAt, completedBy: actor.id, reason: command.reason || "admin_force_complete" };
+      this.finishTaskActivity(root);
+      this.markTask(root);
+
+      this.queueEvent("workflow.completed", { rootTaskId: root.taskId, forceCompleted: true });
+      await this.recordEvent("workflow.force_completed", { actor: actor.id, rootTaskId: root.taskId });
+      await this.retryQueuedTasks();
+      return { ok: true, task: root };
     }
     throw httpError(400, `Unsupported command type: ${command.type}`);
   }

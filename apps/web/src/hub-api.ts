@@ -9,6 +9,7 @@ import type {
   HubTask,
   HumanIntervention,
   TokenUsage,
+  UploadedAttachment,
   UsageAgentSummary,
   WebUser,
   WebUserStatus,
@@ -163,6 +164,43 @@ export async function downloadArtifact(downloadUrl: string, filename: string) {
   } finally {
     window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000)
   }
+}
+
+export async function uploadAttachment(file: File, signal?: AbortSignal): Promise<UploadedAttachment> {
+  const headers = new Headers()
+  headers.set('content-type', file.type || 'application/octet-stream')
+  headers.set('x-file-name', encodeURIComponent(file.name))
+  if (csrfToken) headers.set('x-csrf-token', csrfToken)
+  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  if (lanToken) headers.set('x-a446-lan-token', lanToken)
+
+  const response = await fetch(`${API_BASE}/v1/attachments?filename=${encodeURIComponent(file.name)}`, {
+    method: 'POST',
+    credentials: 'include',
+    headers,
+    body: file,
+    signal,
+  })
+
+  const text = await response.text()
+  let body: { artifact?: UploadedAttachment } & ErrorBody = {}
+  if (text) {
+    try {
+      body = JSON.parse(text)
+    } catch {
+      body = { error: `Hub returned an invalid response (${response.status})` }
+    }
+  }
+
+  if (!response.ok || !body.artifact) {
+    throw new HubApiError(
+      body.error ?? `附件上传失败 (${response.status})`,
+      response.status,
+      body.code ?? `HTTP_${response.status}`,
+    )
+  }
+
+  return body.artifact
 }
 
 export async function getHubOverview(signal?: AbortSignal): Promise<HubOverview> {

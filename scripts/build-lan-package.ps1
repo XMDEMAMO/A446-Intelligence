@@ -38,9 +38,11 @@ try {
   New-Item -ItemType Directory -Path $ReleaseRoot -Force | Out-Null
   foreach ($relative in @(
     'START-A446-MULTI-DEVICE-LAN.bat',
+    'STOP-A446-MULTI-DEVICE-LAN.bat',
     'MULTI-DEVICE-LAN-README.md',
     'README.md',
     'scripts\start-lan-multidevice.ps1',
+    'scripts\stop-lan-multidevice.ps1',
     'scripts\build-lan-package.ps1',
     'scripts\test-lan-runtime.ps1',
     'docs\AI_AGENT_MANUAL.md',
@@ -65,11 +67,15 @@ try {
     'apps\web\test'
   )) { Copy-SourceItem -RelativePath $relative }
 
-  # Keep the cmd.exe entry point portable across Windows code pages.
-  $launcherPath = Join-Path $stagingRoot 'START-A446-MULTI-DEVICE-LAN.bat'
-  $launcherText = [System.IO.File]::ReadAllText($launcherPath)
-  $launcherText = $launcherText.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", "`r`n")
-  [System.IO.File]::WriteAllText($launcherPath, $launcherText, [System.Text.Encoding]::ASCII)
+  # Keep the cmd.exe entry points portable across Windows code pages.
+  foreach ($batName in @('START-A446-MULTI-DEVICE-LAN.bat', 'STOP-A446-MULTI-DEVICE-LAN.bat')) {
+    $batPath = Join-Path $stagingRoot $batName
+    if (Test-Path -LiteralPath $batPath) {
+      $batText = [System.IO.File]::ReadAllText($batPath)
+      $batText = $batText.Replace("`r`n", "`n").Replace("`r", "`n").Replace("`n", "`r`n")
+      [System.IO.File]::WriteAllText($batPath, $batText, [System.Text.Encoding]::ASCII)
+    }
+  }
 
   $sourceCommit = (& git -C $ProjectRoot rev-parse HEAD).Trim()
   $sourceBranch = (& git -C $ProjectRoot branch --show-current).Trim()

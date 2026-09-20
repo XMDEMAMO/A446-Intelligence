@@ -28,6 +28,30 @@ test("local artifact store verifies and reopens a LAN artifact", async (t) => {
   assert.equal(Buffer.concat(chunks).toString("utf8"), content.toString("utf8"));
 });
 
+test("local artifact store dynamically calculates size and sha256 when streaming", async (t) => {
+  const directory = await mkdtemp(path.join(os.tmpdir(), "a446-artifacts-dyn-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const store = new LocalArtifactStore({ rootDirectory: directory, maxFileBytes: 1024 });
+  await store.init();
+  const content = Buffer.from("dynamic upload content\n", "utf8");
+  const expectedHash = createHash("sha256").update(content).digest("hex");
+  const artifact = {
+    artifactId: randomUUID(),
+    storageKey: store.createStorageKey(),
+  };
+
+  const result = await store.receive(Readable.from(content), artifact);
+  assert.equal(result.size, content.length);
+  assert.equal(result.sha256, expectedHash);
+  assert.equal(artifact.size, content.length);
+  assert.equal(artifact.sha256, expectedHash);
+
+  const opened = await store.open(artifact);
+  const chunks = [];
+  for await (const chunk of opened.stream) chunks.push(chunk);
+  assert.equal(Buffer.concat(chunks).toString("utf8"), content.toString("utf8"));
+});
+
 test("local artifact store rejects escaped storage keys", async () => {
   const store = new LocalArtifactStore({ rootDirectory: path.resolve(os.tmpdir(), "a446-artifact-root") });
   assert.throws(() => store.resolveStorageKey("../outside"), /Invalid local storage key/);
@@ -92,4 +116,24 @@ test("legacy private-LAN token binds artifact upload to the declared Agent", asy
   });
   assert.equal(download.status, 200);
   assert.equal(await download.text(), content.toString("utf8"));
+
+  const attachmentContent = Buffer.from("user attached document\n", "utf8");
+  const attachmentUpload = await fetch(`${hub.url()}/v1/attachments?filename=requirements.md`, {
+    method: "POST",
+    headers: { authorization: "Bearer test-private-lan-token", "content-type": "text/markdown" },
+    body: attachmentContent,
+  });
+  const attachmentText = await attachmentUpload.text();
+  assert.equal(attachmentUpload.status, 201, attachmentText);
+  const attachmentArtifact = JSON.parse(attachmentText).artifact;
+  assert.equal(attachmentArtifact.path, "requirements.md");
+  assert.equal(attachmentArtifact.size, attachmentContent.length);
+  assert.equal(attachmentArtifact.status, "ready");
+
+  const attachmentDownload = await fetch(`${hub.url()}/v1/artifacts/${attachmentArtifact.artifactId}/content`, {
+    headers: { authorization: "Bearer test-private-lan-token" },
+  });
+  assert.equal(attachmentDownload.status, 200);
+  assert.equal(await attachmentDownload.text(), attachmentContent.toString("utf8"));
 });
+

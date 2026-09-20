@@ -17,6 +17,7 @@ import {
   sendConversationMessage,
   sendHubCommand,
   setLanAccessToken,
+  uploadAttachment,
 } from './hub-api'
 import { failedConnectionMode, nextPollDelay, NORMAL_POLL_MS, permitsServerMutation } from './sync-policy.js'
 import type {
@@ -33,6 +34,7 @@ import type {
   QuotaSnapshot,
   QuotaWindow,
   TokenUsage,
+  UploadedAttachment,
   WebUser,
 } from './types'
 
@@ -46,6 +48,7 @@ interface WorkflowDraft {
   modelPreference: string
   reasoningEffort: string
   maxReviewCycles: number
+  attachments: File[]
 }
 
 type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated'
@@ -64,6 +67,7 @@ const statusName: Record<string, string> = {
   completed: '已完成',
   failed: '异常',
   needs_human: '需人工',
+  stalled: '停滞未决',
   queued: '排队中',
   dispatched: '已指派',
   running: '执行中',
@@ -96,6 +100,7 @@ function emptyDraft(): WorkflowDraft {
     modelPreference: '',
     reasoningEffort: '',
     maxReviewCycles: 2,
+    attachments: [],
   }
 }
 
@@ -346,19 +351,29 @@ function App() {
       setNotice('所选执行 Agent 已离线、暂停或角色不匹配，请重新选择。')
       return
     }
-    const request: CreateWorkflowRequest = {
-      title: draft.title.trim() || draft.objective.trim().slice(0, 40),
-      objective: draft.objective.trim(),
-      acceptance: draft.acceptance.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
-      plannerAgentId: draft.plannerAgentId || null,
-      executorAgentId: draft.executorAgentId || null,
-      reviewerAgentId: draft.reviewerAgentId || null,
-      modelPreference: draft.modelPreference || null,
-      reasoningEffort: draft.reasoningEffort || null,
-      maxReviewCycles: Math.min(5, Math.max(0, Number.isFinite(draft.maxReviewCycles) ? draft.maxReviewCycles : 2)),
-    }
     setSubmitting(true)
     try {
+      let uploadedAttachments: UploadedAttachment[] | undefined
+      if (draft.attachments.length > 0) {
+        setNotice(`正在上传 ${draft.attachments.length} 个附件…`)
+        uploadedAttachments = []
+        for (const file of draft.attachments) {
+          const uploaded = await uploadAttachment(file)
+          uploadedAttachments.push(uploaded)
+        }
+      }
+      const request: CreateWorkflowRequest = {
+        title: draft.title.trim() || draft.objective.trim().slice(0, 40),
+        objective: draft.objective.trim(),
+        acceptance: draft.acceptance.split(/\r?\n/).map((line) => line.trim()).filter(Boolean),
+        plannerAgentId: draft.plannerAgentId || null,
+        executorAgentId: draft.executorAgentId || null,
+        reviewerAgentId: draft.reviewerAgentId || null,
+        modelPreference: draft.modelPreference || null,
+        reasoningEffort: draft.reasoningEffort || null,
+        maxReviewCycles: Math.min(5, Math.max(0, Number.isFinite(draft.maxReviewCycles) ? draft.maxReviewCycles : 2)),
+        attachments: uploadedAttachments,
+      }
       const result = await createWorkflow(request)
       setSelectedRootId(result.task.rootTaskId ?? result.task.taskId)
       setDraft(emptyDraft())
@@ -556,6 +571,28 @@ function App() {
     }
   }
 
+  async function resumeStalledWorkflow(action: 'replan' | 'force_complete') {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    if (action === 'force_complete' && currentUser?.role !== 'admin') return
+    const confirmMsg = action === 'force_complete'
+      ? `确认强制结案此工作流？（标题：“${selectedConversation.title}”）`
+      : `确认通知规划 Agent 对工作流重新规划？`
+    if (!window.confirm(confirmMsg)) return
+    setWorkingAction(`stalled:${action}`)
+    try {
+      const type = action === 'force_complete' ? 'workflow.force_complete' : 'workflow.replan'
+      await sendHubCommand({ type, rootTaskId })
+      setNotice(action === 'force_complete' ? '已强制结案' : '已触发重新规划')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, action === 'force_complete' ? '强制结案失败' : '重新规划触发失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
   async function loadFullMessage(message: HubMessage) {
     if (message.attachments.every((attachment) => attachment.type !== 'full_result' || attachment.content !== undefined)) return
     if (connectionMode !== 'live' || loadingMessageIds.has(message.messageId)) {
@@ -706,6 +743,34 @@ function App() {
                   {detail?.rootTaskId !== selectedConversation.rootTaskId && <div className="workflow-loading">正在加载当前会话摘要…</div>}
                 </div>
 
+                {selectedConversation.status === 'stalled' && (
+                  <div className="stalled-banner">
+                    <div className="stalled-copy">
+                      <strong>⚠️ 任务停滞未决</strong>
+                      <p>当前所有任务已停止，但未收到 Planner 明确结案指令。您可以通知 Planner 重新规划，或由管理员直接强制结案。</p>
+                    </div>
+                    <div className="stalled-actions">
+                      <button
+                        type="button"
+                        disabled={!canWrite || Boolean(workingAction)}
+                        onClick={() => void resumeStalledWorkflow('replan')}
+                      >
+                        🔄 重新规划
+                      </button>
+                      {currentUser?.role === 'admin' && (
+                        <button
+                          type="button"
+                          className="danger"
+                          disabled={!canWrite || Boolean(workingAction)}
+                          onClick={() => void resumeStalledWorkflow('force_complete')}
+                        >
+                          ✓ 强制结案
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
                 <section className="message-stream" aria-label="任务群聊消息">
                   <div className="chat-date">任务创建于 {formatDate(selectedConversation.createdAt)}</div>
                   {selectedMessages.map((message) => (
@@ -792,6 +857,54 @@ function App() {
             <label>任务名称<input value={draft.title} onChange={(event) => setDraft({ ...draft, title: event.target.value })} placeholder="例如：改进发布流程" /></label>
             <label>目标<textarea required rows={5} value={draft.objective} onChange={(event) => setDraft({ ...draft, objective: event.target.value })} placeholder="说明最终要解决的问题；规划 Agent 会负责拆分和指派。" /></label>
             <label>验收标准<textarea rows={3} value={draft.acceptance} onChange={(event) => setDraft({ ...draft, acceptance: event.target.value })} placeholder={'每行一项，例如：\n功能通过自动测试\n审核 Agent 确认无回归'} /></label>
+            <div className="attachment-picker">
+              <div className="attachment-picker-header">
+                <span>任务附件 <small>（可选，单个文件最大 100MB）</small></span>
+                <label className="attachment-add-btn" htmlFor="task-attachment-input">
+                  + 添加附件
+                </label>
+                <input
+                  id="task-attachment-input"
+                  type="file"
+                  multiple
+                  style={{ display: 'none' }}
+                  onChange={(event) => {
+                    const files = Array.from(event.target.files ?? [])
+                    if (files.length === 0) return
+                    const existing = new Set(draft.attachments.map((f) => f.name))
+                    const next = files.filter((f) => !existing.has(f.name))
+                    setDraft({ ...draft, attachments: [...draft.attachments, ...next] })
+                    event.target.value = ''
+                  }}
+                />
+              </div>
+              {draft.attachments.length > 0 ? (
+                <div className="attachment-chips">
+                  {draft.attachments.map((file, index) => (
+                    <div className="attachment-chip" key={`${file.name}-${index}`}>
+                      <span className="attachment-chip-icon">📎</span>
+                      <span className="attachment-chip-name" title={file.name}>{file.name}</span>
+                      <span className="attachment-chip-size">{formatBytes(file.size)}</span>
+                      <button
+                        type="button"
+                        className="attachment-chip-remove"
+                        title="移除附件"
+                        onClick={() => {
+                          setDraft({
+                            ...draft,
+                            attachments: draft.attachments.filter((_, i) => i !== index),
+                          })
+                        }}
+                      >
+                        ×
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="attachment-empty-hint">支持附带需求文档、代码、数据表或配置文件，创建后将自动分发给规划与执行 Agent。</div>
+              )}
+            </div>
             <div className="form-grid">
               <label>规划 Agent<select value={draft.plannerAgentId} onChange={(event) => setDraft({ ...draft, plannerAgentId: event.target.value })}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>执行 Agent<select value={draft.executorAgentId} onChange={(event) => setDraft({ ...draft, executorAgentId: event.target.value })}><option value="">自动调度</option>{compatibleExecutors.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId} · {executorStatus(agent)}</option>)}</select></label>

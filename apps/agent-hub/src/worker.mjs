@@ -494,7 +494,7 @@ export class AgentWorker {
       const usage = normalizeUsage(result.usage);
       if (usage) this.state.usageTotals = addUsage(this.state.usageTotals, usage);
       await this.refreshQuota();
-      const submission = parseRoleSubmission(role, result.output);
+      const submission = parseRoleSubmission(role, result.output, message.payload?.stage ?? null);
       const checkpoint = await this.checkpoints.save(message, "COMPLETED", {
         sessionId: this.state.sessionId,
         output: result.output,

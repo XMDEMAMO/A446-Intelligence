@@ -326,7 +326,7 @@ export interface HubMessage {
 export interface Conversation {
   rootTaskId: string
   title: string
-  status: 'active' | 'completed' | 'failed' | 'needs_human' | 'cancelled' | string
+  status: 'active' | 'completed' | 'failed' | 'needs_human' | 'cancelled' | 'stalled' | string
   createdAt: string
   updatedAt: string
   participants: string[]
@@ -381,6 +381,15 @@ export interface ConversationDetail {
   interventions: HumanIntervention[]
 }
 
+export interface UploadedAttachment {
+  artifactId: string
+  path: string
+  size: number
+  sha256: string
+  originalName?: string
+  downloadUrl?: string
+}
+
 export interface CreateWorkflowRequest {
   title: string
   objective: string
@@ -391,4 +400,5 @@ export interface CreateWorkflowRequest {
   modelPreference?: string | null
   reasoningEffort?: string | null
   maxReviewCycles: number
+  attachments?: UploadedAttachment[]
 }
