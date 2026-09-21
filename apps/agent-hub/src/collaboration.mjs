@@ -9,6 +9,7 @@ export const STAGE_SET = new Set([
   "result_review",
   "upstream_review",
   "result_intake",
+  "hub_finalization",
 ]);
 const QUOTA_SCORE = { Healthy: 30, Unknown: 10, Low: -40, Exhausted: -1000 };
 
@@ -760,7 +761,22 @@ function normalizeExpectedOutputs(value) {
   }).filter(Boolean);
 }
 
-export function modelCostTier(modelId) {
+export function getModelCostTier(model) {
+  if (!model) return 2;
+  if (typeof model === "object") {
+    if (typeof model.costTier === "number" && [1, 2, 3].includes(model.costTier)) {
+      return model.costTier;
+    }
+    return inferTierFromName(model.id);
+  }
+  return inferTierFromName(model);
+}
+
+export function modelCostTier(modelOrId) {
+  return getModelCostTier(modelOrId);
+}
+
+function inferTierFromName(modelId) {
   if (!modelId || typeof modelId !== "string") return 2;
   const id = modelId.toLowerCase();
   // Tier 1: Fast, lightweight, economical models (preferred for automatic selection)
@@ -791,6 +807,40 @@ export function modelCostTier(modelId) {
   return 2;
 }
 
+function extractModelString(val) {
+  if (typeof val === "string" && val.trim()) return val.trim();
+  if (val && typeof val === "object" && typeof val.modelPreference === "string" && val.modelPreference.trim()) {
+    return val.modelPreference.trim();
+  }
+  return null;
+}
+
+function extractReasoningString(val) {
+  if (typeof val === "string" && val.trim()) return val.trim();
+  if (val && typeof val === "object" && typeof val.reasoningEffort === "string" && val.reasoningEffort.trim()) {
+    return val.reasoningEffort.trim();
+  }
+  return null;
+}
+
+export function normalizeStageModels(stageModels, directPrefs = {}) {
+  const sm = stageModels && typeof stageModels === "object" ? stageModels : {};
+  return {
+    planner: {
+      modelPreference: extractModelString(directPrefs.plannerModelPreference ?? sm.planner),
+      reasoningEffort: extractReasoningString(directPrefs.plannerReasoningEffort ?? sm.planner),
+    },
+    reviewer: {
+      modelPreference: extractModelString(directPrefs.reviewerModelPreference ?? sm.reviewer),
+      reasoningEffort: extractReasoningString(directPrefs.reviewerReasoningEffort ?? sm.reviewer),
+    },
+    intake: {
+      modelPreference: extractModelString(directPrefs.intakeModelPreference ?? sm.intake),
+      reasoningEffort: extractReasoningString(directPrefs.intakeReasoningEffort ?? sm.intake),
+    },
+  };
+}
+
 export function isPreferredQuotaSnapshot(candidate, current) {
   if (!candidate) return false;
   if (!current) return true;
@@ -803,7 +853,7 @@ export function isPreferredQuotaSnapshot(candidate, current) {
   return candidateTime > currentTime;
 }
 
-export function chooseModel(agent, request, strict = true) {
+export function chooseModel(agent, request = {}, strict = true) {
   const agentCapabilities = new Set(agent.capabilities ?? []);
   const requiredCapabilities = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
   const configuredModels = agent.models ?? [];
@@ -827,11 +877,33 @@ export function chooseModel(agent, request, strict = true) {
     }
     return { id: null, capabilities: [] };
   }
-  return [...models].sort((a, b) => (
-    quotaScore(b.quota?.state) - quotaScore(a.quota?.state) ||
-    modelCostTier(a.id) - modelCostTier(b.id) ||
-    a.id.localeCompare(b.id)
-  ))[0];
+
+  const role = request.role ?? null;
+  return [...models].sort((a, b) => {
+    // 1. Quota health score (Healthy > Low > Unknown)
+    const quotaDiff = quotaScore(b.quota?.state) - quotaScore(a.quota?.state);
+    if (quotaDiff !== 0) return quotaDiff;
+
+    // 2. Recommended role match (if model explicitly declares recommendedRoles)
+    const bRoleMatch = role && Array.isArray(b.recommendedRoles) && b.recommendedRoles.includes(role) ? 1 : 0;
+    const aRoleMatch = role && Array.isArray(a.recommendedRoles) && a.recommendedRoles.includes(role) ? 1 : 0;
+    if (bRoleMatch !== aRoleMatch) return bRoleMatch - aRoleMatch;
+
+    // 3. Cost tier: Tier 1 (fast/economical) > Tier 2 (standard) > Tier 3 (heavy/flagship)
+    const tierA = getModelCostTier(a);
+    const tierB = getModelCostTier(b);
+    if (tierA !== tierB) {
+      return tierA - tierB;
+    }
+
+    // 4. isDefault bonus
+    const bDefault = b.isDefault ? 1 : 0;
+    const aDefault = a.isDefault ? 1 : 0;
+    if (bDefault !== aDefault) return bDefault - aDefault;
+
+    // 5. Stable alphabetical tie-breaker
+    return String(a.id ?? "").localeCompare(String(b.id ?? ""));
+  })[0];
 }
 
 function scoreAgent(agent, request) {

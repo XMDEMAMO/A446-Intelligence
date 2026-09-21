@@ -344,6 +344,16 @@ function App() {
   const compatibleReviewers = (overview?.agents ?? []).filter((agent) => acceptsRole(agent, 'reviewer'))
   const models = [...new Set(compatiblePlanners.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
 
+  const selectedPlannerAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
+  const plannerModels = selectedPlannerAgent && selectedPlannerAgent.models?.length
+    ? [...new Set(selectedPlannerAgent.models.filter((m) => m.enabled !== false && m.id).map((m) => (typeof m === 'string' ? m : m.id as string)))]
+    : models
+
+  const selectedReviewerAgent = compatibleReviewers.find((a) => a.agentId === draft.reviewerAgentId)
+  const reviewerModels = selectedReviewerAgent && selectedReviewerAgent.models?.length
+    ? [...new Set(selectedReviewerAgent.models.filter((m) => m.enabled !== false && m.id).map((m) => (typeof m === 'string' ? m : m.id as string)))]
+    : [...new Set(compatibleReviewers.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [selectedMessages.length, selectedConversation?.rootTaskId])
@@ -364,6 +374,20 @@ function App() {
     if (draft.executorAgentId && !compatibleExecutors.some((agent) => agent.agentId === draft.executorAgentId)) {
       setNotice('所选执行 Agent 已离线、暂停或角色不匹配，请重新选择。')
       return
+    }
+    if (draft.plannerAgentId && draft.modelPreference) {
+      const pAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
+      if (pAgent && !pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.modelPreference)) {
+        setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持模型 '${draft.modelPreference}'，请重新选择。`)
+        return
+      }
+    }
+    if (draft.reviewerAgentId && draft.reviewerModelPreference) {
+      const rAgent = compatibleReviewers.find((a) => a.agentId === draft.reviewerAgentId)
+      if (rAgent && !rAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)) {
+        setNotice(`所选审核 Agent '${draft.reviewerAgentId}' 不支持模型 '${draft.reviewerModelPreference}'，请重新选择。`)
+        return
+      }
     }
     setSubmitting(true)
     try {
@@ -945,23 +969,41 @@ function App() {
               )}
             </div>
             <div className="form-grid">
-              <label>规划 Agent<select value={draft.plannerAgentId} onChange={(event) => setDraft({ ...draft, plannerAgentId: event.target.value })}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
+              <label>规划 Agent<select value={draft.plannerAgentId} onChange={(event) => {
+                const nextPlannerId = event.target.value
+                const pAgent = compatiblePlanners.find((a) => a.agentId === nextPlannerId)
+                const validModel = pAgent && draft.modelPreference && pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.modelPreference)
+                setDraft({
+                  ...draft,
+                  plannerAgentId: nextPlannerId,
+                  modelPreference: validModel || !nextPlannerId ? draft.modelPreference : '',
+                })
+              }}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>执行 Agent<select value={draft.executorAgentId} onChange={(event) => setDraft({ ...draft, executorAgentId: event.target.value })}><option value="">自动调度</option>{compatibleExecutors.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId} · {executorStatus(agent)}</option>)}</select></label>
-              <label>审核 Agent<select value={draft.reviewerAgentId} onChange={(event) => setDraft({ ...draft, reviewerAgentId: event.target.value })}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
-              <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => setDraft({ ...draft, modelPreference: event.target.value })}><option value="">自动选择</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+              <label>审核 Agent<select value={draft.reviewerAgentId} onChange={(event) => {
+                const nextReviewerId = event.target.value
+                const rAgent = compatibleReviewers.find((a) => a.agentId === nextReviewerId)
+                const validModel = rAgent && draft.reviewerModelPreference && rAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)
+                setDraft({
+                  ...draft,
+                  reviewerAgentId: nextReviewerId,
+                  reviewerModelPreference: validModel || !nextReviewerId ? draft.reviewerModelPreference : '',
+                })
+              }}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
+              <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => setDraft({ ...draft, modelPreference: event.target.value })}><option value="">自动选择</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
               <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label>
               <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
             </div>
             <details className="stage-models-accordion">
               <summary><strong>阶段模型策略与高级设置</strong><small>（自定义审核、结果接收模型与快速结案）</small></summary>
               <div className="form-grid" style={{ marginTop: '0.75rem' }}>
-                <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => setDraft({ ...draft, reviewerModelPreference: event.target.value })}><option value="">自动分级（推荐轻量模型）</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => setDraft({ ...draft, reviewerModelPreference: event.target.value })}><option value="">自动分级（推荐轻量模型）</option>{reviewerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
                 <label>审核推理强度<select value={draft.reviewerReasoningEffort} onChange={(event) => setDraft({ ...draft, reviewerReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
-                <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => setDraft({ ...draft, intakeModelPreference: event.target.value })}><option value="">继承规划模型</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => setDraft({ ...draft, intakeModelPreference: event.target.value })}><option value="">继承规划模型</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
                 <label>结果接收推理强度<select value={draft.intakeReasoningEffort} onChange={(event) => setDraft({ ...draft, intakeReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
                 <label style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                   <input type="checkbox" checked={draft.fastPath} onChange={(event) => setDraft({ ...draft, fastPath: event.target.checked })} />
-                  <span>启用确定性快速闭环 (Fast Path)：同批子任务全部审核通过后直接结案，跳过多余 LLM 问答</span>
+                  <span>[实验性] 启用 Hub 确定性结案 (Fast Path)：仅在当前批次子任务全部审核通过时直接由 Hub 结案，跳过额外 LLM 汇总问答</span>
                 </label>
               </div>
             </details>

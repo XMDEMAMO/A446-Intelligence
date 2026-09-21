@@ -7,7 +7,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
-import { addUsage, bindModelQuotas, chooseAgent, isPreferredQuotaSnapshot, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, isPreferredQuotaSnapshot, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeStageModels, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
@@ -807,12 +807,14 @@ export class AgentHub {
 
   createTask(input) {
     const taskId = randomUUID();
-    const role = normalizeRoles(input.role)[0] ?? null;
+    const role = input.role === "system" ? "system" : (normalizeRoles(input.role)[0] ?? null);
     const rootTaskId = input.rootTaskId ?? taskId;
     const task = {
       taskId,
       rootTaskId,
       parentTaskId: input.parentTaskId,
+      batchId: input.batchId ?? null,
+      planningTaskId: input.planningTaskId ?? null,
       targetAgentId: input.targetAgentId ?? null,
       requestedAgentId: input.requestedAgentId ?? input.targetAgentId ?? null,
       sourceAgentId: input.sourceAgentId ?? "human",
@@ -881,19 +883,41 @@ export class AgentHub {
       const reason = !executor ? "unknown" : executor.status !== "online" ? "offline" : executor.paused ? "paused" : !executor.roles?.includes("executor") ? "role_mismatch" : null;
       if (reason) throw httpError(409, `Executor ${executorAgentId} is unavailable`, "EXECUTOR_UNAVAILABLE", { reason, agentId: executorAgentId });
     }
+    const normalizedStages = normalizeStageModels(input.stageModels, {
+      plannerModelPreference: input.plannerModelPreference ?? input.modelPreference,
+      plannerReasoningEffort: input.plannerReasoningEffort ?? input.reasoningEffort,
+      reviewerModelPreference: input.reviewerModelPreference,
+      reviewerReasoningEffort: input.reviewerReasoningEffort,
+      intakeModelPreference: input.intakeModelPreference,
+      intakeReasoningEffort: input.intakeReasoningEffort,
+    });
+
+    if (input.plannerAgentId && normalizedStages.planner.modelPreference) {
+      const plannerAgent = this.agents.get(input.plannerAgentId);
+      if (plannerAgent && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.planner.modelPreference)) {
+        throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected model '${normalizedStages.planner.modelPreference}'`, "INCOMPATIBLE_MODEL");
+      }
+    }
+    if (input.reviewerAgentId && normalizedStages.reviewer.modelPreference) {
+      const reviewerAgent = this.agents.get(input.reviewerAgentId);
+      if (reviewerAgent && !reviewerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.reviewer.modelPreference)) {
+        throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' does not support selected model '${normalizedStages.reviewer.modelPreference}'`, "INCOMPATIBLE_MODEL");
+      }
+    }
+
     const workflow = {
       enabled: true,
       plannerAgentId: input.plannerAgentId ?? null,
       executorAgentId,
       reviewerAgentId: input.reviewerAgentId ?? null,
       maxReviewCycles: Math.max(0, Number(input.maxReviewCycles ?? 2)),
-      plannerModelPreference: input.plannerModelPreference ?? input.stageModels?.planner?.modelPreference ?? input.modelPreference ?? null,
-      plannerReasoningEffort: input.plannerReasoningEffort ?? input.stageModels?.planner?.reasoningEffort ?? input.reasoningEffort ?? null,
-      reviewerModelPreference: input.reviewerModelPreference ?? input.stageModels?.reviewer?.modelPreference ?? null,
-      reviewerReasoningEffort: input.reviewerReasoningEffort ?? input.stageModels?.reviewer?.reasoningEffort ?? null,
-      intakeModelPreference: input.intakeModelPreference ?? input.stageModels?.intake?.modelPreference ?? null,
-      intakeReasoningEffort: input.intakeReasoningEffort ?? input.stageModels?.intake?.reasoningEffort ?? null,
-      stageModels: input.stageModels ?? null,
+      plannerModelPreference: normalizedStages.planner.modelPreference,
+      plannerReasoningEffort: normalizedStages.planner.reasoningEffort,
+      reviewerModelPreference: normalizedStages.reviewer.modelPreference,
+      reviewerReasoningEffort: normalizedStages.reviewer.reasoningEffort,
+      intakeModelPreference: normalizedStages.intake.modelPreference,
+      intakeReasoningEffort: normalizedStages.intake.reasoningEffort,
+      stageModels: normalizedStages,
       fastPath: Boolean(input.fastPath),
     };
 
@@ -918,8 +942,8 @@ export class AgentHub {
       stage: "planning",
       workflow,
       requiredCapabilities: input.requiredCapabilities,
-      modelPreference: input.modelPreference,
-      reasoningEffort: input.reasoningEffort,
+      modelPreference: workflow.plannerModelPreference,
+      reasoningEffort: workflow.plannerReasoningEffort,
       requiresApproval: Boolean(input.requiresApproval),
       taskSpec: {
         title: String(input.title ?? input.objective).trim().slice(0, 200),
@@ -1152,17 +1176,18 @@ export class AgentHub {
       }
 
       const root = this.getCanonicalRootTask(task.rootTaskId);
-      const reviewerModel = task.workflow?.reviewerModelPreference
+      const rawReviewerModel = task.workflow?.reviewerModelPreference
         ?? root?.workflow?.reviewerModelPreference
         ?? task.workflow?.stageModels?.reviewer?.modelPreference
         ?? root?.workflow?.stageModels?.reviewer?.modelPreference
-        ?? task.workflow?.stageModels?.reviewer
         ?? null;
-      const reviewerReasoning = task.workflow?.reviewerReasoningEffort
+      const reviewerModel = typeof rawReviewerModel === "string" ? rawReviewerModel.trim() || null : null;
+      const rawReviewerReasoning = task.workflow?.reviewerReasoningEffort
         ?? root?.workflow?.reviewerReasoningEffort
         ?? task.workflow?.stageModels?.reviewer?.reasoningEffort
         ?? root?.workflow?.stageModels?.reviewer?.reasoningEffort
         ?? null;
+      const reviewerReasoning = typeof rawReviewerReasoning === "string" ? rawReviewerReasoning.trim() || null : null;
 
       const reviewer = this.createTask({
         targetAgentId: reviewerAgentId,
@@ -1223,56 +1248,96 @@ export class AgentHub {
         (t) => t.rootTaskId === root.taskId || this.getCanonicalRootTask(t)?.taskId === root.taskId
       );
       const activeTasks = tasks.filter((t) => !t.superseded);
+      const currentBatchId = reviewed.batchId ?? reviewed.parentTaskId;
 
-      // Check if other sibling execution or review tasks in this workflow are still in flight
-      const hasRunningExecution = activeTasks.some(
-        (t) => t.role === "executor" && ACTIVE_TASK_STATUSES.has(t.status)
+      // Identify all active (non-superseded) executors belonging to this batch
+      const batchExecutors = activeTasks.filter(
+        (t) => t.role === "executor" && (t.batchId === currentBatchId || t.parentTaskId === currentBatchId)
       );
-      const hasRunningReview = activeTasks.some(
-        (t) => t.role === "reviewer" && t.taskId !== task.taskId && ACTIVE_TASK_STATUSES.has(t.status)
+
+      // Check if any sibling execution tasks in this batch are still active or pending review
+      const hasRunningExecution = batchExecutors.some((t) => ACTIVE_TASK_STATUSES.has(t.status));
+      const hasPendingReview = batchExecutors.some(
+        (t) => t.status === "completed" && (!t.reviewStatus || t.reviewStatus === "pending")
       );
-      const hasPendingReview = activeTasks.some(
-        (t) => t.role === "executor" && t.status === "completed" && (!t.reviewStatus || t.reviewStatus === "pending")
-      );
+      const hasRunningReview = activeTasks.some((t) => {
+        if (t.role !== "reviewer" || t.taskId === task.taskId) return false;
+        const parent = this.tasks.get(t.parentTaskId);
+        const parentBatch = parent?.batchId ?? parent?.parentTaskId;
+        return parentBatch === currentBatchId && ACTIVE_TASK_STATUSES.has(t.status);
+      });
 
       if (hasRunningExecution || hasRunningReview || hasPendingReview) {
         // Other siblings in the current batch are still executing or undergoing review.
-        // Wait for all siblings in the batch to complete review before triggering intake.
         return;
       }
 
-      // All active execution tasks in the batch are now approved!
-      const activeExecutionTasks = activeTasks.filter((t) => t.role === "executor");
-      const latestIntake = tasks.filter((t) => t.role === "planner" && t.stage === "result_intake" && t.status === "completed").at(-1);
-      const intakeCutoff = latestIntake ? Date.parse(latestIntake.completedAt ?? latestIntake.createdAt) : 0;
-      const currentBatchTasks = activeExecutionTasks.filter((t) => (Date.parse(t.completedAt ?? t.createdAt) || 0) > intakeCutoff);
-      const batchTasks = currentBatchTasks.length > 0 ? currentBatchTasks : activeExecutionTasks;
+      // CRITICAL SAFETY CHECK: Verify that ALL batch executors completed successfully and are approved.
+      // If any task failed, was cancelled, was rejected, or has an unapproved reviewStatus:
+      const failedOrUnapproved = batchExecutors.filter(
+        (t) => t.status !== "completed" || t.reviewStatus !== "approved"
+      );
+      if (failedOrUnapproved.length > 0) {
+        const failureDetails = failedOrUnapproved
+          .map((t) => `'${t.taskSpec?.title ?? t.taskId}' (status: ${t.status}, review: ${t.reviewStatus ?? "none"})`)
+          .join(", ");
+        this.requireHuman(
+          task,
+          `当前批次存在未成功完成或未获通过的子任务 [${failureDetails}]，禁止自动进入结果汇总。请人工介入排查。`
+        );
+        return;
+      }
 
-      const aggregatedBrief = batchTasks.length === 1
-        ? (batchTasks[0].submission?.brief ?? "执行完成")
-        : batchTasks.map((t) => `【${t.taskSpec?.title ?? t.taskId}】: ${t.submission?.brief ?? "执行完成"}`).join("\n");
-      const aggregatedArtifacts = batchTasks.flatMap((t) => (t.artifacts?.files ?? []).map(toArtifactReference));
+      // Concurrency deduplication: Check if an intake or finalization task for this batch already exists
+      const existingIntake = tasks.find(
+        (t) => (t.stage === "result_intake" || t.stage === "hub_finalization") &&
+          (t.batchId === currentBatchId || t.contextBundle?.batchId === currentBatchId)
+      );
+      if (existingIntake) {
+        return;
+      }
+
+      // Aggregate briefs from ALL completed executors in this batch
+      const aggregatedBrief = batchExecutors.length === 1
+        ? (batchExecutors[0].submission?.brief ?? "执行完成")
+        : batchExecutors.map((t) => `【${t.taskSpec?.title ?? t.taskId}】: ${t.submission?.brief ?? "执行完成"}`).join("\n");
+      const aggregatedArtifacts = batchExecutors.flatMap((t) => (t.artifacts?.files ?? []).map(toArtifactReference));
+
+      // Aggregate briefs from ALL completed reviewers in this batch
+      const batchReviewers = tasks.filter((t) => {
+        if (t.role !== "reviewer" || t.status !== "completed") return false;
+        const p = this.tasks.get(t.parentTaskId);
+        return (p?.batchId === currentBatchId || p?.parentTaskId === currentBatchId);
+      });
+      const aggregatedReviewBrief = batchReviewers.length <= 1
+        ? (submission.brief ?? "审核通过")
+        : batchReviewers.map((r) => {
+            const p = this.tasks.get(r.parentTaskId);
+            return `【${p?.taskSpec?.title ?? r.taskId}】: ${r.submission?.brief ?? r.submission?.verdict ?? "审核通过"}`;
+          }).join("\n");
 
       if (root.workflow?.fastPath) {
         const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
         if (!reservation.ok) {
-          this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法调度 Planner：${reservation.error}`);
+          this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法执行快速结案：${reservation.error}`);
           return;
         }
-        const intake = this.createTask({
+        const finalization = this.createTask({
           targetAgentId: root.workflow?.plannerAgentId ?? task.targetAgentId,
-          input: "全量子任务已审核通过，确定性快速结案。",
+          input: "全量子任务已审核通过，Hub 确定性结案（实验功能）。",
           rootTaskId: root.taskId,
           parentTaskId: task.taskId,
-          sourceAgentId: task.targetAgentId,
-          role: "planner",
-          stage: "result_intake",
+          sourceAgentId: "system",
+          sourceRole: "system",
+          role: "system",
+          stage: "hub_finalization",
+          batchId: currentBatchId,
           quotaReserved: true,
           workflow: root.workflow,
           sessionScopeId: `${root.taskId}:intake`,
           taskSpec: {
-            title: "接收审核结果（确定性快速结案）",
-            type: "result_intake",
+            title: "Hub 确定性结案（实验功能）",
+            type: "hub_finalization",
             priority: "P1",
             permissions_required: { project_workspace: true },
             acceptance: [],
@@ -1280,33 +1345,35 @@ export class AgentHub {
           contextBundle: {
             approved: true,
             fastPath: true,
-            batchCount: batchTasks.length,
+            batchId: currentBatchId,
+            batchCount: batchExecutors.length,
             executorBrief: aggregatedBrief,
-            reviewBrief: submission.brief,
+            reviewBrief: aggregatedReviewBrief,
             artifactReferences: aggregatedArtifacts,
           },
         });
-        intake.status = "completed";
-        intake.completedAt = new Date().toISOString();
-        intake.submission = {
+        finalization.status = "completed";
+        finalization.completedAt = new Date().toISOString();
+        finalization.submission = {
           decision: "complete",
-          brief: `当前批次所有子任务（${batchTasks.length}个）均已通过审核并交付完整成果，确定性快速结案完成。`,
+          brief: `当前批次所有子任务（${batchExecutors.length}个）均已通过审核并交付完整成果，Hub 确定性结案（实验功能）完成。`,
           assignments: [],
           needsHuman: false,
         };
-        intake.output = intake.submission.brief;
-        intake.workflowDecision = "complete";
-        this.finishTaskActivity(intake);
-        this.markTask(intake);
+        finalization.output = finalization.submission.brief;
+        finalization.workflowDecision = "complete";
+        this.finishTaskActivity(finalization);
+        this.markTask(finalization);
         this.checkAndFinalizeWorkflow(root.taskId);
         return;
       }
 
       await this.createPlannerIntake(task, reviewed, "result_intake", {
         approved: true,
-        batchCount: batchTasks.length,
+        batchId: currentBatchId,
+        batchCount: batchExecutors.length,
         executorBrief: aggregatedBrief,
-        reviewBrief: submission.brief,
+        reviewBrief: aggregatedReviewBrief,
         artifactReferences: aggregatedArtifacts,
       });
       return;
@@ -1384,6 +1451,8 @@ export class AgentHub {
         input: assignment.instructions,
         rootTaskId: task.rootTaskId,
         parentTaskId: task.taskId,
+        batchId: task.taskId,
+        planningTaskId: task.taskId,
         sourceAgentId: task.targetAgentId,
         role: "executor",
         stage: "execution",
@@ -1473,6 +1542,7 @@ export class AgentHub {
       input: stage === "replan" ? "根据已确认的上游错误重新安排后续任务。" : "接收已审核通过的任务简报，并决定是否继续安排任务。",
       rootTaskId: reviewTask.rootTaskId,
       parentTaskId: reviewTask.taskId,
+      batchId: details.batchId ?? null,
       sourceAgentId: reviewTask.targetAgentId,
       role: "planner",
       stage,
@@ -1506,6 +1576,8 @@ export class AgentHub {
       input: details.upstreamDenied ? "审核未认可上游错误报告，请继续原任务。" : "根据审核意见修改原成果。",
       rootTaskId: reviewTask.rootTaskId,
       parentTaskId: reviewTask.taskId,
+      batchId: reviewed.batchId ?? reviewed.parentTaskId,
+      planningTaskId: reviewed.planningTaskId ?? reviewed.parentTaskId,
       sourceAgentId: reviewTask.targetAgentId,
       role: "executor",
       stage: "revision",
@@ -1853,8 +1925,11 @@ export class AgentHub {
       }
     }
 
-    // Pillar 3: Planner explicitly decided 'complete' in result_intake stage
-    const intakeTask = tasks.filter((t) => t.role === "planner" && t.stage === "result_intake" && t.status === "completed").at(-1);
+    // Pillar 3: Planner explicitly decided 'complete' in result_intake stage OR Hub deterministic finalization completed
+    const intakeTask = tasks.filter((t) => (
+      (t.role === "planner" && t.stage === "result_intake") ||
+      (t.role === "system" && t.stage === "hub_finalization")
+    ) && t.status === "completed").at(-1);
     if (!intakeTask || intakeTask.submission?.decision !== "complete") {
       return false;
     }
