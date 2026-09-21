@@ -382,9 +382,9 @@ test("planner, executor, and reviewer form one minimal-context task conversation
     assert.deepEqual(hub.messages.filter((message) => message.kind === "task_instruction").map((message) => message.senderRole), ["human", "planner", "executor", "reviewer"]);
     assert.equal(hub.conversations()[0].messageCount, hub.messages.length);
     assert.equal(hub.usageTotals.totalTokens, 40);
-    assert.deepEqual(Object.keys(workers[0].state.sessions), [rootId]);
+    assert.deepEqual(Object.keys(workers[0].state.sessions).sort(), [rootId, `${rootId}:intake`].sort());
     assert.deepEqual(Object.keys(workers[1].state.sessions), [tasks.find((task) => task.role === "executor").sessionScopeId]);
-    assert.equal(tasks.find((task) => task.stage === "result_intake").sessionScopeId, rootId);
+    assert.equal(tasks.find((task) => task.stage === "result_intake").sessionScopeId, `${rootId}:intake`);
   } finally {
     await Promise.all(workers.map((worker) => worker.stop()));
     await hub.stop();

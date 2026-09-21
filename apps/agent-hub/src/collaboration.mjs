@@ -208,7 +208,11 @@ export function buildRolePrompt(role, input, payload = {}) {
     }
   }
 
-  const bundle = payload.contextBundle && typeof payload.contextBundle === "object" ? payload.contextBundle : {};
+  let bundle = payload.contextBundle && typeof payload.contextBundle === "object" ? payload.contextBundle : {};
+  if (stage === "result_intake" && bundle.schedulerCatalog) {
+    const { schedulerCatalog, ...rest } = bundle;
+    bundle = rest;
+  }
   return [
     `ROLE: ${role}`,
     `STAGE: ${stage}`,
@@ -756,7 +760,50 @@ function normalizeExpectedOutputs(value) {
   }).filter(Boolean);
 }
 
-function chooseModel(agent, request, strict = true) {
+export function modelCostTier(modelId) {
+  if (!modelId || typeof modelId !== "string") return 2;
+  const id = modelId.toLowerCase();
+  // Tier 1: Fast, lightweight, economical models (preferred for automatic selection)
+  if (
+    id.includes("flash") ||
+    id.includes("mini") ||
+    id.includes("haiku") ||
+    id.includes("luna") ||
+    id.includes("lite") ||
+    id.includes("small") ||
+    id.includes("fast") ||
+    id.includes("low")
+  ) {
+    return 1;
+  }
+  // Tier 3: Heavyweight, flagship models (should not be chosen by default over lightweight models)
+  if (
+    id.includes("opus") ||
+    id.includes("o1") ||
+    id.includes("o3") ||
+    id.includes("max") ||
+    id.includes("heavy") ||
+    id.includes("ultra")
+  ) {
+    return 3;
+  }
+  // Tier 2: Standard models (pro, sonnet, 4o, standard default)
+  return 2;
+}
+
+export function isPreferredQuotaSnapshot(candidate, current) {
+  if (!candidate) return false;
+  if (!current) return true;
+  const candidateValid = !candidate.stale && !candidate.errorSummary && (candidate.windows?.length ?? 0) > 0;
+  const currentValid = !current.stale && !current.errorSummary && (current.windows?.length ?? 0) > 0;
+  if (candidateValid && !currentValid) return true;
+  if (!candidateValid && currentValid) return false;
+  const candidateTime = Date.parse(candidate.lastSuccessAt ?? candidate.checkedAt ?? 0) || 0;
+  const currentTime = Date.parse(current.lastSuccessAt ?? current.checkedAt ?? 0) || 0;
+  return candidateTime > currentTime;
+}
+
+export function chooseModel(agent, request, strict = true) {
   const agentCapabilities = new Set(agent.capabilities ?? []);
   const requiredCapabilities = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
   const configuredModels = agent.models ?? [];
@@ -780,7 +827,11 @@ function chooseModel(agent, request, strict = true) {
     }
     return { id: null, capabilities: [] };
   }
-  return [...models].sort((a, b) => quotaScore(b.quota?.state) - quotaScore(a.quota?.state) || a.id.localeCompare(b.id))[0];
+  return [...models].sort((a, b) => (
+    quotaScore(b.quota?.state) - quotaScore(a.quota?.state) ||
+    modelCostTier(a.id) - modelCostTier(b.id) ||
+    a.id.localeCompare(b.id)
+  ))[0];
 }
 
 function scoreAgent(agent, request) {

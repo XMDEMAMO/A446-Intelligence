@@ -7,7 +7,7 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
-import { addUsage, bindModelQuotas, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, isPreferredQuotaSnapshot, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
@@ -887,6 +887,14 @@ export class AgentHub {
       executorAgentId,
       reviewerAgentId: input.reviewerAgentId ?? null,
       maxReviewCycles: Math.max(0, Number(input.maxReviewCycles ?? 2)),
+      plannerModelPreference: input.plannerModelPreference ?? input.stageModels?.planner?.modelPreference ?? input.modelPreference ?? null,
+      plannerReasoningEffort: input.plannerReasoningEffort ?? input.stageModels?.planner?.reasoningEffort ?? input.reasoningEffort ?? null,
+      reviewerModelPreference: input.reviewerModelPreference ?? input.stageModels?.reviewer?.modelPreference ?? null,
+      reviewerReasoningEffort: input.reviewerReasoningEffort ?? input.stageModels?.reviewer?.reasoningEffort ?? null,
+      intakeModelPreference: input.intakeModelPreference ?? input.stageModels?.intake?.modelPreference ?? null,
+      intakeReasoningEffort: input.intakeReasoningEffort ?? input.stageModels?.intake?.reasoningEffort ?? null,
+      stageModels: input.stageModels ?? null,
+      fastPath: Boolean(input.fastPath),
     };
 
     const initialArtifacts = [];
@@ -1143,6 +1151,19 @@ export class AgentHub {
         return;
       }
 
+      const root = this.getCanonicalRootTask(task.rootTaskId);
+      const reviewerModel = task.workflow?.reviewerModelPreference
+        ?? root?.workflow?.reviewerModelPreference
+        ?? task.workflow?.stageModels?.reviewer?.modelPreference
+        ?? root?.workflow?.stageModels?.reviewer?.modelPreference
+        ?? task.workflow?.stageModels?.reviewer
+        ?? null;
+      const reviewerReasoning = task.workflow?.reviewerReasoningEffort
+        ?? root?.workflow?.reviewerReasoningEffort
+        ?? task.workflow?.stageModels?.reviewer?.reasoningEffort
+        ?? root?.workflow?.stageModels?.reviewer?.reasoningEffort
+        ?? null;
+
       const reviewer = this.createTask({
         targetAgentId: reviewerAgentId,
         input: reviewKind === "upstream_review" ? "审核执行 Agent 提交的上游错误报告。" : "审核执行 Agent 提交的完整成果。",
@@ -1153,6 +1174,8 @@ export class AgentHub {
         stage: reviewKind,
         quotaReserved: true,
         workflow: task.workflow,
+        modelPreference: reviewerModel,
+        reasoningEffort: reviewerReasoning,
         reviewCycle: task.reviewCycle,
         taskSpec: {
           title: reviewKind === "upstream_review" ? "上游错误裁定" : `审核：${task.taskSpec?.title ?? "执行成果"}`,
@@ -1195,11 +1218,96 @@ export class AgentHub {
     this.markTask(reviewed);
 
     if (verdict === "approved") {
+      const root = this.getCanonicalRootTask(task.rootTaskId) ?? task;
+      const tasks = [...this.tasks.values()].filter(
+        (t) => t.rootTaskId === root.taskId || this.getCanonicalRootTask(t)?.taskId === root.taskId
+      );
+      const activeTasks = tasks.filter((t) => !t.superseded);
+
+      // Check if other sibling execution or review tasks in this workflow are still in flight
+      const hasRunningExecution = activeTasks.some(
+        (t) => t.role === "executor" && ACTIVE_TASK_STATUSES.has(t.status)
+      );
+      const hasRunningReview = activeTasks.some(
+        (t) => t.role === "reviewer" && t.taskId !== task.taskId && ACTIVE_TASK_STATUSES.has(t.status)
+      );
+      const hasPendingReview = activeTasks.some(
+        (t) => t.role === "executor" && t.status === "completed" && (!t.reviewStatus || t.reviewStatus === "pending")
+      );
+
+      if (hasRunningExecution || hasRunningReview || hasPendingReview) {
+        // Other siblings in the current batch are still executing or undergoing review.
+        // Wait for all siblings in the batch to complete review before triggering intake.
+        return;
+      }
+
+      // All active execution tasks in the batch are now approved!
+      const activeExecutionTasks = activeTasks.filter((t) => t.role === "executor");
+      const latestIntake = tasks.filter((t) => t.role === "planner" && t.stage === "result_intake" && t.status === "completed").at(-1);
+      const intakeCutoff = latestIntake ? Date.parse(latestIntake.completedAt ?? latestIntake.createdAt) : 0;
+      const currentBatchTasks = activeExecutionTasks.filter((t) => (Date.parse(t.completedAt ?? t.createdAt) || 0) > intakeCutoff);
+      const batchTasks = currentBatchTasks.length > 0 ? currentBatchTasks : activeExecutionTasks;
+
+      const aggregatedBrief = batchTasks.length === 1
+        ? (batchTasks[0].submission?.brief ?? "执行完成")
+        : batchTasks.map((t) => `【${t.taskSpec?.title ?? t.taskId}】: ${t.submission?.brief ?? "执行完成"}`).join("\n");
+      const aggregatedArtifacts = batchTasks.flatMap((t) => (t.artifacts?.files ?? []).map(toArtifactReference));
+
+      if (root.workflow?.fastPath) {
+        const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
+        if (!reservation.ok) {
+          this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法调度 Planner：${reservation.error}`);
+          return;
+        }
+        const intake = this.createTask({
+          targetAgentId: root.workflow?.plannerAgentId ?? task.targetAgentId,
+          input: "全量子任务已审核通过，确定性快速结案。",
+          rootTaskId: root.taskId,
+          parentTaskId: task.taskId,
+          sourceAgentId: task.targetAgentId,
+          role: "planner",
+          stage: "result_intake",
+          quotaReserved: true,
+          workflow: root.workflow,
+          sessionScopeId: `${root.taskId}:intake`,
+          taskSpec: {
+            title: "接收审核结果（确定性快速结案）",
+            type: "result_intake",
+            priority: "P1",
+            permissions_required: { project_workspace: true },
+            acceptance: [],
+          },
+          contextBundle: {
+            approved: true,
+            fastPath: true,
+            batchCount: batchTasks.length,
+            executorBrief: aggregatedBrief,
+            reviewBrief: submission.brief,
+            artifactReferences: aggregatedArtifacts,
+          },
+        });
+        intake.status = "completed";
+        intake.completedAt = new Date().toISOString();
+        intake.submission = {
+          decision: "complete",
+          brief: `当前批次所有子任务（${batchTasks.length}个）均已通过审核并交付完整成果，确定性快速结案完成。`,
+          assignments: [],
+          needsHuman: false,
+        };
+        intake.output = intake.submission.brief;
+        intake.workflowDecision = "complete";
+        this.finishTaskActivity(intake);
+        this.markTask(intake);
+        this.checkAndFinalizeWorkflow(root.taskId);
+        return;
+      }
+
       await this.createPlannerIntake(task, reviewed, "result_intake", {
         approved: true,
-        executorBrief: reviewed.submission?.brief,
+        batchCount: batchTasks.length,
+        executorBrief: aggregatedBrief,
         reviewBrief: submission.brief,
-        artifactReferences: (reviewed.artifacts?.files ?? []).map(toArtifactReference),
+        artifactReferences: aggregatedArtifacts,
       });
       return;
     }
@@ -1337,11 +1445,28 @@ export class AgentHub {
   }
 
   async createPlannerIntake(reviewTask, reviewed, stage, details) {
-    const root = this.tasks.get(reviewTask.rootTaskId);
+    const root = this.getCanonicalRootTask(reviewTask.rootTaskId);
     const reservation = this.reserveWorkflowInvocations(reviewTask.rootTaskId, 1);
     if (!reservation.ok) {
       this.requireHuman(reviewTask, `工作流累计任务调用已达上限（50次），无法调度 Planner：${reservation.error}`);
       return;
+    }
+    const plannerModel = root?.workflow?.intakeModelPreference
+      ?? root?.workflow?.stageModels?.intake?.modelPreference
+      ?? root?.workflow?.plannerModelPreference
+      ?? root?.workflow?.stageModels?.planner?.modelPreference
+      ?? null;
+    const plannerReasoning = root?.workflow?.intakeReasoningEffort
+      ?? root?.workflow?.stageModels?.intake?.reasoningEffort
+      ?? root?.workflow?.plannerReasoningEffort
+      ?? root?.workflow?.stageModels?.planner?.reasoningEffort
+      ?? null;
+    const sessionScopeId = stage === "result_intake"
+      ? `${reviewTask.rootTaskId}:intake`
+      : (root?.sessionScopeId ?? reviewTask.rootTaskId);
+    const contextBundle = { ...details };
+    if (stage !== "result_intake") {
+      contextBundle.schedulerCatalog = this.schedulerCatalog();
     }
     const planner = this.createTask({
       targetAgentId: reviewTask.workflow?.plannerAgentId,
@@ -1353,7 +1478,9 @@ export class AgentHub {
       stage,
       quotaReserved: true,
       workflow: root?.workflow ?? reviewTask.workflow,
-      sessionScopeId: root?.sessionScopeId ?? reviewTask.rootTaskId,
+      sessionScopeId,
+      modelPreference: plannerModel,
+      reasoningEffort: plannerReasoning,
       taskSpec: {
         title: stage === "replan" ? "重新规划" : "接收审核结果",
         type: stage,
@@ -1361,7 +1488,7 @@ export class AgentHub {
         permissions_required: { project_workspace: true },
         acceptance: [],
       },
-      contextBundle: { ...details, schedulerCatalog: this.schedulerCatalog() },
+      contextBundle,
     });
     await this.queueOrDispatch(planner);
   }
@@ -1388,6 +1515,8 @@ export class AgentHub {
       revision: Number(reviewed.revision ?? 1) + 1,
       superseded: false,
       sessionScopeId: reviewed.sessionScopeId,
+      modelPreference: reviewed.modelPreference ?? null,
+      reasoningEffort: reviewed.reasoningEffort ?? null,
       reviewCycle,
       taskSpec: reviewed.taskSpec,
       contextBundle: {
@@ -1738,7 +1867,8 @@ export class AgentHub {
     if (!root) return;
     if (this.isWorkflowComplete(root.taskId)) {
       root.status = "completed";
-      root.completedAt = new Date().toISOString();
+      root.completedAt = root.completedAt ?? new Date().toISOString();
+      root.workflowCompletedAt = new Date().toISOString();
       this.finishTaskActivity(root);
       this.markTask(root);
       this.queueEvent("workflow.completed", { rootTaskId: root.taskId });
@@ -2503,7 +2633,7 @@ export class AgentHub {
           current.agentIds.push(item.agentId);
           if (!current.deviceIds.includes(item.deviceId)) current.deviceIds.push(item.deviceId);
           if (item.usageTotals) current.usageTotals = addUsage(current.usageTotals, item.usageTotals);
-          if (item.quotaSnapshot && (!current.quotaSnapshot || Date.parse(item.quotaSnapshot.checkedAt) > Date.parse(current.quotaSnapshot.checkedAt))) {
+          if (item.quotaSnapshot && isPreferredQuotaSnapshot(item.quotaSnapshot, current.quotaSnapshot)) {
             current.quotaSnapshot = item.quotaSnapshot;
           }
           accounts.set(key, current);
@@ -2749,6 +2879,16 @@ export class AgentHub {
         this.refundWorkflowInvocation(root.taskId, 1);
         throw httpError(400, "Workflow does not specify a planner Agent");
       }
+      const replanModel = command.modelPreference
+        ?? root.workflow?.plannerModelPreference
+        ?? root.workflow?.stageModels?.planner?.modelPreference
+        ?? root.modelPreference
+        ?? null;
+      const replanReasoning = command.reasoningEffort
+        ?? root.workflow?.plannerReasoningEffort
+        ?? root.workflow?.stageModels?.planner?.reasoningEffort
+        ?? root.reasoningEffort
+        ?? null;
       const replanTask = this.createTask({
         targetAgentId: plannerId,
         input: command.instructions || "用户要求对当前工作流重新进行任务规划。",
@@ -2760,6 +2900,8 @@ export class AgentHub {
         quotaReserved: true,
         workflow: root.workflow,
         sessionScopeId: root.sessionScopeId ?? root.taskId,
+        modelPreference: replanModel,
+        reasoningEffort: replanReasoning,
         taskSpec: {
           title: "人工触发重新规划",
           type: "replan",

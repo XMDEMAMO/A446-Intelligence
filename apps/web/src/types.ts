@@ -261,6 +261,14 @@ export interface HubTask {
     executorAgentId?: string | null
     reviewerAgentId?: string | null
     maxReviewCycles?: number
+    fastPath?: boolean
+    plannerModelPreference?: string | null
+    plannerReasoningEffort?: string | null
+    reviewerModelPreference?: string | null
+    reviewerReasoningEffort?: string | null
+    intakeModelPreference?: string | null
+    intakeReasoningEffort?: string | null
+    stageModels?: Record<string, { modelPreference?: string | null; reasoningEffort?: string | null }> | null
   } | null
   sessionScopeId?: string | null
   taskSpec?: TaskSpec | null
@@ -268,6 +276,7 @@ export interface HubTask {
   execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
   model?: string | null
   usage?: TokenUsage | null
+  usageTotals?: TokenUsage | null
   submission?: RoleSubmission
   reviewStatus?: string
   reviewCycle?: number
@@ -293,6 +302,7 @@ export interface HubTask {
   dispatchedAt?: string
   startedAt?: string
   completedAt?: string
+  workflowCompletedAt?: string
   output?: string
   error?: { name?: string; message?: string; code?: string; reasons?: string[] }
   artifacts?: ArtifactManifest
@@ -390,6 +400,11 @@ export interface UploadedAttachment {
   downloadUrl?: string
 }
 
+export interface StageModelPolicy {
+  modelPreference?: string | null
+  reasoningEffort?: string | null
+}
+
 export interface CreateWorkflowRequest {
   title: string
   objective: string
@@ -401,4 +416,16 @@ export interface CreateWorkflowRequest {
   reasoningEffort?: string | null
   maxReviewCycles: number
   attachments?: UploadedAttachment[]
+  plannerModelPreference?: string | null
+  plannerReasoningEffort?: string | null
+  reviewerModelPreference?: string | null
+  reviewerReasoningEffort?: string | null
+  intakeModelPreference?: string | null
+  intakeReasoningEffort?: string | null
+  stageModels?: {
+    planner?: StageModelPolicy
+    reviewer?: StageModelPolicy
+    intake?: StageModelPolicy
+  } | null
+  fastPath?: boolean
 }

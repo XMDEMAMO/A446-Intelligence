@@ -49,6 +49,13 @@ interface WorkflowDraft {
   reasoningEffort: string
   maxReviewCycles: number
   attachments: File[]
+  fastPath: boolean
+  plannerModelPreference: string
+  plannerReasoningEffort: string
+  reviewerModelPreference: string
+  reviewerReasoningEffort: string
+  intakeModelPreference: string
+  intakeReasoningEffort: string
 }
 
 type AuthStatus = 'checking' | 'authenticated' | 'unauthenticated'
@@ -101,6 +108,13 @@ function emptyDraft(): WorkflowDraft {
     reasoningEffort: '',
     maxReviewCycles: 2,
     attachments: [],
+    fastPath: false,
+    plannerModelPreference: '',
+    plannerReasoningEffort: '',
+    reviewerModelPreference: '',
+    reviewerReasoningEffort: '',
+    intakeModelPreference: '',
+    intakeReasoningEffort: '',
   }
 }
 
@@ -373,6 +387,27 @@ function App() {
         reasoningEffort: draft.reasoningEffort || null,
         maxReviewCycles: Math.min(5, Math.max(0, Number.isFinite(draft.maxReviewCycles) ? draft.maxReviewCycles : 2)),
         attachments: uploadedAttachments,
+        fastPath: draft.fastPath,
+        plannerModelPreference: draft.plannerModelPreference || draft.modelPreference || null,
+        plannerReasoningEffort: draft.plannerReasoningEffort || draft.reasoningEffort || null,
+        reviewerModelPreference: draft.reviewerModelPreference || null,
+        reviewerReasoningEffort: draft.reviewerReasoningEffort || null,
+        intakeModelPreference: draft.intakeModelPreference || null,
+        intakeReasoningEffort: draft.intakeReasoningEffort || null,
+        stageModels: {
+          planner: {
+            modelPreference: draft.plannerModelPreference || draft.modelPreference || null,
+            reasoningEffort: draft.plannerReasoningEffort || draft.reasoningEffort || null,
+          },
+          reviewer: {
+            modelPreference: draft.reviewerModelPreference || null,
+            reasoningEffort: draft.reviewerReasoningEffort || null,
+          },
+          intake: {
+            modelPreference: draft.intakeModelPreference || null,
+            reasoningEffort: draft.intakeReasoningEffort || null,
+          },
+        },
       }
       const result = await createWorkflow(request)
       setSelectedRootId(result.task.rootTaskId ?? result.task.taskId)
@@ -728,18 +763,22 @@ function App() {
                 </header>
 
                 <div className="workflow-strip">
-                  {selectedTasks.map((task, index) => (
-                    <div className={`workflow-step ${task.status} ${task.schedulingError ? 'has-error' : ''}`} key={task.taskId} title={task.taskSpec?.title}>
-                      <span>{index + 1}</span>
-                      <div>
-                        <strong>{roleName[task.role ?? ''] ?? 'Agent'}</strong>
-                        <small>{statusName[task.status] ?? task.status}</small>
-                        {(task.targetAgentId || task.requestedAgentId) && <em>{task.targetAgentId ? `实际：${task.targetAgentId}` : `等待：${task.requestedAgentId}`}</em>}
-                        {task.schedulingError && <mark title={task.schedulingErrorCode ?? undefined}>{task.schedulingError}</mark>}
+                  {selectedTasks.map((task, index) => {
+                    const duration = task.startedAt && task.completedAt ? formatDuration(task.startedAt, task.completedAt) : null
+                    const tokens = task.usageTotals?.totalTokens ?? task.usage?.totalTokens
+                    return (
+                      <div className={`workflow-step ${task.status} ${task.schedulingError ? 'has-error' : ''}`} key={task.taskId} title={task.taskSpec?.title}>
+                        <span>{index + 1}</span>
+                        <div>
+                          <strong>{roleName[task.role ?? ''] ?? 'Agent'}</strong>
+                          <small>{statusName[task.status] ?? task.status}{duration ? ` · ${duration}` : ''}{tokens ? ` · ${formatTokens(tokens)}` : ''}</small>
+                          {(task.targetAgentId || task.requestedAgentId) && <em>{task.targetAgentId ? `实际：${task.targetAgentId}` : `等待：${task.requestedAgentId}`}</em>}
+                          {task.schedulingError && <mark title={task.schedulingErrorCode ?? undefined}>{task.schedulingError}</mark>}
+                        </div>
+                        {currentUser?.role === 'admin' && activeTaskStatuses.has(task.status) && <button type="button" disabled={!canWrite || Boolean(workingAction)} onClick={() => void cancelTask(task)}>取消</button>}
                       </div>
-                      {currentUser?.role === 'admin' && activeTaskStatuses.has(task.status) && <button type="button" disabled={!canWrite || Boolean(workingAction)} onClick={() => void cancelTask(task)}>取消</button>}
-                    </div>
-                  ))}
+                    )
+                  })}
                   {detail?.rootTaskId !== selectedConversation.rootTaskId && <div className="workflow-loading">正在加载当前会话摘要…</div>}
                 </div>
 
@@ -913,6 +952,19 @@ function App() {
               <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label>
               <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
             </div>
+            <details className="stage-models-accordion">
+              <summary><strong>阶段模型策略与高级设置</strong><small>（自定义审核、结果接收模型与快速结案）</small></summary>
+              <div className="form-grid" style={{ marginTop: '0.75rem' }}>
+                <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => setDraft({ ...draft, reviewerModelPreference: event.target.value })}><option value="">自动分级（推荐轻量模型）</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>审核推理强度<select value={draft.reviewerReasoningEffort} onChange={(event) => setDraft({ ...draft, reviewerReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+                <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => setDraft({ ...draft, intakeModelPreference: event.target.value })}><option value="">继承规划模型</option>{models.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>结果接收推理强度<select value={draft.intakeReasoningEffort} onChange={(event) => setDraft({ ...draft, intakeReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+                <label style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                  <input type="checkbox" checked={draft.fastPath} onChange={(event) => setDraft({ ...draft, fastPath: event.target.checked })} />
+                  <span>启用确定性快速闭环 (Fast Path)：同批子任务全部审核通过后直接结案，跳过多余 LLM 问答</span>
+                </label>
+              </div>
+            </details>
             <div className="executor-candidates">
               <strong>Executor 候选状态</strong>
               {allExecutors.length > 0 ? allExecutors.map((agent) => <span className={isEligibleExecutor(agent) ? 'eligible' : 'unavailable'} key={agent.agentId}><b>{agent.agentId}</b>{executorStatus(agent)}</span>) : <span className="unavailable">当前没有声明 executor 角色的 Agent</span>}
@@ -951,7 +1003,23 @@ function MessageBubble({ message, task, agents, loadingFullResult, onLoadFullRes
             {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}>{file.status === 'ready' && file.downloadUrl ? <button type="button" onClick={() => void downloadArtifact(file.downloadUrl!, file.path).catch((error) => window.alert(error instanceof Error ? error.message : '成果下载失败'))}>{file.path}</button> : <span>{file.path}</span>}<small>{file.status} · {formatBytes(file.size)}</small></div>)}
           </details>
         ))}
-        {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage) && <div className="message-metrics"><span>{task.model ?? task.execution?.model ?? '默认模型'}</span>{task.usage && <><span>输入 {formatTokens(task.usage.inputTokens)}</span><span>输出 {formatTokens(task.usage.outputTokens)}</span><b>共 {formatTokens(task.usage.totalTokens)} tokens</b></>}</div>}
+        {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage || task?.usageTotals) && (
+          <div className="message-metrics">
+            <span>{task.model ?? task.execution?.model ?? '默认模型'}</span>
+            {(task.usageTotals || task.usage) && (() => {
+              const u = task.usageTotals ?? task.usage!
+              const dur = task.startedAt && task.completedAt ? formatDuration(task.startedAt, task.completedAt) : null
+              return (
+                <>
+                  <span>输入 {formatTokens(u.inputTokens)}</span>
+                  <span>输出 {formatTokens(u.outputTokens)}</span>
+                  <b>共 {formatTokens(u.totalTokens)} tokens</b>
+                  {dur && <span>耗时 {dur}</span>}
+                </>
+              )
+            })()}
+          </div>
+        )}
       </div>
     </article>
   )
@@ -968,7 +1036,8 @@ function Participant({ agent }: { agent: Agent }) {
   const memory = resource?.capabilities?.device?.memory?.totalBytes
   const resourceLabel = resource?.state === 'available' ? '资源可用' : resource?.state === 'stale' ? '资源陈旧' : resource?.state === 'unavailable' ? '部分不可用' : '资源未知'
   const modelResourceLabel = resource?.models?.state === 'available' ? '模型可用' : resource?.models?.state === 'stale' ? '模型陈旧' : resource?.models?.state === 'unavailable' ? '模型不可用' : '模型来源待确认'
-  const resourceTitle = resource ? `探测：${formatDate(resource.checkedAt)}${resource.errorSummary ? `；${resource.errorSummary}` : ''}` : '尚未收到统一资源快照'
+  const sanitizedError = resource?.errorSummary ? resource.errorSummary.split(/[\r\n]/)[0].slice(0, 120) : null
+  const resourceTitle = resource ? `探测：${formatDate(resource.checkedAt)}${sanitizedError ? `；${sanitizedError}` : ''}` : '尚未收到统一资源快照'
   return (
     <div className="participant">
       <AgentAvatar agent={agent} />
@@ -1060,6 +1129,29 @@ function isAgentRole(value: string): value is AgentRole {
   return value === 'planner' || value === 'executor' || value === 'reviewer'
 }
 
+function formatDuration(start: string, end?: string | null): string {
+  const s = Date.parse(start)
+  const e = Date.parse(end ?? new Date().toISOString())
+  if (!s || !e || e < s) return ''
+  const diffSec = Math.round((e - s) / 1000)
+  if (diffSec < 60) return `${diffSec}s`
+  const min = Math.floor(diffSec / 60)
+  const sec = diffSec % 60
+  return sec > 0 ? `${min}m${sec}s` : `${min}m`
+}
+
+function isPreferredQuotaSnapshot(candidate: QuotaSnapshot | null | undefined, current: QuotaSnapshot | null | undefined): boolean {
+  if (!candidate) return false
+  if (!current) return true
+  const candidateValid = !candidate.stale && !candidate.errorSummary && (candidate.windows?.length ?? 0) > 0
+  const currentValid = !current.stale && !current.errorSummary && (current.windows?.length ?? 0) > 0
+  if (candidateValid && !currentValid) return true
+  if (!candidateValid && currentValid) return false
+  const candidateTime = Date.parse(candidate.lastSuccessAt ?? candidate.checkedAt ?? '0') || 0
+  const currentTime = Date.parse(current.lastSuccessAt ?? current.checkedAt ?? '0') || 0
+  return candidateTime > currentTime
+}
+
 function groupAccountUsage(agents: Agent[]) {
   const empty = (): TokenUsage => ({ inputTokens: 0, outputTokens: 0, cachedTokens: 0, reasoningTokens: 0, toolTokens: 0, totalTokens: 0 })
   const groups = new Map<string, { key: string; label: string; provider: string; plan: string; usage: TokenUsage; agents: Agent[]; devices: Set<string>; quota: QuotaSnapshot | null }>()
@@ -1079,7 +1171,7 @@ function groupAccountUsage(agents: Agent[]) {
     group.devices.add(agent.deviceId ?? agent.agentId)
     for (const field of Object.keys(group.usage) as Array<keyof TokenUsage>) group.usage[field] += agent.usageTotals?.[field] ?? 0
     const candidate = agent.quotaSnapshot
-    if (candidate && (!group.quota || Date.parse(candidate.checkedAt) > Date.parse(group.quota.checkedAt))) group.quota = candidate
+    if (candidate && isPreferredQuotaSnapshot(candidate, group.quota)) group.quota = candidate
     groups.set(key, group)
   }
   return [...groups.values()]

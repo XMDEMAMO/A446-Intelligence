@@ -45,6 +45,7 @@ try {
     'scripts\stop-lan-multidevice.ps1',
     'scripts\build-lan-package.ps1',
     'scripts\test-lan-runtime.ps1',
+    'scripts\test-package-structure.ps1',
     'docs\AI_AGENT_MANUAL.md',
     'apps\agent-hub\AI_IMPLEMENTATION_GUIDE.md',
     'apps\agent-hub\package.json',
@@ -100,7 +101,8 @@ try {
   }
   $manifest | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath (Join-Path $stagingRoot 'PACKAGE-MANIFEST.json') -Encoding UTF8
 
-  Compress-Archive -LiteralPath $stagingRoot -DestinationPath $ZipPath -CompressionLevel Optimal
+  Add-Type -AssemblyName 'System.IO.Compression.FileSystem'
+  [System.IO.Compression.ZipFile]::CreateFromDirectory($stagingRoot, $ZipPath, [System.IO.Compression.CompressionLevel]::Optimal, $false)
   $hash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
   Set-Content -LiteralPath $HashPath -Value "$hash  $([System.IO.Path]::GetFileName($ZipPath))" -Encoding Ascii
   Write-Output "PACKAGE=$ZipPath"
