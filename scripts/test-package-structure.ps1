@@ -19,6 +19,22 @@ Write-Host "Verifying ZIP package structure: $ZipPath"
 
 $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
 try {
+  # 0. Explicit security gate: no absolute paths (/ or \), drive letters (^[a-zA-Z]:), or path traversal (..)
+  Write-Host "Verifying entry path security constraints (no absolute paths, drive letters, or path traversal)..."
+  foreach ($rawEntry in $archive.Entries) {
+    $rawName = $rawEntry.FullName
+    if ($rawName.StartsWith('/') -or $rawName.StartsWith('\')) {
+      throw "Security gate failed: ZIP contains entry with absolute path: '$rawName'"
+    }
+    if ($rawName -match '^[a-zA-Z]:') {
+      throw "Security gate failed: ZIP contains entry with drive letter: '$rawName'"
+    }
+    if ($rawName -match '(^|[\\/])\.\.([\\/]|$)') {
+      throw "Security gate failed: ZIP contains entry with path traversal: '$rawName'"
+    }
+  }
+  Write-Host "Path traversal and absolute path security gates PASSED!" -ForegroundColor Green
+
   $entries = $archive.Entries | ForEach-Object { $_.FullName.Replace('\', '/') }
 
   # 1. Verify root files exist directly without directory prefix
@@ -105,7 +121,20 @@ try {
   $archive.Dispose()
 }
 
-# 5. Simulate extraction to $PackageName folder and verify direct accessibility
+# 5. Verify companion .sha256 file matches the ZIP package
+$companionSha256Path = "$ZipPath.sha256"
+if (-not (Test-Path -LiteralPath $companionSha256Path)) {
+  throw "Companion SHA-256 file not found: $companionSha256Path"
+}
+$actualZipHash = (Get-FileHash -LiteralPath $ZipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$expectedShaContent = (Get-Content -LiteralPath $companionSha256Path -Raw).Trim()
+$expectedZipHash = ($expectedShaContent -split '\s+')[0].ToLowerInvariant()
+if ($actualZipHash -ne $expectedZipHash) {
+  throw "ZIP file hash ($actualZipHash) does not match companion .sha256 file ($expectedZipHash)!"
+}
+Write-Host "Companion .sha256 hash match PASSED ($actualZipHash)!" -ForegroundColor Green
+
+# 6. Simulate extraction to $PackageName folder and verify direct accessibility
 $tempPath = [System.IO.Path]::GetTempPath()
 $simGuid = [System.Guid]::NewGuid().ToString()
 $testExtractDir = Join-Path $tempPath "pkg-sim-extract-$simGuid"
