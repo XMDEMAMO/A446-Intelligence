@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { AgentHub } from "../src/hub.mjs";
-import { chooseModel, isPreferredQuotaSnapshot, modelCostTier } from "../src/collaboration.mjs";
+import { chooseModel, isPreferredQuotaSnapshot, modelCostTier, normalizeModels } from "../src/collaboration.mjs";
 
 function agent(agentId, role, overrides = {}) {
   return {
@@ -415,4 +415,246 @@ test("P1: Concurrent reviewer completions spawn only 1 result_intake task", asyn
   assert.equal(intakeTasks[0].contextBundle.batchCount, 2);
   assert.match(intakeTasks[0].contextBundle.reviewBrief, /Rev1 approved/);
   assert.match(intakeTasks[0].contextBundle.reviewBrief, /Rev2 approved/);
+});
+
+test("P0: Auto Reviewer selection filters by reviewerModelPreference or escalates to human review", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+  hub.agents.set("reviewer-1", agent("reviewer-1", "reviewer", {
+    models: [{ id: "model-tier3", capabilities: ["validation"], quota: { state: "Healthy" } }],
+  }));
+  hub.agents.set("reviewer-2", agent("reviewer-2", "reviewer", {
+    models: [{ id: "model-tier1", capabilities: ["validation"], quota: { state: "Healthy" } }],
+  }));
+
+  // Workflow with reviewerModelPreference = 'model-tier1'
+  const root = hub.createTask({
+    input: "Auto reviewer model filtering test",
+    role: "planner",
+    targetAgentId: "planner-1",
+    workflow: {
+      enabled: true,
+      plannerAgentId: "planner-1",
+      executorAgentId: "executor-1",
+      reviewerModelPreference: "model-tier1",
+    },
+  });
+
+  await hub.dispatchAssignments(root, [
+    { title: "Task 1", instructions: "Build component A", expectedOutputs: ["a.js"] },
+  ]);
+
+  const [execTask] = [...hub.tasks.values()].filter((t) => t.role === "executor");
+  execTask.status = "completed";
+  execTask.submission = { brief: "Finished", fullResult: "code" };
+  await hub.advanceWorkflow(execTask);
+
+  const reviewerTask = [...hub.tasks.values()].find((t) => t.role === "reviewer");
+  assert.ok(reviewerTask, "Reviewer task should be created");
+  assert.equal(reviewerTask.targetAgentId, "reviewer-2", "Should pick reviewer-2 which supports model-tier1");
+
+  // Now test when NO reviewer supports the requested model
+  const hub2 = new AgentHub({ logs: { includePayloads: true } });
+  hub2.agents.set("planner-1", agent("planner-1", "planner"));
+  hub2.agents.set("executor-1", agent("executor-1", "executor"));
+  hub2.agents.set("reviewer-1", agent("reviewer-1", "reviewer", {
+    models: [{ id: "model-tier3", capabilities: ["validation"], quota: { state: "Healthy" } }],
+  }));
+
+  const root2 = hub2.createTask({
+    input: "No compatible reviewer test",
+    role: "planner",
+    targetAgentId: "planner-1",
+    workflow: {
+      enabled: true,
+      plannerAgentId: "planner-1",
+      executorAgentId: "executor-1",
+      reviewerModelPreference: "model-nonexistent",
+    },
+  });
+
+  await hub2.dispatchAssignments(root2, [
+    { title: "Task 2", instructions: "Build component B", expectedOutputs: ["b.js"] },
+  ]);
+
+  const [execTask2] = [...hub2.tasks.values()].filter((t) => t.role === "executor");
+  execTask2.status = "completed";
+  execTask2.submission = { brief: "Finished", fullResult: "code" };
+  await hub2.advanceWorkflow(execTask2);
+
+  // Instead of hanging, an intervention should have been created
+  const interventions = [...hub2.interventions.values()];
+  assert.ok(interventions.length > 0, "Intervention should be created when no reviewer supports the model");
+  const reviewIntervention = interventions.find((i) => i.continuation?.type === "human_review");
+  assert.ok(reviewIntervention, "Should create human_review intervention");
+  assert.match(reviewIntervention.question, /model-nonexistent/);
+});
+
+test("P0/P1: createWorkflow pre-validates intakeModelPreference and reasoningEffort against model declarations", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner", {
+    models: [
+      { id: "model-planner-1", reasoningEfforts: ["low", "medium"], capabilities: ["reasoning"], quota: { state: "Healthy" } },
+      { id: "model-planner-2", capabilities: ["reasoning"], quota: { state: "Healthy" } },
+    ],
+  }));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+  hub.agents.set("reviewer-1", agent("reviewer-1", "reviewer", {
+    models: [
+      { id: "model-rev-1", reasoningEfforts: ["low"], capabilities: ["validation"], quota: { state: "Healthy" } },
+    ],
+  }));
+
+  // 1. Incompatible intakeModelPreference
+  await assert.rejects(
+    async () => {
+      await hub.createWorkflow({
+        objective: "Test objective",
+        plannerAgentId: "planner-1",
+        intakeModelPreference: "model-unsupported",
+      });
+    },
+    (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.code, "INCOMPATIBLE_MODEL");
+      return true;
+    }
+  );
+
+  // 2. Incompatible planner reasoningEffort
+  await assert.rejects(
+    async () => {
+      await hub.createWorkflow({
+        objective: "Test objective",
+        plannerAgentId: "planner-1",
+        plannerModelPreference: "model-planner-1",
+        plannerReasoningEffort: "high", // only low, medium supported
+      });
+    },
+    (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.code, "INCOMPATIBLE_REASONING_EFFORT");
+      return true;
+    }
+  );
+
+  // 3. Incompatible intake reasoningEffort
+  await assert.rejects(
+    async () => {
+      await hub.createWorkflow({
+        objective: "Test objective",
+        plannerAgentId: "planner-1",
+        intakeModelPreference: "model-planner-1",
+        intakeReasoningEffort: "xhigh",
+      });
+    },
+    (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.code, "INCOMPATIBLE_REASONING_EFFORT");
+      return true;
+    }
+  );
+
+  // 4. Incompatible reviewer reasoningEffort
+  await assert.rejects(
+    async () => {
+      await hub.createWorkflow({
+        objective: "Test objective",
+        reviewerAgentId: "reviewer-1",
+        reviewerModelPreference: "model-rev-1",
+        reviewerReasoningEffort: "high",
+      });
+    },
+    (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.code, "INCOMPATIBLE_REASONING_EFFORT");
+      return true;
+    }
+  );
+
+  // 5. Valid workflow succeeds
+  const okWorkflow = await hub.createWorkflow({
+    objective: "Test objective",
+    plannerAgentId: "planner-1",
+    plannerModelPreference: "model-planner-1",
+    plannerReasoningEffort: "low",
+    intakeModelPreference: "model-planner-1",
+    intakeReasoningEffort: "medium",
+    reviewerAgentId: "reviewer-1",
+    reviewerModelPreference: "model-rev-1",
+    reviewerReasoningEffort: "low",
+  });
+  assert.ok(okWorkflow.taskId);
+});
+
+test("P1: normalizeModels preserves costTier and recommendedRoles in registration pipeline", () => {
+  const rawModels = [
+    {
+      id: "model-a",
+      costTier: 1,
+      recommendedRoles: ["planner", "reviewer"],
+      capabilities: ["reasoning"],
+    },
+    {
+      id: "model-b",
+      costTier: "2",
+      recommendedRoles: ["EXECUTOR", "unknown_role"],
+      capabilities: ["task.execute"],
+    },
+    {
+      id: "model-c",
+      costTier: 99, // invalid tier
+      recommendedRoles: "not-an-array",
+    },
+  ];
+
+  const normalized = normalizeModels(rawModels);
+  assert.equal(normalized[0].costTier, 1);
+  assert.deepEqual(normalized[0].recommendedRoles, ["planner", "reviewer"]);
+
+  assert.equal(normalized[1].costTier, 2);
+  assert.deepEqual(normalized[1].recommendedRoles, ["executor"]);
+
+  assert.equal(normalized[2].costTier, undefined);
+  assert.equal(normalized[2].recommendedRoles, undefined);
+
+  // Agent with normalized models works properly in chooseModel
+  const normalizedAgent = {
+    agentId: "agent-norm",
+    capabilities: ["reasoning"],
+    models: normalized,
+  };
+  const chosen = chooseModel(normalizedAgent, { role: "planner" });
+  assert.equal(chosen.id, "model-a");
+});
+
+test("P0/P1: Single executor failure or cancellation triggers requireHuman escalation", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+
+  const root = hub.createTask({
+    input: "Executor failure test",
+    role: "planner",
+    targetAgentId: "planner-1",
+    workflow: { enabled: true, plannerAgentId: "planner-1", executorAgentId: "executor-1" },
+  });
+
+  await hub.dispatchAssignments(root, [
+    { title: "Subtask 1", instructions: "Do 1", expectedOutputs: ["1.txt"] },
+    { title: "Subtask 2", instructions: "Do 2", expectedOutputs: ["2.txt"] },
+  ]);
+
+  const execTasks = [...hub.tasks.values()].filter((t) => t.role === "executor");
+  assert.equal(execTasks.length, 2);
+  const [e1, e2] = execTasks;
+
+  // Simulate admin cancellation on e2
+  await hub.handleCommand({ type: "task.cancel", taskId: e2.taskId }, { id: "admin-1", role: "admin" });
+
+  // Verify intervention created for cancelled task
+  const interventions = [...hub.interventions.values()];
+  assert.ok(interventions.length > 0, "Intervention should be created on subtask cancellation");
+  assert.match(interventions[0].question, /已被人工取消/);
 });

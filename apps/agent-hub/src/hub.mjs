@@ -572,6 +572,10 @@ export class AgentHub {
       this.finishTaskActivity(task);
       this.markTask(task, this.taskAttemptGuard(message));
       await this.recordEvent("task.rejected", { taskId: task.taskId, agentId, attemptId: message.payload?.attemptId, payload: message.payload });
+      if (task.workflow?.enabled && !task.forceCompleted && !this.getCanonicalRootTask(task.rootTaskId)?.forceCompleted) {
+        const reason = task.error?.reasons?.join("; ") || task.error?.code || "PolicyDenied";
+        this.requireHuman(task, `子任务 '${task.taskSpec?.title ?? task.taskId}' 被节点安全策略拒绝 (${reason})。工作流已暂停，请人工介入审查。`);
+      }
       await this.retryQueuedTasks();
     } else if ((message.type === "task.result" || message.type === "task.error") && task) {
       if (TERMINAL_TASK_STATUSES.has(task.status)) {
@@ -717,6 +721,10 @@ export class AgentHub {
         await this.retryQueuedTasks();
       }
       if (task.workflow?.enabled) {
+        if (["failed", "cancelled", "rejected"].includes(terminalStatus) && !task.forceCompleted && !this.getCanonicalRootTask(task.rootTaskId)?.forceCompleted) {
+          const reason = task.error?.message ?? task.error?.name ?? terminalStatus;
+          this.requireHuman(task, `子任务 '${task.taskSpec?.title ?? task.taskId}' 执行失败 (${reason})。工作流已暂停，请人工介入审查。`);
+        }
         this.checkAndFinalizeWorkflow(task.rootTaskId);
       }
       }
@@ -892,16 +900,44 @@ export class AgentHub {
       intakeReasoningEffort: input.intakeReasoningEffort,
     });
 
-    if (input.plannerAgentId && normalizedStages.planner.modelPreference) {
+    if (input.plannerAgentId) {
       const plannerAgent = this.agents.get(input.plannerAgentId);
-      if (plannerAgent && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.planner.modelPreference)) {
-        throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected model '${normalizedStages.planner.modelPreference}'`, "INCOMPATIBLE_MODEL");
+      if (plannerAgent) {
+        if (normalizedStages.planner.modelPreference && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.planner.modelPreference)) {
+          throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected model '${normalizedStages.planner.modelPreference}'`, "INCOMPATIBLE_MODEL");
+        }
+        if (normalizedStages.intake.modelPreference && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.intake.modelPreference)) {
+          throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected intake model '${normalizedStages.intake.modelPreference}'`, "INCOMPATIBLE_MODEL");
+        }
+        if (normalizedStages.planner.reasoningEffort) {
+          const mId = normalizedStages.planner.modelPreference ?? plannerAgent.models?.[0]?.id;
+          const mObj = plannerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
+          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.planner.reasoningEffort)) {
+            throw httpError(400, `Planner agent '${input.plannerAgentId}' model '${mObj.id}' does not support reasoning effort '${normalizedStages.planner.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
+          }
+        }
+        if (normalizedStages.intake.reasoningEffort) {
+          const mId = normalizedStages.intake.modelPreference ?? normalizedStages.planner.modelPreference ?? plannerAgent.models?.[0]?.id;
+          const mObj = plannerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
+          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.intake.reasoningEffort)) {
+            throw httpError(400, `Planner agent '${input.plannerAgentId}' intake model '${mObj.id}' does not support reasoning effort '${normalizedStages.intake.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
+          }
+        }
       }
     }
-    if (input.reviewerAgentId && normalizedStages.reviewer.modelPreference) {
+    if (input.reviewerAgentId) {
       const reviewerAgent = this.agents.get(input.reviewerAgentId);
-      if (reviewerAgent && !reviewerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.reviewer.modelPreference)) {
-        throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' does not support selected model '${normalizedStages.reviewer.modelPreference}'`, "INCOMPATIBLE_MODEL");
+      if (reviewerAgent) {
+        if (normalizedStages.reviewer.modelPreference && !reviewerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.reviewer.modelPreference)) {
+          throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' does not support selected model '${normalizedStages.reviewer.modelPreference}'`, "INCOMPATIBLE_MODEL");
+        }
+        if (normalizedStages.reviewer.reasoningEffort) {
+          const mId = normalizedStages.reviewer.modelPreference ?? reviewerAgent.models?.[0]?.id;
+          const mObj = reviewerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
+          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.reviewer.reasoningEffort)) {
+            throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' model '${mObj.id}' does not support reasoning effort '${normalizedStages.reviewer.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
+          }
+        }
       }
     }
 
@@ -1137,43 +1173,6 @@ export class AgentHub {
       if (reviewerAgentId === task.targetAgentId) {
         reviewerAgentId = null;
       }
-      if (!reviewerAgentId) {
-        // Exclude executor and ensure formal scheduler constraints
-        const candidateAgents = new Map(
-          [...this.agents.entries()].filter(([id, a]) => (
-            id !== task.targetAgentId &&
-            (!this.leasesEnabled() || a.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
-          ))
-        );
-        this.refreshAccountLoads();
-        try {
-          const selection = chooseAgent(candidateAgents, {
-            role: "reviewer",
-            requireDeclaredRole: false,
-          });
-          reviewerAgentId = selection.agent.agentId;
-        } catch {
-          reviewerAgentId = null;
-        }
-      }
-
-      if (!reviewerAgentId) {
-        task.reviewStatus = "waiting_for_human_review";
-        this.markTask(task);
-        this.createIntervention(task, {
-          kind: "workflow_input",
-          question: "当前没有可立即调度的独立 Reviewer 节点（严禁由 Executor 自行审核）。成果已提交，请人工进行审核确认。",
-          allowedActions: ["approve", "reject"],
-          continuation: { type: "human_review", taskId: task.taskId },
-        });
-        return;
-      }
-
-      const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
-      if (!reservation.ok) {
-        this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法调度 Reviewer：${reservation.error}`);
-        return;
-      }
 
       const root = this.getCanonicalRootTask(task.rootTaskId);
       const rawReviewerModel = task.workflow?.reviewerModelPreference
@@ -1188,6 +1187,48 @@ export class AgentHub {
         ?? root?.workflow?.stageModels?.reviewer?.reasoningEffort
         ?? null;
       const reviewerReasoning = typeof rawReviewerReasoning === "string" ? rawReviewerReasoning.trim() || null : null;
+
+      if (!reviewerAgentId) {
+        // Exclude executor and ensure formal scheduler constraints
+        const candidateAgents = new Map(
+          [...this.agents.entries()].filter(([id, a]) => (
+            id !== task.targetAgentId &&
+            (!this.leasesEnabled() || a.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
+          ))
+        );
+        this.refreshAccountLoads();
+        try {
+          const selection = chooseAgent(candidateAgents, {
+            role: "reviewer",
+            modelPreference: reviewerModel,
+            reasoningEffort: reviewerReasoning,
+            requireDeclaredRole: false,
+          });
+          reviewerAgentId = selection.agent.agentId;
+        } catch {
+          reviewerAgentId = null;
+        }
+      }
+
+      if (!reviewerAgentId) {
+        task.reviewStatus = "waiting_for_human_review";
+        this.markTask(task);
+        this.createIntervention(task, {
+          kind: "workflow_input",
+          question: reviewerModel
+            ? `当前没有可运行指定审核模型 '${reviewerModel}' 的独立 Reviewer 节点（严禁由 Executor 自行审核）。成果已提交，请人工进行审核确认。`
+            : "当前没有可立即调度的独立 Reviewer 节点（严禁由 Executor 自行审核）。成果已提交，请人工进行审核确认。",
+          allowedActions: ["approve", "reject"],
+          continuation: { type: "human_review", taskId: task.taskId },
+        });
+        return;
+      }
+
+      const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
+      if (!reservation.ok) {
+        this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法调度 Reviewer：${reservation.error}`);
+        return;
+      }
 
       const reviewer = this.createTask({
         targetAgentId: reviewerAgentId,
@@ -1704,6 +1745,7 @@ export class AgentHub {
 
   closePendingInterventions(task, actorId, reason) {
     const resolvedAt = new Date().toISOString();
+    let count = 0;
     for (const intervention of this.interventions.values()) {
       if (intervention.taskId !== task.taskId || intervention.status !== "pending") continue;
       intervention.status = "resolved";
@@ -1713,8 +1755,10 @@ export class AgentHub {
       intervention.resolvedBy = actorId;
       intervention.updatedAt = resolvedAt;
       this.markIntervention(intervention, { allowedStatuses: ["pending"] });
+      count++;
     }
     this.syncRootIntervention(task.rootTaskId);
+    return count;
   }
 
   async resolveIntervention(interventionId, input, actor) {
@@ -2909,7 +2953,7 @@ export class AgentHub {
       }
       this.finishTaskActivity(task);
       this.markTask(task);
-      this.closePendingInterventions(task, actor.id, "Task cancelled by an administrator");
+      const closedCount = this.closePendingInterventions(task, actor.id, "Task cancelled by an administrator");
       if (task.targetAgentId) {
         this.deliver(task.targetAgentId, makeEnvelope("task.cancel", {
           agentId: task.targetAgentId,
@@ -2918,6 +2962,14 @@ export class AgentHub {
         }));
       }
       await this.recordEvent("task.cancelled", { actor: actor.id, taskId: task.taskId, agentId: task.targetAgentId, attemptId: task.currentAttemptId ?? null });
+      if (task.workflow?.enabled && !task.forceCompleted && !this.getCanonicalRootTask(task.rootTaskId)?.forceCompleted) {
+        const hasOtherPending = [...this.interventions.values()].some(
+          (item) => item.rootTaskId === (task.rootTaskId ?? task.taskId) && item.status === "pending"
+        );
+        if (closedCount === 0 && !hasOtherPending && task.taskId !== task.rootTaskId) {
+          this.requireHuman(task, `子任务 '${task.taskSpec?.title ?? task.taskId}' 已被人工取消。工作流已暂停，请人工介入审查。`);
+        }
+      }
       await this.retryQueuedTasks();
       return { ok: true, task };
     }

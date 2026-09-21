@@ -354,6 +354,27 @@ function App() {
     ? [...new Set(selectedReviewerAgent.models.filter((m) => m.enabled !== false && m.id).map((m) => (typeof m === 'string' ? m : m.id as string)))]
     : [...new Set(compatibleReviewers.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
 
+  const defaultReasoningEfforts = ['low', 'medium', 'high', 'xhigh']
+
+  const plannerModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
+    .find((m) => m && (typeof m === 'string' ? m : m.id) === draft.modelPreference)
+  const plannerReasoningOptions = (plannerModelObj && typeof plannerModelObj === 'object' && plannerModelObj.reasoningEfforts && plannerModelObj.reasoningEfforts.length > 0)
+    ? plannerModelObj.reasoningEfforts
+    : defaultReasoningEfforts
+
+  const reviewerModelObj = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((a) => a.models ?? []))
+    .find((m) => m && (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)
+  const reviewerReasoningOptions = (reviewerModelObj && typeof reviewerModelObj === 'object' && reviewerModelObj.reasoningEfforts && reviewerModelObj.reasoningEfforts.length > 0)
+    ? reviewerModelObj.reasoningEfforts
+    : ['low', 'medium', 'high']
+
+  const intakeTargetModel = draft.intakeModelPreference || draft.modelPreference
+  const intakeModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
+    .find((m) => m && (typeof m === 'string' ? m : m.id) === intakeTargetModel)
+  const intakeReasoningOptions = (intakeModelObj && typeof intakeModelObj === 'object' && intakeModelObj.reasoningEfforts && intakeModelObj.reasoningEfforts.length > 0)
+    ? intakeModelObj.reasoningEfforts
+    : ['low', 'medium', 'high']
+
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
   }, [selectedMessages.length, selectedConversation?.rootTaskId])
@@ -382,10 +403,35 @@ function App() {
         return
       }
     }
+    if (draft.plannerAgentId && draft.intakeModelPreference) {
+      const pAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
+      if (pAgent && !pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.intakeModelPreference)) {
+        setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持结果接收模型 '${draft.intakeModelPreference}'，请重新选择。`)
+        return
+      }
+    }
     if (draft.reviewerAgentId && draft.reviewerModelPreference) {
       const rAgent = compatibleReviewers.find((a) => a.agentId === draft.reviewerAgentId)
       if (rAgent && !rAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)) {
         setNotice(`所选审核 Agent '${draft.reviewerAgentId}' 不支持模型 '${draft.reviewerModelPreference}'，请重新选择。`)
+        return
+      }
+    }
+    if (draft.reasoningEffort && plannerModelObj && typeof plannerModelObj === 'object' && plannerModelObj.reasoningEfforts?.length) {
+      if (!plannerModelObj.reasoningEfforts.includes(draft.reasoningEffort)) {
+        setNotice(`规划模型 '${plannerModelObj.id}' 不支持推理强度 '${draft.reasoningEffort}'，请重新选择。`)
+        return
+      }
+    }
+    if (draft.reviewerReasoningEffort && reviewerModelObj && typeof reviewerModelObj === 'object' && reviewerModelObj.reasoningEfforts?.length) {
+      if (!reviewerModelObj.reasoningEfforts.includes(draft.reviewerReasoningEffort)) {
+        setNotice(`审核模型 '${reviewerModelObj.id}' 不支持推理强度 '${draft.reviewerReasoningEffort}'，请重新选择。`)
+        return
+      }
+    }
+    if (draft.intakeReasoningEffort && intakeModelObj && typeof intakeModelObj === 'object' && intakeModelObj.reasoningEfforts?.length) {
+      if (!intakeModelObj.reasoningEfforts.includes(draft.intakeReasoningEffort)) {
+        setNotice(`结果接收模型 '${intakeModelObj.id}' 不支持推理强度 '${draft.intakeReasoningEffort}'，请重新选择。`)
         return
       }
     }
@@ -973,10 +1019,12 @@ function App() {
                 const nextPlannerId = event.target.value
                 const pAgent = compatiblePlanners.find((a) => a.agentId === nextPlannerId)
                 const validModel = pAgent && draft.modelPreference && pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.modelPreference)
+                const validIntakeModel = pAgent && draft.intakeModelPreference && pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.intakeModelPreference)
                 setDraft({
                   ...draft,
                   plannerAgentId: nextPlannerId,
                   modelPreference: validModel || !nextPlannerId ? draft.modelPreference : '',
+                  intakeModelPreference: validIntakeModel || !nextPlannerId ? draft.intakeModelPreference : '',
                 })
               }}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>执行 Agent<select value={draft.executorAgentId} onChange={(event) => setDraft({ ...draft, executorAgentId: event.target.value })}><option value="">自动调度</option>{compatibleExecutors.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId} · {executorStatus(agent)}</option>)}</select></label>
@@ -990,17 +1038,47 @@ function App() {
                   reviewerModelPreference: validModel || !nextReviewerId ? draft.reviewerModelPreference : '',
                 })
               }}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
-              <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => setDraft({ ...draft, modelPreference: event.target.value })}><option value="">自动选择</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-              <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option><option value="xhigh">xhigh</option></select></label>
+              <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => {
+                const nextModel = event.target.value
+                const targetObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
+                  .find((m) => m && (typeof m === 'string' ? m : m.id) === nextModel)
+                const validEffort = !draft.reasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.reasoningEffort)
+                setDraft({
+                  ...draft,
+                  modelPreference: nextModel,
+                  reasoningEffort: validEffort ? draft.reasoningEffort : '',
+                })
+              }}><option value="">自动选择</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+              <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option>{plannerReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
               <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
             </div>
             <details className="stage-models-accordion">
               <summary><strong>阶段模型策略与高级设置</strong><small>（自定义审核、结果接收模型与快速结案）</small></summary>
               <div className="form-grid" style={{ marginTop: '0.75rem' }}>
-                <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => setDraft({ ...draft, reviewerModelPreference: event.target.value })}><option value="">自动分级（推荐轻量模型）</option>{reviewerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-                <label>审核推理强度<select value={draft.reviewerReasoningEffort} onChange={(event) => setDraft({ ...draft, reviewerReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
-                <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => setDraft({ ...draft, intakeModelPreference: event.target.value })}><option value="">继承规划模型</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
-                <label>结果接收推理强度<select value={draft.intakeReasoningEffort} onChange={(event) => setDraft({ ...draft, intakeReasoningEffort: event.target.value })}><option value="">默认</option><option value="low">low</option><option value="medium">medium</option><option value="high">high</option></select></label>
+                <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => {
+                  const nextModel = event.target.value
+                  const targetObj = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((a) => a.models ?? []))
+                    .find((m) => m && (typeof m === 'string' ? m : m.id) === nextModel)
+                  const validEffort = !draft.reviewerReasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.reviewerReasoningEffort)
+                  setDraft({
+                    ...draft,
+                    reviewerModelPreference: nextModel,
+                    reviewerReasoningEffort: validEffort ? draft.reviewerReasoningEffort : '',
+                  })
+                }}><option value="">自动分级（推荐轻量模型）</option>{reviewerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>审核推理强度<select value={draft.reviewerReasoningEffort} onChange={(event) => setDraft({ ...draft, reviewerReasoningEffort: event.target.value })}><option value="">默认</option>{reviewerReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
+                <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => {
+                  const nextModel = event.target.value
+                  const targetObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
+                    .find((m) => m && (typeof m === 'string' ? m : m.id) === (nextModel || draft.modelPreference))
+                  const validEffort = !draft.intakeReasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.intakeReasoningEffort)
+                  setDraft({
+                    ...draft,
+                    intakeModelPreference: nextModel,
+                    intakeReasoningEffort: validEffort ? draft.intakeReasoningEffort : '',
+                  })
+                }}><option value="">继承规划模型</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
+                <label>结果接收推理强度<select value={draft.intakeReasoningEffort} onChange={(event) => setDraft({ ...draft, intakeReasoningEffort: event.target.value })}><option value="">默认</option>{intakeReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
                 <label style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                   <input type="checkbox" checked={draft.fastPath} onChange={(event) => setDraft({ ...draft, fastPath: event.target.checked })} />
                   <span>[实验性] 启用 Hub 确定性结案 (Fast Path)：仅在当前批次子任务全部审核通过时直接由 Hub 结案，跳过额外 LLM 汇总问答</span>

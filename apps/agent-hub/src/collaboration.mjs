@@ -40,6 +40,12 @@ export function normalizeModels(value, adapter = {}) {
       lastSuccessAt: model.lastSuccessAt ? String(model.lastSuccessAt) : undefined,
       stale: Boolean(model.stale),
       errorSummary: model.errorSummary ? String(model.errorSummary).slice(0, 500) : null,
+      costTier: typeof model.costTier === "number" && [1, 2, 3].includes(model.costTier)
+        ? model.costTier
+        : (typeof model.costTier === "string" && ["1", "2", "3"].includes(model.costTier.trim()) ? Number(model.costTier.trim()) : undefined),
+      recommendedRoles: Array.isArray(model.recommendedRoles)
+        ? [...new Set(model.recommendedRoles.map((r) => String(r).toLowerCase().trim()).filter((r) => ROLE_SET.has(r)))]
+        : undefined,
     };
   }).filter((model) => model.id);
   if (normalized.length === 0 && adapter.model) {
