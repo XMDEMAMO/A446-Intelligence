@@ -5,14 +5,17 @@ import { createDemoSnapshot } from './demo-data'
 import {
   artifactDownloadUrl,
   clearLocalSession,
+  clearPendingLocalLogout,
   createWorkflow,
   getConversationDetail,
   getCurrentUser,
   getHubOverview,
   getMessageDetail,
+  hasPendingLocalLogout,
   HubApiError,
   login as loginToHub,
   logout as logoutFromHub,
+  markPendingLocalLogout,
   resolveIntervention as resolveHubIntervention,
   sendConversationMessage,
   sendHubCommand,
@@ -97,11 +100,11 @@ function emptyDraft(): WorkflowDraft {
 }
 
 function App() {
-  const [authStatus, setAuthStatus] = useState<AuthStatus>('checking')
+  const [authStatus, setAuthStatus] = useState<AuthStatus>(() => hasPendingLocalLogout() ? 'unauthenticated' : 'checking')
   const [currentUser, setCurrentUser] = useState<WebUser | null>(null)
   const [overview, setOverview] = useState<HubOverview | null>(null)
   const [detail, setDetail] = useState<ConversationDetail | null>(null)
-  const [connectionMode, setConnectionMode] = useState<ConnectionMode>('loading')
+  const [connectionMode, setConnectionMode] = useState<ConnectionMode>(() => hasPendingLocalLogout() ? 'offline' : 'loading')
   const [lastSuccessfulAt, setLastSuccessfulAt] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
   const [selectedRootId, setSelectedRootId] = useState<string | null>(null)
@@ -119,12 +122,14 @@ function App() {
   const [loginPassword, setLoginPassword] = useState('')
   const [loginRetrySeconds, setLoginRetrySeconds] = useState(0)
   const [authCheckRevision, setAuthCheckRevision] = useState(0)
+  const [localLogoutPending, setLocalLogoutPending] = useState(() => hasPendingLocalLogout())
   const [refreshRevision, setRefreshRevision] = useState(0)
   const [demoActive, setDemoActive] = useState(false)
   const [messageDetails, setMessageDetails] = useState<Record<string, HubMessage>>({})
   const [loadingMessageIds, setLoadingMessageIds] = useState<Set<string>>(() => new Set())
   const chatEndRef = useRef<HTMLDivElement | null>(null)
   const pollAbortRef = useRef<AbortController | null>(null)
+  const explicitRestoreSessionRef = useRef(false)
   const overviewRef = useRef<HubOverview | null>(null)
   const demoSnapshotRef = useRef<HubSnapshot | null>(null)
   const currentUserId = currentUser?.id ?? null
@@ -153,8 +158,19 @@ function App() {
 
   useEffect(() => {
     if (demoActive) return
+    const explicitRestoreRequested = explicitRestoreSessionRef.current
+    explicitRestoreSessionRef.current = false
+    if (hasPendingLocalLogout() && !explicitRestoreRequested) {
+      setCurrentUser(null)
+      setAuthStatus('unauthenticated')
+      setConnectionMode('offline')
+      setLastError('本机登录状态已清除；服务器 Session 尚未撤销。')
+      return
+    }
     const controller = new AbortController()
     void getCurrentUser(controller.signal).then((user) => {
+      clearPendingLocalLogout()
+      setLocalLogoutPending(false)
       setCurrentUser(user)
       setAuthStatus('authenticated')
       setLastError('')
@@ -162,10 +178,13 @@ function App() {
       if (isAbortError(error)) return
       if (error instanceof HubApiError && error.status === 401) {
         clearLocalSession()
+        clearPendingLocalLogout()
+        setLocalLogoutPending(false)
         setLastError('')
       } else {
         setLastError(formatApiError(error, '无法连接 Server Hub'))
       }
+      setLocalLogoutPending(hasPendingLocalLogout())
       setCurrentUser(null)
       setAuthStatus('unauthenticated')
       setConnectionMode('offline')
@@ -427,6 +446,7 @@ function App() {
     try {
       const user = await loginToHub(loginName, loginPassword)
       setLoginPassword('')
+      setLocalLogoutPending(false)
       setCurrentUser(user)
       setAuthStatus('authenticated')
       setConnectionMode('loading')
@@ -440,7 +460,17 @@ function App() {
   }
 
   async function submitLogout() {
-    if (!requireLive()) return
+    if (!canWrite) {
+      const confirmed = window.confirm('当前无法联系 Server Hub。继续后只会清除本机登录状态，服务器 Session 尚未撤销。网络恢复后需重新登录，或明确确认恢复旧 Session。是否继续本机退出？')
+      if (!confirmed) return
+      if (!markPendingLocalLogout()) {
+        setNotice('浏览器无法保存本机退出状态，请允许本站使用本地存储后重试。')
+        return
+      }
+      setLocalLogoutPending(true)
+      resetToLogin('已在本机退出。服务器 Session 尚未撤销；网络恢复后请重新登录，或确认恢复旧 Session。')
+      return
+    }
     setWorkingAction('logout')
     try {
       await logoutFromHub()
@@ -457,6 +487,7 @@ function App() {
     pollAbortRef.current?.abort()
     pollAbortRef.current = null
     clearLocalSession()
+    setLocalLogoutPending(hasPendingLocalLogout())
     overviewRef.current = null
     setCurrentUser(null)
     setAuthStatus('unauthenticated')
@@ -565,6 +596,17 @@ function App() {
   if (authStatus === 'checking') return <LoadingGate label="正在检查登录会话" />
 
   if (authStatus === 'unauthenticated') {
+    function recheckSession() {
+      if (localLogoutPending) {
+        const confirmed = window.confirm('服务器 Session 尚未撤销。是否确认恢复这个旧 Session？')
+        if (!confirmed) return
+        explicitRestoreSessionRef.current = true
+      }
+      setAuthStatus('checking')
+      setConnectionMode('loading')
+      setAuthCheckRevision((value) => value + 1)
+    }
+
     return (
       <main className="login-shell">
         <form className="login-card" onSubmit={submitLogin}>
@@ -572,9 +614,10 @@ function App() {
           <div><span>Server Hub</span><h1>登录 A446 协作台</h1><p>使用管理员或操作者账号继续。登录前不会轮询业务接口。</p></div>
           <label>用户名<input autoComplete="username" autoFocus value={loginName} onChange={(event) => setLoginName(event.target.value)} /></label>
           <label>密码<input autoComplete="current-password" type="password" value={loginPassword} onChange={(event) => setLoginPassword(event.target.value)} /></label>
+          {localLogoutPending && <div className="login-status" role="status">本机登录状态已清除，服务器 Session 尚未撤销。输入账号密码可重新登录；恢复旧 Session 需要单独确认。</div>}
           {lastError && <div className="login-error">{lastError}</div>}
           <button type="submit" disabled={submitting || loginRetrySeconds > 0 || !loginName || !loginPassword}>{submitting ? '登录中…' : loginRetrySeconds > 0 ? `${loginRetrySeconds} 秒后重试` : '登录'}</button>
-          <button className="login-secondary" type="button" disabled={submitting} onClick={() => { setAuthStatus('checking'); setConnectionMode('loading'); setAuthCheckRevision((value) => value + 1) }}>重新检查连接</button>
+          <button className="login-secondary" type="button" disabled={submitting} onClick={recheckSession}>{localLogoutPending ? '确认恢复旧 Session' : '重新检查连接'}</button>
           {demoEnabled && <button className="login-demo" type="button" onClick={enterDemo}>进入只读演示</button>}
         </form>
       </main>
@@ -590,7 +633,8 @@ function App() {
         <span>Connection unavailable</span>
         <h1>Hub 当前离线</h1>
         <p>{lastError || '尚未取得任何可显示的实时数据。'}</p>
-        <div><button type="button" onClick={requestRefresh}>立即重试</button>{demoEnabled && <button type="button" onClick={enterDemo}>只读演示</button>}</div>
+        {currentUser && <div className="offline-identity"><span>当前登录身份</span><strong>{currentUser.username}</strong><small>{currentUser.role === 'admin' ? '管理员' : '操作者'}</small></div>}
+        <div><button type="button" onClick={requestRefresh}>立即重试</button>{currentUser && <button type="button" disabled={workingAction === 'logout'} onClick={() => void submitLogout()}>本地退出</button>}{demoEnabled && <button type="button" onClick={enterDemo}>只读演示</button>}</div>
       </main>
     )
   }
@@ -635,7 +679,7 @@ function App() {
 
         <div className="identity-card">
           <div><strong>{currentUser?.username ?? 'unknown'}</strong><small>{currentUser?.role === 'admin' ? '管理员' : '操作者'}</small></div>
-          {demoActive ? <button type="button" onClick={exitDemo}>退出演示</button> : <button type="button" disabled={!canWrite || workingAction === 'logout'} onClick={() => void submitLogout()}>退出</button>}
+          {demoActive ? <button type="button" onClick={exitDemo}>退出演示</button> : <button type="button" disabled={workingAction === 'logout'} onClick={() => void submitLogout()}>{canWrite ? '退出' : '本地退出'}</button>}
         </div>
       </aside>
 

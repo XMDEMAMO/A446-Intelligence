@@ -8,7 +8,7 @@
     "node": ">=20.0.0"
   },
   "scripts": {
-    "check": "node scripts/check.mjs && node --test test/login-protection.test.mjs",
+    "check": "node scripts/check.mjs && node --test test/login-protection.test.mjs test/client-ip.test.mjs",
     "migrate": "node src/migrate-cli.mjs",
     "identity": "node src/identity-cli.mjs",
     "start": "node src/server-hub-cli.mjs --config config/server.example.json",

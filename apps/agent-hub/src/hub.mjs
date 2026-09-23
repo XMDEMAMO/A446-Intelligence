@@ -1,6 +1,5 @@
 import http from "node:http";
 import https from "node:https";
-import { isIP } from "node:net";
 import { readFile } from "node:fs/promises";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
@@ -8,6 +7,7 @@ import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
 import { addUsage, chooseAgent, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, parseRoleSubmission } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
+import { clientIpForRequest } from "./client-ip.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
 const ACTIVE_SLOT_STATUSES = new Set(["dispatched", "running", "processing_result"]);
@@ -2308,16 +2308,6 @@ function summarizeMessage(message) {
     ...message,
     attachments: (message.attachments ?? []).map(({ content, ...attachment }) => attachment),
   };
-}
-
-function clientIpForRequest(request, authConfig = {}) {
-  const peer = String(request.socket?.remoteAddress ?? "unknown");
-  const trusted = authConfig?.trustedProxyIps ?? authConfig?.trustedProxies ?? [];
-  if (!Array.isArray(trusted) || !trusted.includes(peer)) return peer;
-  const forwarded = request.headers["x-forwarded-for"];
-  if (typeof forwarded !== "string") return peer;
-  const candidate = forwarded.split(",", 1)[0].trim();
-  return isIP(candidate) ? candidate : peer;
 }
 
 function contentDisposition(filename) {

@@ -11,6 +11,7 @@
 - 每个逻辑 Worker 使用独立凭据，并绑定一个 `agentId` 与 `deviceId`；浏览器使用 Web Session，不与 Worker 共用凭据。
 - Worker 的本地 Policy 仍是最终权限边界。服务器不能批准被 Worker 拒绝的权限、路径或凭据操作。
 - 登录失败同时按规范化用户名与可信来源 IP 做可恢复退避。只有 Hub 明确配置并校验反向代理时才可读取转发地址；公网请求自带的 `X-Forwarded-For` 不可信。
+- `auth.trustedProxyIps` 默认为空。只填写 Hub socket 实际看到的反向代理 IP 或 CIDR；未匹配的直连请求始终使用 socket 对端地址。匹配代理后，Hub 才解析 `X-Forwarded-For`，并从右向左跳过已配置的代理地址。不要使用 `0.0.0.0/0`、`::/0` 或任意客户端可到达的网段。
 
 环境变量名称见 [.env.example](.env.example)。该文件只是模板，当前程序不会自动读取 `.env` 文件。
 
@@ -32,7 +33,7 @@
    $env:A446_ARTIFACT_ROOT = '<absolute-directory-outside-the-repository>'
    ```
 
-4. 从 [config/server.example.json](config/server.example.json) 复制一份本机配置。保持 `auth.mode=identity`、`secureCookies=true` 和回环监听；将 `auth.allowedOrigins` 改为 Web 控制台实际使用的唯一 HTTPS Origin。
+4. 从 [config/server.example.json](config/server.example.json) 复制一份本机配置。保持 `auth.mode=identity`、`secureCookies=true` 和回环监听；将 `auth.allowedOrigins` 改为 Web 控制台实际使用的唯一 HTTPS Origin。`auth.trustedProxyIps` 默认留空，确认 socket 对端确实是本机 Caddy 后，才设置为 `["127.0.0.1/32"]`；其他代理填写实际地址或 CIDR。
 5. 先应用 migration，再启动服务：
 
    ```powershell
@@ -67,6 +68,18 @@ hub.example.com {
 ```
 
 将 `auth.allowedOrigins` 设为 `https://hub.example.com`。不要为了跨域调试把 Origin 检查改为任意来源，也不要在生产环境把 `secureCookies` 或 Worker TLS 校验关闭。若使用 Nginx、云负载均衡器或企业代理，必须显式保留 HTTP/1.1 Upgrade 头，并由其负责有效证书、TLS 更新和访问日志保留策略。
+
+`auth.trustedProxyIps` 只用于来源 IP 限流。保持默认空数组时，登录限流使用 TCP socket 对端地址，并忽略所有 `X-Forwarded-For`。同机 Caddy 的配置示例（仅当 Hub 确认看到的对端确实为 `127.0.0.1` 时使用）：
+
+```json
+{
+  "auth": {
+    "trustedProxyIps": ["127.0.0.1/32"]
+  }
+}
+```
+
+配置支持单个 IPv4/IPv6 地址和 CIDR。若代理前还有负载均衡器或 Cloudflare，需要只加入实际代理链使用的地址范围，并配置 Caddy 仅信任其官方出口网段；Hub 沿转发链从最近一跳向客户端逐步检查，遇到第一个未信任地址即作为来源。代理链缺失、超长或包含无效 IP 时回退到 socket 对端。不要信任全网段，也不要只因为客户端提供了转发头就启用信任。
 
 ## 4. 备份与恢复
 

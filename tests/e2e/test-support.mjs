@@ -74,6 +74,13 @@ async function handleRequest(request, response, state) {
   }
   const pathname = url.pathname.slice(4) || "/";
   state.requests.push({ method: request.method ?? "GET", pathname, search: url.search });
+  if (state.failBusinessRequests && (
+    pathname === "/health"
+    || (pathname.startsWith("/v1/") && !["/v1/auth/login", "/v1/auth/me", "/v1/auth/logout"].includes(pathname))
+  )) {
+    sendJson(response, 503, { error: "Fixture Hub is temporarily unavailable", code: "HUB_UNAVAILABLE" });
+    return;
+  }
   if (pathname === "/health") {
     sendJson(response, 200, { ok: true, protocolVersion: 1, now: new Date().toISOString() });
     return;
@@ -200,7 +207,7 @@ function createWorkflow(response, state, body, actor) {
   });
   state.lastWorkflowBody = body;
   state.events.push({ seq: state.events.length + 1, ts: task.createdAt, type: "workflow.created", details: { rootTaskId, actor: actor.username } });
-  sendJson(response, 201, { task });
+  sendJson(response, 202, { task });
 }
 
 function applyCommand(response, state, body, actor) {
@@ -475,6 +482,7 @@ function fixtureState() {
     nextUser: 1,
     nextToken: 1,
     lastWorkflowBody: null,
+    failBusinessRequests: false,
     requests: [],
     users: [
       { id: "fixture-admin-id", username: "fixture-admin", password: "fixture-admin-password", role: "admin", status: "active", createdAt: now, updatedAt: now, lastLoginAt: null },

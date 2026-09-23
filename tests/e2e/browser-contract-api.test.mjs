@@ -29,7 +29,7 @@ test("browser E2E: executor constraint, RBAC, one-time credential, cancellation,
       acceptance: ["executor remains stable"],
       executorAgentId: "fixture-executor",
     });
-    assert.equal(explicit.status, 201);
+    assert.equal(explicit.status, 202);
     assert.equal(explicit.body.task.executorAgentId, "fixture-executor");
 
     const cancelled = await browserRequest(page, "POST", "/api/v1/commands", { type: "task.cancel", taskId: explicit.body.task.taskId });

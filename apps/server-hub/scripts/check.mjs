@@ -26,6 +26,7 @@ const environmentTemplate = await readFile(path.join(root, ".env.example"), "utf
 if (config.storage?.driver !== "postgres") throw new Error("server.example.json must use PostgreSQL");
 if (config.leases?.enabled !== true) throw new Error("server.example.json must enable leases");
 if (config.auth?.required !== true || config.auth?.mode !== "identity") throw new Error("server.example.json must require identity authentication");
+if (!Array.isArray(config.auth?.trustedProxyIps)) throw new Error("server.example.json must configure auth.trustedProxyIps as an array");
 if (config.auth?.loginProtection?.enabled !== true) throw new Error("server.example.json must enable login protection");
 if (!config.artifacts?.rootDirectoryEnv) throw new Error("server.example.json must configure an external Artifact Store root");
 for (const name of ["A446_DATABASE_URL", "A446_ARTIFACT_ROOT", "A446_TEST_DATABASE_URL"]) {

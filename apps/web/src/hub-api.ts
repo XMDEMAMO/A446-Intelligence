@@ -17,6 +17,7 @@ import type {
 
 const API_BASE = (import.meta.env.VITE_HUB_API_BASE ?? '/api').replace(/\/$/, '')
 const DEFAULT_TIMEOUT_MS = 8_000
+const LOCAL_LOGOUT_PENDING_KEY = 'a446.local-logout-pending'
 let csrfToken = readCookie('a446_csrf') || window.sessionStorage.getItem('a446.csrf') || ''
 
 interface ErrorBody {
@@ -112,22 +113,65 @@ export async function login(username: string, password: string, signal?: AbortSi
   })
   csrfToken = result.csrfToken
   window.sessionStorage.setItem('a446.csrf', csrfToken)
+  clearPendingLocalLogout()
   return normalizeUser(result.user)
 }
 
 export async function getCurrentUser(signal?: AbortSignal) {
   const result = await request<{ user: WebUser }>('/v1/auth/me', { signal })
+  csrfToken = readCookie('a446_csrf') || window.sessionStorage.getItem('a446.csrf') || ''
   return normalizeUser(result.user)
 }
 
 export async function logout(signal?: AbortSignal) {
   await request<{ ok: boolean }>('/v1/auth/logout', { method: 'POST', signal })
   clearLocalSession()
+  clearPendingLocalLogout()
 }
 
 export function clearLocalSession() {
   csrfToken = ''
   window.sessionStorage.removeItem('a446.csrf')
+}
+
+export function hasPendingLocalLogout() {
+  try {
+    if (window.localStorage.getItem(LOCAL_LOGOUT_PENDING_KEY) === 'true') return true
+  } catch {
+    // Fall back to session storage when browser policies block local storage.
+  }
+  try {
+    return window.sessionStorage.getItem(LOCAL_LOGOUT_PENDING_KEY) === 'true'
+  } catch {
+    return false
+  }
+}
+
+export function markPendingLocalLogout() {
+  try {
+    window.localStorage.setItem(LOCAL_LOGOUT_PENDING_KEY, 'true')
+    return true
+  } catch {
+    try {
+      window.sessionStorage.setItem(LOCAL_LOGOUT_PENDING_KEY, 'true')
+      return true
+    } catch {
+      return false
+    }
+  }
+}
+
+export function clearPendingLocalLogout() {
+  try {
+    window.localStorage.removeItem(LOCAL_LOGOUT_PENDING_KEY)
+  } catch {
+    // Continue clearing the tab-scoped fallback.
+  }
+  try {
+    window.sessionStorage.removeItem(LOCAL_LOGOUT_PENDING_KEY)
+  } catch {
+    // Storage can be unavailable in restricted browser contexts.
+  }
 }
 
 export function artifactDownloadUrl(downloadUrl: string) {

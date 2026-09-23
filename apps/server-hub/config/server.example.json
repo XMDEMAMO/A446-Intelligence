@@ -9,6 +9,7 @@
     "cookieName": "a446_session",
     "secureCookies": true,
     "allowedOrigins": ["https://hub.example.com"],
+    "trustedProxyIps": [],
     "loginProtection": {
       "enabled": true,
       "windowMs": 900000,

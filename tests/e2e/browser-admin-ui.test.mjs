@@ -14,6 +14,7 @@ test("browser E2E: admin UI manages users, sessions, and one-time Worker credent
   try {
     await adminPage.goto(fixture.baseUrl, { waitUntil: "domcontentloaded" });
     await login(adminPage, "fixture-admin", "fixture-admin-password");
+    await adminPage.locator("details.attachment").filter({ hasText: "完整成果" }).waitFor();
 
     assert.equal(fixture.state.requests.some((item) => item.pathname === "/v1/messages" && item.search.includes("view=summary")), true, "conversation loading uses the summary message endpoint");
     assert.equal(fixture.state.requests.filter((item) => item.pathname === "/v1/messages/fixture-message-1").length, 0, "summary load does not fetch full message detail");

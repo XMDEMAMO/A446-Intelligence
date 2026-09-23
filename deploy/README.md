@@ -28,7 +28,13 @@
 - 设置 CSP、禁止 frame 嵌入、MIME sniffing、宽松来源泄漏和不需要的浏览器能力；
 - HSTS 默认注释，只有真实域名 HTTPS 稳定且子域策略确认后才启用。
 
-Hub 的登录限流默认只应信任 socket 对端。路由层只有在明确配置 Caddy 为可信代理时，才可读取 Caddy 重写的转发地址；绝不能直接信任公网请求自带的 `X-Forwarded-For`。若在 Caddy 前增加 Cloudflare，必须维护 Cloudflare 官方出口网段并在 Caddy 的全局 `trusted_proxies` 配置中限定来源。
+Hub 的登录限流默认只应信任 socket 对端。`apps/server-hub/config/server.example.json` 中 `auth.trustedProxyIps` 默认为空；只有在确认 Hub socket 实际看到的代理地址后，才加入精确地址或 CIDR。例如，同机 Caddy 的 peer 确认是 `127.0.0.1` 时可以设置：
+
+```json
+"trustedProxyIps": ["127.0.0.1/32"]
+```
+
+未匹配的 socket 对端不能影响登录来源 IP，即使它发送了伪造的 `X-Forwarded-For`。匹配可信代理后，Hub 从转发链右侧向左跳过配置中的代理 IP，遇到第一个未信任 IP 后停止。若 Caddy 前还有 Cloudflare 或负载均衡器，只信任这些实际代理使用的地址范围，并在 Caddy 中同样限定上游代理；不要配置 `0.0.0.0/0` 或 `::/0`。
 
 Cloudflare Access 可以作为额外入口门禁，但不能取代 A446 的登录、RBAC、CSRF 和 Worker 凭据。不要让 Access 的身份头自动成为应用管理员身份。
 

@@ -26,6 +26,8 @@ Set `auth.allowedOrigins` to the exact public HTTPS origin used by the Web conso
 
 `auth.loginProtection` configures recoverable backoff independently for normalized usernames and source IP addresses. The service persists only SHA-256 scope keys and bounded result metadata in `web_login_throttles` and `web_auth_events`; it never stores submitted passwords or raw source addresses. The HTTP route owner must pass `login(username, password, { clientIp })` a source address resolved from the socket or an explicitly trusted reverse proxy. It must not trust arbitrary public `X-Forwarded-For` values.
 
+`auth.trustedProxyIps` is empty by default. Configure only the reverse proxy addresses or CIDRs that the Hub actually sees on its socket; unmatched peers cannot use `X-Forwarded-For` to change the login rate-limit address. See [OPERATIONS.md](OPERATIONS.md#3-tls-反向代理) for same-host Caddy and multi-proxy guidance.
+
 ## Bootstrap identities
 
 Create the first administrator with a password passed through a temporary environment variable:

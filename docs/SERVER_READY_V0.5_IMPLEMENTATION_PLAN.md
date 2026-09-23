@@ -396,7 +396,7 @@ TLS 反向代理
 | 阶段 D 最小身份与权限 | 已验收 | 2026-09-15：独立 Worker 凭据及即时撤销/轮换、agentId/deviceId 绑定、Web scrypt 用户与服务端 Session、HttpOnly/Secure/SameSite Cookie、CSRF/Origin、admin/operator RBAC 和真实 Actor 审计完成；真实身份/权限场景 PASS |
 | 阶段 E 资源探针统一 | 已验收 | 2026-09-16：启动及低频刷新、设备/工具/服务/模型/额度统一快照、来源与最后成功时间、陈旧保留、配置模型回退、动态能力刷新和 Web 状态展示完成；资源专项 4/4、Hub 全量 23/23、Web lint/build、E2E PASS |
 | 阶段 F 人工介入持久化 | 已验收 | 2026-09-16：独立 Store/表记录、migration 003、最小上下文、Web 批准/拒绝/回复、pending 条件更新、并发单次处理、原父任务/角色/阶段/session 恢复及审计已实现；Memory 重启与并发测试 2/2 PASS；根据当前人类确认，专用 PostgreSQL migration、Hub 重启和并发条件处理已人工验证通过。本机未持有 `A446_TEST_DATABASE_URL`，未重复执行该破坏性测试。 |
-| 阶段 G 验证与发布准备 | 进行中 | 2026-09-16：批次四已启动；Mock Hub 重启、Executor 断线、Reviewer 断线故障注入 3/3 PASS，最终全仓检查为 Hub 26/26、Server Hub 包检查、Web lint/build 与组合 E2E 全绿；三个包的生产依赖审计均为 0 vulnerabilities；环境模板、运维/恢复与发布检查资料已补充。真实多机模型验证与目标部署演练尚未执行。详见批次四记录。 |
+| 阶段 G 验证与发布准备 | 进行中 | 2026-09-22：集成分支补齐离线本机退出和可信代理配置；最终工作树完整 `check-all.ps1 -RequirePostgres` 通过，包括 Hub 35/35、Server Hub 5/5、Web lint/build、Mock 组合 Smoke、浏览器 Fixture E2E 5/5、三个生产包依赖审计 0 漏洞，以及一次性隔离 PostgreSQL 18 验收 3/3。一次性真实 Server Hub/PostgreSQL/Web/Worker 服务栈的实时浏览器门禁 1/1 通过，并修正 Fixture 的 Workflow `202 Accepted` 契约漂移。当前未配置目标服务器；真实 HTTPS/WSS、备份/回退、systemd 和多设备模型验收均未执行。详细记录见 `docs/V0.5_RELEASE_ACCEPTANCE_REPORT.md`。 |
 
 每次交付后更新本表，并按以下结构报告：
 

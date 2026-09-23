@@ -32,7 +32,7 @@ test("live browser release gate: login, identity display, Executor selection, of
     const workflowResponsePromise = page.waitForResponse((response) => response.url().endsWith("/api/v1/workflows") && response.request().method() === "POST");
     await page.getByRole("button", { name: "创建任务群聊" }).click();
     const workflowResponse = await workflowResponsePromise;
-    assert.equal(workflowResponse.status(), 201);
+    assert.equal(workflowResponse.status(), 202);
     const workflow = await workflowResponse.json();
     const cancelled = await page.evaluate(async (taskId) => {
       const response = await fetch("/api/v1/commands", {
