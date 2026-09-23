@@ -49,7 +49,7 @@ fi
 [[ ! -e "$target" || -d "$target" ]] || fail "Artifact target must be a directory"
 
 umask 077
-stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)-$$-${RANDOM}"
 target_name="$(basename -- "$target")"
 staging="${target_parent}/.${target_name}.restore-${stamp}"
 rollback="${target_parent}/${target_name}.rollback-${stamp}"
@@ -75,8 +75,7 @@ cleanup_restore_sql() {
 }
 trap cleanup_restore_sql EXIT
 if ! {
-  printf 'DROP SCHEMA public CASCADE;\n'
-  printf 'CREATE SCHEMA public AUTHORIZATION CURRENT_USER;\n'
+  printf 'DROP OWNED BY CURRENT_USER CASCADE;\n'
   pg_restore \
     --no-owner \
     --no-privileges \
