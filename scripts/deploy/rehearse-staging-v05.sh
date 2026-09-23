@@ -124,30 +124,28 @@ create_pair_backup() {
 }
 
 restore_active_pair() {
-  local backup_directory="$1" stamp target_parent target_name staging rollback
+  local backup_directory="$1"
   (cd -- "$backup_directory" && sha256sum --check SHA256SUMS)
-  stamp="$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM"
-  target_parent="$(dirname -- "$artifact_root")"
-  target_name="$(basename -- "$artifact_root")"
-  staging="${target_parent}/.${target_name}.restore-${stamp}"
-  rollback="${target_parent}/${target_name}.rollback-${stamp}"
-  mkdir -m 0750 -- "$staging"
-  cp -a -- "$backup_directory/artifacts/." "$staging/"
-  chown -R a446:a446 "$staging"
-  if [[ -d "$artifact_root" ]]; then mv -- "$artifact_root" "$rollback"; fi
-  mv -- "$staging" "$artifact_root"
-  if ! (cd /tmp && sudo -u postgres pg_restore \
-    --clean \
-    --if-exists \
-    --no-owner \
-    --role="$database_role" \
-    --exit-on-error \
-    --single-transaction \
-    --dbname="$database_name") < "$backup_directory/a446.dump"; then
-    mv -- "$artifact_root" "${artifact_root}.failed-${stamp}"
-    if [[ -d "$rollback" ]]; then mv -- "$rollback" "$artifact_root"; fi
-    return 1
-  fi
+  node - "$runtime_environment" "$script_directory" "$backup_directory" <<'NODE'
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [environmentFile, scriptDirectory, backupDirectory] = process.argv.slice(2);
+const environment = JSON.parse(fs.readFileSync(environmentFile, "utf8"));
+const result = spawnSync("bash", [
+  `${scriptDirectory}/restore-server.sh`,
+  backupDirectory,
+], {
+  env: {
+    ...process.env,
+    ...environment,
+    A446_MAINTENANCE_CONFIRMED: "yes",
+    A446_RESTORE_CONFIRMED: "yes",
+  },
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+NODE
 }
 
 activate_release() {

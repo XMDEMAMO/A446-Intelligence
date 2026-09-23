@@ -20,6 +20,7 @@ is_within() {
 [[ -n "${A446_ARTIFACT_ROOT:-}" ]] || fail "A446_ARTIFACT_ROOT is not set"
 command -v node >/dev/null 2>&1 || fail "node is not available"
 command -v pg_restore >/dev/null 2>&1 || fail "pg_restore is not available"
+command -v psql >/dev/null 2>&1 || fail "psql is not available"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is not available"
 command -v realpath >/dev/null 2>&1 || fail "realpath is not available"
 
@@ -68,17 +69,36 @@ if ! mv -- "$staging" "$target"; then
 fi
 
 script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-if ! node "$script_directory/run-postgres-client.mjs" pg_restore \
-  --clean \
-  --if-exists \
-  --no-owner \
-  --exit-on-error \
+restore_sql="$(mktemp "${backup_directory}/.restore-XXXXXXXX.sql")"
+cleanup_restore_sql() {
+  rm -f -- "$restore_sql"
+}
+trap cleanup_restore_sql EXIT
+if ! {
+  printf 'DROP SCHEMA public CASCADE;\n'
+  printf 'CREATE SCHEMA public AUTHORIZATION CURRENT_USER;\n'
+  pg_restore \
+    --no-owner \
+    --no-privileges \
+    --exit-on-error \
+    --file=- \
+    "$backup_directory/a446.dump"
+} > "$restore_sql"; then
+  mv -- "$target" "$failed"
+  if [[ "$had_previous" == true ]]; then mv -- "$rollback" "$target"; fi
+  fail "could not prepare database restore; previous Artifact target was restored"
+fi
+
+if ! node "$script_directory/run-postgres-client.mjs" psql \
+  --set=ON_ERROR_STOP=1 \
   --single-transaction \
-  "$backup_directory/a446.dump"; then
+  --file="$restore_sql"; then
   mv -- "$target" "$failed"
   if [[ "$had_previous" == true ]]; then mv -- "$rollback" "$target"; fi
   fail "database restore failed; previous Artifact target was restored and failed snapshot was kept at $failed"
 fi
+cleanup_restore_sql
+trap - EXIT
 
 printf 'Restore complete. Artifact target: %s\n' "$target"
 if [[ "$had_previous" == true ]]; then
