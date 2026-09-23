@@ -31,9 +31,8 @@ postgres_helper="$script_directory/run-postgres-client.mjs"
 runtime_environment="$(mktemp /run/a446-worker-restart-environment.XXXXXX)"
 credential_file="$(mktemp /run/a446-worker-restart-credential.XXXXXX)"
 worker_root="/var/lib/a446-worker/$agent_id"
-workers_config_root="/etc/a446/workers"
-environment_file="$workers_config_root/restart-probe.env"
-worker_config="$workers_config_root/restart-probe.json"
+environment_file="$worker_root/restart-probe.env"
+worker_config="$worker_root/restart-probe.json"
 unit_file="/etc/systemd/system/$unit_name"
 evidence_directory="$evidence_root/worker-restart-$stamp"
 credential_id=""
@@ -123,7 +122,6 @@ if ! id -u "$worker_user" >/dev/null 2>&1; then
 fi
 getent group a446 >/dev/null || fail "required release access group a446 does not exist"
 worker_group="$(id -gn "$worker_user")"
-install -d -o root -g "$worker_group" -m 0750 "$workers_config_root"
 install -d -o "$worker_user" -g "$worker_group" -m 0750 /var/lib/a446-worker "$worker_root" "$worker_root/workspace" "$worker_root/state"
 install -d -o root -g root -m 0700 "$evidence_root" "$evidence_directory"
 
@@ -151,10 +149,10 @@ const config = {
   reconnect: { baseMs: 250, maxMs: 5000 },
   adapter: { type: "mock", delayMs: 50 },
 };
-fs.writeFileSync(environmentFile, `A446_WORKER_TOKEN=${credential.token}\n`, { mode: 0o640 });
-fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o640 });
+fs.writeFileSync(environmentFile, `A446_WORKER_TOKEN=${credential.token}\n`, { mode: 0o600 });
+fs.writeFileSync(configFile, `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
 NODE
-chown root:"$worker_group" "$environment_file" "$worker_config"
+chown "$worker_user":"$worker_group" "$environment_file" "$worker_config"
 
 cat > "$unit_file" <<EOF
 [Unit]
