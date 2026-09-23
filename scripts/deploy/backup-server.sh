@@ -17,6 +17,7 @@ is_within() {
 [[ "${A446_MAINTENANCE_CONFIRMED:-}" == "yes" ]] || fail "stop Server Hub, then set A446_MAINTENANCE_CONFIRMED=yes"
 [[ -n "${A446_DATABASE_URL:-}" ]] || fail "A446_DATABASE_URL is not set"
 [[ -n "${A446_ARTIFACT_ROOT:-}" ]] || fail "A446_ARTIFACT_ROOT is not set"
+command -v node >/dev/null 2>&1 || fail "node is not available"
 command -v pg_dump >/dev/null 2>&1 || fail "pg_dump is not available"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is not available"
 command -v realpath >/dev/null 2>&1 || fail "realpath is not available"
@@ -36,7 +37,8 @@ backup_directory="${backup_root}/a446-${stamp}"
 mkdir -- "$backup_directory"
 touch -- "$backup_directory/INCOMPLETE"
 
-PGDATABASE="$A446_DATABASE_URL" pg_dump \
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+node "$script_directory/run-postgres-client.mjs" pg_dump \
   --format=custom \
   --file="$backup_directory/a446.dump"
 

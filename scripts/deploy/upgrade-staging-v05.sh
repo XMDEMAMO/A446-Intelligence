@@ -105,27 +105,82 @@ sed \
   "$release_directory/deploy/Caddyfile.example" > "$new_caddyfile"
 caddy validate --config "$new_caddyfile"
 
+runtime_environment="$(mktemp /run/a446-upgrade-environment.XXXXXX)"
+chmod 0600 "$runtime_environment"
+cleanup_runtime_environment() {
+  rm -f -- "$runtime_environment"
+  if ! systemctl is-active --quiet a446-server-hub; then
+    systemctl start a446-server-hub || true
+  fi
+}
+trap cleanup_runtime_environment EXIT
+
+hub_pid="$(systemctl show a446-server-hub --property MainPID --value)"
+[[ "$hub_pid" =~ ^[1-9][0-9]*$ ]] || fail "Server Hub must be running before deployment"
+node - "$hub_pid" "$runtime_environment" <<'NODE'
+const fs = require("node:fs");
+const [pid, output] = process.argv.slice(2);
+const entries = fs.readFileSync(`/proc/${pid}/environ`, "utf8")
+  .split("\0")
+  .filter(Boolean)
+  .map((item) => {
+    const separator = item.indexOf("=");
+    return [item.slice(0, separator), item.slice(separator + 1)];
+  });
+const environment = Object.fromEntries(entries);
+for (const name of ["A446_DATABASE_URL", "A446_ARTIFACT_ROOT"]) {
+  if (!environment[name]) throw new Error(`Running Server Hub is missing ${name}`);
+}
+fs.writeFileSync(output, JSON.stringify({
+  A446_DATABASE_URL: environment.A446_DATABASE_URL,
+  A446_ARTIFACT_ROOT: environment.A446_ARTIFACT_ROOT,
+}), { mode: 0o600 });
+NODE
+
 systemctl stop a446-server-hub
 [[ "$(systemctl is-active a446-server-hub || true)" != "active" ]] || fail "Server Hub did not stop"
 
-set -a
-. /etc/a446/server-hub.env
-set +a
-export A446_MAINTENANCE_CONFIRMED=yes
-bash "$release_directory/scripts/deploy/backup-server.sh" /var/backups/a446
+node - "$runtime_environment" "$release_directory" <<'NODE'
+const fs = require("node:fs");
+const { spawnSync } = require("node:child_process");
+const [environmentFile, releaseDirectory] = process.argv.slice(2);
+const runtimeEnvironment = JSON.parse(fs.readFileSync(environmentFile, "utf8"));
+const result = spawnSync("bash", [
+  `${releaseDirectory}/scripts/deploy/backup-server.sh`,
+  "/var/backups/a446",
+], {
+  env: {
+    ...process.env,
+    ...runtimeEnvironment,
+    A446_MAINTENANCE_CONFIRMED: "yes",
+  },
+  stdio: "inherit",
+});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+NODE
 
-export A446_SERVICES_STOPPED=yes
+A446_MAINTENANCE_CONFIRMED=yes \
+A446_SERVICES_STOPPED=yes \
 bash "$release_directory/scripts/deploy/switch-release.sh" "$release_sha"
-unset A446_SERVICES_STOPPED A446_MAINTENANCE_CONFIRMED
 
-sudo -u a446 -H bash -c '
-  set -euo pipefail
-  set -a
-  . /etc/a446/server-hub.env
-  set +a
-  cd "$1/apps/server-hub"
-  npm run migrate
-' bash "$release_directory"
+node - "$runtime_environment" "$release_directory" <<'NODE'
+const fs = require("node:fs");
+const { execFileSync, spawnSync } = require("node:child_process");
+const [environmentFile, releaseDirectory] = process.argv.slice(2);
+const runtimeEnvironment = JSON.parse(fs.readFileSync(environmentFile, "utf8"));
+const uid = Number(execFileSync("id", ["-u", "a446"], { encoding: "utf8" }).trim());
+const gid = Number(execFileSync("id", ["-g", "a446"], { encoding: "utf8" }).trim());
+const result = spawnSync("npm", ["run", "migrate"], {
+  cwd: `${releaseDirectory}/apps/server-hub`,
+  env: { ...process.env, ...runtimeEnvironment },
+  stdio: "inherit",
+  uid,
+  gid,
+});
+if (result.error) throw result.error;
+process.exit(result.status ?? 1);
+NODE
 
 install -o root -g root -m 0644 "$new_unit" /etc/systemd/system/a446-server-hub.service
 install -o root -g root -m 0644 "$new_caddyfile" /etc/caddy/Caddyfile

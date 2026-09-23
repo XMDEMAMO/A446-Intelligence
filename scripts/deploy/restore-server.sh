@@ -18,6 +18,7 @@ is_within() {
 [[ "${A446_RESTORE_CONFIRMED:-}" == "yes" ]] || fail "set A446_RESTORE_CONFIRMED=yes after verifying the exact target database and Artifact root"
 [[ -n "${A446_DATABASE_URL:-}" ]] || fail "A446_DATABASE_URL is not set"
 [[ -n "${A446_ARTIFACT_ROOT:-}" ]] || fail "A446_ARTIFACT_ROOT is not set"
+command -v node >/dev/null 2>&1 || fail "node is not available"
 command -v pg_restore >/dev/null 2>&1 || fail "pg_restore is not available"
 command -v sha256sum >/dev/null 2>&1 || fail "sha256sum is not available"
 command -v realpath >/dev/null 2>&1 || fail "realpath is not available"
@@ -66,7 +67,8 @@ if ! mv -- "$staging" "$target"; then
   fail "could not activate restored Artifact snapshot"
 fi
 
-if ! PGDATABASE="$A446_DATABASE_URL" pg_restore \
+script_directory="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+if ! node "$script_directory/run-postgres-client.mjs" pg_restore \
   --clean \
   --if-exists \
   --no-owner \

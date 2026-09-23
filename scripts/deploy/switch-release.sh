@@ -20,8 +20,10 @@ candidate="$(realpath "${releases_root}/${release_name}")"
 [[ -f "$candidate/apps/web/dist/index.html" ]] || fail "release is missing the Web production build"
 
 deployment_root="$(dirname -- "$releases_root")"
-current="$(realpath -m "${A446_CURRENT_LINK:-${deployment_root}/current}")"
-[[ "$(dirname -- "$current")" == "$deployment_root" ]] || fail "current link must be a direct child of $deployment_root"
+current_input="${A446_CURRENT_LINK:-${deployment_root}/current}"
+current_parent="$(realpath -m "$(dirname -- "$current_input")")"
+current="${current_parent}/$(basename -- "$current_input")"
+[[ "$current_parent" == "$deployment_root" ]] || fail "current link must be a direct child of $deployment_root"
 if [[ -e "$current" && ! -L "$current" ]]; then
   fail "refusing to replace non-symbolic-link path: $current"
 fi
