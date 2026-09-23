@@ -202,12 +202,12 @@ const fs = require("node:fs");
 const { spawnSync } = require("node:child_process");
 const [environmentFile, helper, agentId] = process.argv.slice(2);
 const environment = JSON.parse(fs.readFileSync(environmentFile, "utf8"));
-const sql = `SELECT concat_ws(E'\\t', status, coalesce(document->>'deviceId',''), coalesce(document->>'connectedAt',''), coalesce(document->>'reconnectedAt','')) FROM worker_registrations WHERE agent_id = :'agent_id';`;
+if (!/^[a-z0-9-]+$/.test(agentId)) throw new Error("Unexpected probe agent ID");
+const sql = `SELECT concat_ws(E'\\t', status, coalesce(document->>'deviceId',''), coalesce(document->>'connectedAt',''), coalesce(document->>'reconnectedAt','')) FROM worker_registrations WHERE agent_id = '${agentId}';`;
 const result = spawnSync(process.execPath, [
   helper,
   "psql",
   "--set=ON_ERROR_STOP=1",
-  `--set=agent_id=${agentId}`,
   "--tuples-only",
   "--no-align",
   "--command", sql,
