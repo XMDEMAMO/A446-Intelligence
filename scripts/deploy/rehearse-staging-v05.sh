@@ -143,8 +143,7 @@ restore_active_pair() {
     --role="$database_role" \
     --exit-on-error \
     --single-transaction \
-    --dbname="$database_name" \
-    "$backup_directory/a446.dump"); then
+    --dbname="$database_name") < "$backup_directory/a446.dump"; then
     mv -- "$artifact_root" "${artifact_root}.failed-${stamp}"
     if [[ -d "$rollback" ]]; then mv -- "$rollback" "$artifact_root"; fi
     return 1
@@ -200,13 +199,12 @@ restore_database="a446_restore_${restore_stamp,,}"
 restore_artifacts="/var/lib/a446/restore-rehearsal-${restore_stamp}"
 sudo -u postgres psql --set=ON_ERROR_STOP=1 --command="CREATE ROLE ${restore_role} NOLOGIN"
 sudo -u postgres createdb --owner="$restore_role" "$restore_database"
-sudo -u postgres pg_restore \
+(cd /tmp && sudo -u postgres pg_restore \
   --no-owner \
   --role="$restore_role" \
   --exit-on-error \
   --single-transaction \
-  --dbname="$restore_database" \
-  "$pre_deploy_backup/a446.dump"
+  --dbname="$restore_database") < "$pre_deploy_backup/a446.dump"
 mkdir -m 0750 -- "$restore_artifacts"
 cp -a -- "$pre_deploy_backup/artifacts/." "$restore_artifacts/"
 chown -R a446:a446 "$restore_artifacts"
