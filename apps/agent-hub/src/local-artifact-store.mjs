@@ -65,6 +65,18 @@ export class LocalArtifactStore {
     return { stream: createReadStream(file), size: info.size };
   }
 
+  /**
+   * Deletes the artifact object. Idempotent: removing an already-removed
+   * (or never-stored) object succeeds. The storage key is validated through
+   * the same security boundary as reads, so a poisoned key cannot escape the
+   * artifact root. Transient Windows locks (EBUSY/EPERM) are retried.
+   */
+  async remove(artifact) {
+    if (!artifact?.storageKey) throw Object.assign(new Error("Artifact has no local storage key"), { code: "ARTIFACT_DELETE_FAILED" });
+    const file = this.resolveStorageKey(artifact.storageKey);
+    await rm(file, { force: true, maxRetries: 5, retryDelay: 100 });
+  }
+
   resolveStorageKey(storageKey) {
     if (typeof storageKey !== "string" || !/^objects\/[a-f0-9]{2}\/[a-f0-9]{32}$/.test(storageKey)) {
       throw new Error("Invalid local storage key");

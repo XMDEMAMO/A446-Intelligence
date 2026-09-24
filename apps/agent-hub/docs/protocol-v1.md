@@ -80,8 +80,8 @@ stale        本次刷新失败，仍保留最后一次可信成功值
 
 ## Reliable delivery
 
-- Hub 发送的 `task.assign`、`task.cancel`、`agent.pause`、`agent.resume` 需要 Worker 回 `ack`。
-- Worker 发送的 `task.started`、`task.result`、`task.error`、`task.rejected`、`approval.request` 需要 Hub 回 `ack`。
+- Hub 发送的 `task.assign`、`task.cancel`、`agent.pause`、`agent.resume`、`device.update.request` 需要 Worker 回 `ack`。
+- Worker 发送的 `task.started`、`task.result`、`task.error`、`task.rejected`、`approval.request`、`device.update.status` 需要 Hub 回 `ack`。
 - `ack.replyTo` 等于被确认消息的 `id`。
 - 未确认消息可在超时或重连后重复发送；接收方必须以消息 `id` 去重。
 - `worker.heartbeat` 和 `hub.welcome` 不要求确认。
@@ -240,6 +240,49 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 
 `task.started`、`task.rejected` 和 `approval.request` 也必须在 payload 中回传当前 `attemptId`。未协商 `attempt-lease-v1` 的旧版本地模式保持 v1 原有行为。
 
+## Device update bridge (v0.5 LAN)
+
+设备更新桥接把 GitHub Release 更新指令通过现有 Hub WebSocket 通道转发给指定设备，由设备上独立运行的 Updater 完成 check/download/verify/stage/切换/重启/健康检查/回滚。Hub 只做权限校验、路由与状态记录，不参与更新执行。完整状态机、安装布局与断电恢复见 `docs/UPDATER_PROTOCOL.md`。
+
+### 6.1 Hub -> Worker：`device.update.request`
+
+由 `POST /v1/commands` 提交（LAN 共享 token 即 admin）：
+
+```json
+{ "type": "device.update.request", "deviceId": "laptop-01", "version": "0.5.0-preview16", "jobId": "uuid-or-slug" }
+```
+
+Hub 行为：
+
+1. 校验 admin 角色、`deviceId`、`jobId`（必填，8-200 字符）。
+2. `jobId` 已存在 -> 返回既有任务（幂等，`duplicate: true`），不重新下发；重试必须使用新的 `jobId`（Worker 桥接与设备 Updater 对已知 jobId 都重放终态，重复下发不会重跑）。
+3. 同一 `deviceId` 已有活动更新任务 -> HTTP 409 `UPDATE_JOB_ALREADY_RUNNING`。
+4. 无该 deviceId 的在线 Agent -> HTTP 409 `DEVICE_OFFLINE`。
+5. 通过现有可靠投递（at-least-once，需 ack，按消息 id 去重）发送 envelope 给该设备任一在线 Agent。
+
+### 6.2 Worker -> Hub：`device.update.status`
+
+Worker 桥接收到 request 后：ack -> 以独立进程拉起本机 Updater（`update --job-id <id> [--version <v>]`）-> 轮询 Updater `state.json`，phase 变化即上报；Worker 自身被重启后，在启动时检查 Updater state，对未补报终态的 job 补发一次最终状态（在 Worker 自身状态中记录 `finalSent` 防重复）。
+
+```json
+{
+  "v": 1, "id": "...", "type": "device.update.status", "agentId": "...",
+  "payload": {
+    "jobId": "...", "deviceId": "...", "phase": "downloading",
+    "version": "0.5.0-preview16", "fromVersion": "0.5.0-preview15",
+    "error": null, "checkedAt": "ISO-8601"
+  }
+}
+```
+
+phase 取值：`checking|downloading|staged|applying|restarting|verifying|completed|failed|rolled_back`。该消息加入可靠投递集合（需 ack、按 id 去重）。
+
+### 6.3 Hub 侧状态
+
+- 内存注册表 `updateJobs: Map<jobId, job>`（Hub 重启后丢失非终态记录属 v1 已知限制；Worker 重连补报会按 upsert 重建）。
+- `GET /v1/update-jobs` 返回任务列表（Web 会话/admin）。
+- 每次请求与上报都写入审计事件 `device.update.requested` / `device.update.status`。
+
 ## Human intervention
 
 人工介入是独立持久记录，至少包含 `interventionId`、`rootTaskId`、`taskId`、`kind`、发起角色、发起阶段、`sessionScopeId`、最小上下文、允许动作和继续节点。记录初始状态为 `pending`，只能通过数据库条件更新转换一次为 `resolved`；重复或并发提交返回 HTTP `409`。
@@ -251,6 +294,7 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - `GET /health`
 - `POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me`
 - `GET /v1/agents`
+- `GET /v1/update-jobs`
 - `GET /v1/events?limit=N`
 - `GET /v1/tasks?rootTaskId=UUID`
 - `GET /v1/attempts?taskId=UUID`

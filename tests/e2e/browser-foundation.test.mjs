@@ -24,10 +24,11 @@ test("browser E2E: authentication, reviewed result, intervention, and workflow c
 
     await page.getByText("完整成果").click();
     await page.getByText("fixture full result").waitFor();
-    await page.getByText("需要你的决定").waitFor();
+    const pendingDecisionAlert = page.getByRole("button", { name: /需要你的决定/ });
+    await pendingDecisionAlert.waitFor();
     await page.getByRole("button", { name: "批准" }).click();
     await page.getByText("请求已批准").waitFor();
-    await page.getByText("需要你的决定").waitFor({ state: "detached" });
+    await pendingDecisionAlert.waitFor({ state: "detached" });
 
     await page.getByRole("button", { name: "＋ 新建协作任务" }).click();
     await page.getByLabel("任务名称").fill("Browser fixture workflow");

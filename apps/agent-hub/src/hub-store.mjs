@@ -13,6 +13,9 @@ function emptyState() {
     deliveries: [],
     inboundMessages: [],
     auditEvents: [],
+    updateJobs: [],
+    lifecycles: [],
+    tombstones: [],
     metadata: {
       messageSeq: 0,
       usageTotals: null,
@@ -54,7 +57,20 @@ export class MemoryHubStore {
       upsert(this.state.inboundMessages, message, (item) => item.messageId);
     }
     for (const event of changes.auditEvents ?? []) upsert(this.state.auditEvents, event, (item) => item.seq);
+    for (const job of changes.updateJobs ?? []) upsert(this.state.updateJobs, job, (item) => item.jobId);
+    for (const record of changes.lifecycles ?? []) upsert(this.state.lifecycles, record, (item) => item.rootTaskId);
+    for (const stone of changes.tombstones ?? []) upsert(this.state.tombstones, stone, (item) => item.rootTaskId);
+    // Removals must be applied AFTER the upserts above: a purge batch can
+    // legitimately contain a stale lifecycle upsert plus the matching removal.
+    applyRemovals(this.state, changes.removals ?? {});
     if (changes.metadata) this.state.metadata = { ...this.state.metadata, ...structuredClone(changes.metadata) };
+  }
+
+  /** Full set of persisted message ids belonging to a root conversation. */
+  collectMessageIdsByRoot(rootTaskId) {
+    return this.state.messages
+      .filter((message) => message?.rootTaskId === rootTaskId)
+      .map((message) => message.messageId);
   }
 
   async close() {}
@@ -123,7 +139,7 @@ export function createEmptyHubState() {
 
 function normalizeState(seed) {
   const state = emptyState();
-  for (const key of ["tasks", "messages", "agents", "attempts", "artifacts", "interventions", "deliveries", "inboundMessages", "auditEvents"]) {
+  for (const key of ["tasks", "messages", "agents", "attempts", "artifacts", "interventions", "deliveries", "inboundMessages", "auditEvents", "updateJobs", "lifecycles", "tombstones"]) {
     state[key] = Array.isArray(seed[key]) ? structuredClone(seed[key]) : [];
   }
   state.metadata = {
@@ -144,6 +160,16 @@ function upsert(collection, value, keyOf) {
 function remove(collection, key, keyOf) {
   const index = collection.findIndex((item) => keyOf(item) === key);
   if (index !== -1) collection.splice(index, 1);
+}
+
+function applyRemovals(state, removals) {
+  for (const taskId of removals.tasks ?? []) remove(state.tasks, taskId, (item) => item.taskId);
+  for (const messageId of removals.messages ?? []) remove(state.messages, messageId, (item) => item.messageId);
+  for (const attemptId of removals.attempts ?? []) remove(state.attempts, attemptId, (item) => item.attemptId);
+  for (const interventionId of removals.interventions ?? []) remove(state.interventions, interventionId, (item) => item.interventionId);
+  for (const artifactId of removals.artifacts ?? []) remove(state.artifacts, artifactId, (item) => item.artifactId);
+  for (const key of removals.deliveries ?? []) remove(state.deliveries, key, deliveryKey);
+  for (const rootTaskId of removals.lifecycles ?? []) remove(state.lifecycles, rootTaskId, (item) => item.rootTaskId);
 }
 
 function deliveryKey(delivery) {

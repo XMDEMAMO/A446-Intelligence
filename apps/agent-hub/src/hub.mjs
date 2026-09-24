@@ -7,14 +7,16 @@ import { randomUUID, timingSafeEqual } from "node:crypto";
 import { EventLog } from "./event-log.mjs";
 import { MemoryHubStore } from "./hub-store.mjs";
 import { isLoopbackHost, makeEnvelope, parseEnvelope, safeError } from "./common.mjs";
-import { addUsage, bindModelQuotas, chooseAgent, isPreferredQuotaSnapshot, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeStageModels, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, chooseAgent, chooseModel, isPreferredQuotaSnapshot, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeStageModels, parseRoleSubmission, ROLE_SET, STAGE_SET } from "./collaboration.mjs";
 import { extractArtifactPaths } from "./local-policy.mjs";
+import { HubUpdateRegistry } from "./hub-updates.mjs";
+import { ConversationLifecycleManager } from "./conversation-lifecycle.mjs";
 
 const ACTIVE_TASK_STATUSES = new Set(["queued", "awaiting_approval", "dispatched", "running", "processing_result"]);
 const ACTIVE_SLOT_STATUSES = new Set(["dispatched", "running", "processing_result"]);
 const TERMINAL_TASK_STATUSES = new Set(["completed", "failed", "cancelled", "rejected"]);
 const ACTIVE_ATTEMPT_STATUSES = new Set(["assigned", "running"]);
-const RELIABLE_WORKER_MESSAGES = new Set(["task.started", "task.result", "task.error", "task.rejected", "approval.request"]);
+const RELIABLE_WORKER_MESSAGES = new Set(["task.started", "task.result", "task.error", "task.rejected", "approval.request", "device.update.status"]);
 const LEASE_PROTOCOL_FEATURE = "attempt-lease-v1";
 const ARTIFACT_PROTOCOL_FEATURE = "artifact-transfer-v1";
 
@@ -35,6 +37,8 @@ export class AgentHub {
     this.artifacts = new Map();
     this.interventions = new Map();
     this.interventionLocks = new Map();
+    this.updates = new HubUpdateRegistry(this);
+    this.lifecycle = new ConversationLifecycleManager(this, { trashRetentionMs: this.config.lifecycle?.trashRetentionMs });
     this.processedInbound = new Set();
     this.store = services.store ?? new MemoryHubStore();
     this.authService = services.authService ?? null;
@@ -54,6 +58,7 @@ export class AgentHub {
     this.wss = null;
     this.retryTimer = null;
     this.leaseTimer = null;
+    this.lifecycleTimer = null;
     this.stopping = false;
   }
 
@@ -90,6 +95,8 @@ export class AgentHub {
     }
     this.processedInbound = new Set((state.inboundMessages ?? []).map((message) => message.messageId));
     this.log.restore(state.auditEvents ?? []);
+    this.updates.restore(state.updateJobs ?? []);
+    this.lifecycle.loadState(state.lifecycles ?? [], state.tombstones ?? []);
 
     this.agents = new Map((state.agents ?? []).map((agent) => {
       const restored = {
@@ -123,6 +130,10 @@ export class AgentHub {
     return Math.max(0, Number(this.config.leases?.maxRecoveryAttempts ?? 3));
   }
 
+  lifecycleSweepIntervalMs() {
+    return Math.max(30_000, Number(this.config.lifecycle?.sweepIntervalMs ?? 60_000));
+  }
+
   markTask(task, guard) {
     if (!task?.taskId) return;
     this.dirty.tasks.set(task.taskId, task);
@@ -131,6 +142,48 @@ export class AgentHub {
 
   markAgent(agent) {
     if (agent?.agentId) this.dirty.agents.set(agent.agentId, agent);
+  }
+
+  markUpdateJob(job) {
+    if (job?.jobId) this.dirty.updateJobs.set(job.jobId, job);
+  }
+
+  markLifecycle(record) {
+    if (record?.rootTaskId) this.dirty.lifecycles.set(record.rootTaskId, record);
+  }
+
+  markTombstone(stone) {
+    if (stone?.rootTaskId) this.dirty.tombstones.set(stone.rootTaskId, stone);
+  }
+
+  markLifecycleRemoved(rootTaskId) {
+    if (!rootTaskId) return;
+    this.dirty.lifecycles.delete(rootTaskId);
+    let set = this.dirty.removals.get("lifecycles");
+    if (!set) {
+      set = new Set();
+      this.dirty.removals.set("lifecycles", set);
+    }
+    set.add(rootTaskId);
+  }
+
+  markPurgeRemovals({ taskIds = [], messageIds = [], attemptIds = [], interventionIds = [], artifactIds = [], deliveryKeys = [] }) {
+    const add = (kind, ids) => {
+      for (const id of ids) {
+        let set = this.dirty.removals.get(kind);
+        if (!set) {
+          set = new Set();
+          this.dirty.removals.set(kind, set);
+        }
+        set.add(id);
+      }
+    };
+    add("tasks", taskIds);
+    add("messages", messageIds);
+    add("attempts", attemptIds);
+    add("interventions", interventionIds);
+    add("artifacts", artifactIds);
+    add("deliveries", deliveryKeys);
   }
 
   markAttempt(attempt) {
@@ -279,6 +332,10 @@ export class AgentHub {
       this.leaseTimer.unref();
       await this.reapExpiredLeases();
     }
+    this.lifecycleTimer = setInterval(() => {
+      void this.lifecycle.purgeDue().catch((error) => this.handleBackgroundError("conversation.lifecycle_sweep_error", error));
+    }, this.lifecycleSweepIntervalMs());
+    this.lifecycleTimer.unref();
     await this.recordEvent("hub.started", { host: this.host, port: this.port, tls: Boolean(this.config.tls?.enabled) });
     await this.flushState();
     return this;
@@ -306,6 +363,7 @@ export class AgentHub {
     this.stopping = true;
     if (this.retryTimer) clearInterval(this.retryTimer);
     if (this.leaseTimer) clearInterval(this.leaseTimer);
+    if (this.lifecycleTimer) clearInterval(this.lifecycleTimer);
     for (const agent of this.agents.values()) {
       if (agent.status !== "offline") {
         agent.status = "offline";
@@ -506,6 +564,13 @@ export class AgentHub {
       const key = deliveryKey(agentId, message.replyTo);
       if (this.pendingDeliveries.delete(key)) this.markDeliveryDeleted(agentId, message.replyTo);
       await this.flushState();
+      return;
+    }
+    if (message.type === "device.update.status") {
+      await this.updates.ingestStatus(agentId, message);
+      this.markInbound(agentId, message);
+      await this.commitAndDispatch();
+      this.sendAck(agentId, message.id);
       return;
     }
     const task = message.taskId ? this.tasks.get(message.taskId) : undefined;
@@ -878,6 +943,32 @@ export class AgentHub {
     return task;
   }
 
+  validateAgentStageModel(agent, roleLabel, role, { modelPreference, reasoningEffort }, customPrefix = "") {
+    const prefix = customPrefix ? `${customPrefix} ` : "";
+    if (modelPreference) {
+      const model = agent.models?.find((m) => (typeof m === "string" ? m : m.id) === modelPreference);
+      if (!model) {
+        throw httpError(400, `${roleLabel} '${agent.agentId}' does not support selected ${prefix}model '${modelPreference}'`, "INCOMPATIBLE_MODEL");
+      }
+      if (reasoningEffort && typeof model === "object" && model.reasoningEfforts?.length && !model.reasoningEfforts.includes(reasoningEffort)) {
+        throw httpError(400, `${roleLabel} '${agent.agentId}' ${prefix}model '${model.id}' does not support reasoning effort '${reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
+      }
+      return;
+    }
+    if (reasoningEffort) {
+      const chosen = chooseModel(agent, { role, reasoningEffort }, false);
+      if (chosen?.id) return;
+      const anyCompatible = (agent.models ?? []).some((m) => {
+        if (typeof m === "string") return true;
+        if (m.enabled === false) return false;
+        return !m.reasoningEfforts?.length || m.reasoningEfforts.includes(reasoningEffort);
+      });
+      if (!anyCompatible) {
+        throw httpError(400, `${roleLabel} '${agent.agentId}' has no available ${prefix}model supporting reasoning effort '${reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
+      }
+    }
+  }
+
   async createWorkflow(input) {
     if (!input || typeof input !== "object" || Array.isArray(input) || typeof input.objective !== "string" || !input.objective.trim()) {
       throw httpError(400, "workflow objective is required", "VALIDATION_ERROR");
@@ -903,41 +994,14 @@ export class AgentHub {
     if (input.plannerAgentId) {
       const plannerAgent = this.agents.get(input.plannerAgentId);
       if (plannerAgent) {
-        if (normalizedStages.planner.modelPreference && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.planner.modelPreference)) {
-          throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected model '${normalizedStages.planner.modelPreference}'`, "INCOMPATIBLE_MODEL");
-        }
-        if (normalizedStages.intake.modelPreference && !plannerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.intake.modelPreference)) {
-          throw httpError(400, `Planner agent '${input.plannerAgentId}' does not support selected intake model '${normalizedStages.intake.modelPreference}'`, "INCOMPATIBLE_MODEL");
-        }
-        if (normalizedStages.planner.reasoningEffort) {
-          const mId = normalizedStages.planner.modelPreference ?? plannerAgent.models?.[0]?.id;
-          const mObj = plannerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
-          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.planner.reasoningEffort)) {
-            throw httpError(400, `Planner agent '${input.plannerAgentId}' model '${mObj.id}' does not support reasoning effort '${normalizedStages.planner.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
-          }
-        }
-        if (normalizedStages.intake.reasoningEffort) {
-          const mId = normalizedStages.intake.modelPreference ?? normalizedStages.planner.modelPreference ?? plannerAgent.models?.[0]?.id;
-          const mObj = plannerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
-          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.intake.reasoningEffort)) {
-            throw httpError(400, `Planner agent '${input.plannerAgentId}' intake model '${mObj.id}' does not support reasoning effort '${normalizedStages.intake.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
-          }
-        }
+        this.validateAgentStageModel(plannerAgent, "Planner agent", "planner", normalizedStages.planner);
+        this.validateAgentStageModel(plannerAgent, "Planner agent", "planner", normalizedStages.intake, "intake");
       }
     }
     if (input.reviewerAgentId) {
       const reviewerAgent = this.agents.get(input.reviewerAgentId);
       if (reviewerAgent) {
-        if (normalizedStages.reviewer.modelPreference && !reviewerAgent.models?.some((m) => (typeof m === "string" ? m : m.id) === normalizedStages.reviewer.modelPreference)) {
-          throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' does not support selected model '${normalizedStages.reviewer.modelPreference}'`, "INCOMPATIBLE_MODEL");
-        }
-        if (normalizedStages.reviewer.reasoningEffort) {
-          const mId = normalizedStages.reviewer.modelPreference ?? reviewerAgent.models?.[0]?.id;
-          const mObj = reviewerAgent.models?.find((m) => (typeof m === "string" ? m : m.id) === mId);
-          if (mObj && typeof mObj === "object" && mObj.reasoningEfforts?.length && !mObj.reasoningEfforts.includes(normalizedStages.reviewer.reasoningEffort)) {
-            throw httpError(400, `Reviewer agent '${input.reviewerAgentId}' model '${mObj.id}' does not support reasoning effort '${normalizedStages.reviewer.reasoningEffort}'`, "INCOMPATIBLE_REASONING_EFFORT");
-          }
-        }
+        this.validateAgentStageModel(reviewerAgent, "Reviewer agent", "reviewer", normalizedStages.reviewer);
       }
     }
 
@@ -1324,7 +1388,11 @@ export class AgentHub {
           .join(", ");
         this.requireHuman(
           task,
-          `当前批次存在未成功完成或未获通过的子任务 [${failureDetails}]，禁止自动进入结果汇总。请人工介入排查。`
+          `当前批次存在未成功完成或未获通过的子任务 [${failureDetails}]，禁止自动进入结果汇总。请人工介入排查。`,
+          {
+            batchId: currentBatchId,
+            reasonTaskIds: failedOrUnapproved.map((t) => t.taskId),
+          }
         );
         return;
       }
@@ -1644,7 +1712,7 @@ export class AgentHub {
     await this.queueOrDispatch(revision);
   }
 
-  requireHuman(task, question) {
+  requireHuman(task, question, extraOptions = {}) {
     const root = this.tasks.get(task.rootTaskId) ?? task;
     return this.createIntervention(task, {
       kind: "workflow_input",
@@ -1657,15 +1725,32 @@ export class AgentHub {
         stage: "human_followup",
         sessionScopeId: root.sessionScopeId ?? task.sessionScopeId ?? root.taskId,
       },
+      ...extraOptions,
     });
   }
 
   createIntervention(task, options = {}) {
     const root = this.getCanonicalRootTask(task.rootTaskId ?? task) ?? task;
     const kind = String(options.kind ?? "workflow_input");
-    const duplicate = [...this.interventions.values()].find((item) => (
-      item.taskId === task.taskId && item.kind === kind && item.status === "pending"
-    ));
+    const batchId = options.batchId ?? task.batchId ?? task.parentTaskId ?? null;
+    const reasonTaskIds = Array.isArray(options.reasonTaskIds) && options.reasonTaskIds.length > 0
+      ? options.reasonTaskIds.map(String)
+      : [task.taskId];
+
+    const duplicate = [...this.interventions.values()].find((item) => {
+      if (item.rootTaskId !== root.taskId || item.status !== "pending" || item.kind !== kind) return false;
+      if (item.taskId === task.taskId) return true;
+      const itemBatchId = item.batchId ?? this.tasks.get(item.taskId)?.batchId ?? this.tasks.get(item.taskId)?.parentTaskId ?? null;
+      if (batchId && itemBatchId && batchId === itemBatchId) {
+        const itemReasonTaskIds = Array.isArray(item.reasonTaskIds) && item.reasonTaskIds.length > 0
+          ? item.reasonTaskIds
+          : [item.taskId];
+        if (reasonTaskIds.some((id) => itemReasonTaskIds.includes(id))) {
+          return true;
+        }
+      }
+      return false;
+    });
     if (duplicate) return duplicate;
     const requestedAt = new Date().toISOString();
     const question = String(options.question ?? "需要人工决定").trim().slice(0, 4000);
@@ -1673,6 +1758,8 @@ export class AgentHub {
       interventionId: randomUUID(),
       rootTaskId: root.taskId,
       taskId: task.taskId,
+      batchId,
+      reasonTaskIds,
       kind,
       status: "pending",
       question,
@@ -1895,7 +1982,8 @@ export class AgentHub {
     return { ok: true, intervention: this.publicIntervention(intervention), task: resumedTask };
   }
 
-  conversations() {
+  conversations(options = {}) {
+    const lifecycleFilter = options.lifecycle ?? "active";
     const roots = [...this.tasks.values()].filter((task) => task.rootTaskId === task.taskId);
     return roots.map((root) => {
       const tasks = [...this.tasks.values()].filter((task) => task.rootTaskId === root.taskId);
@@ -1924,6 +2012,7 @@ export class AgentHub {
         rootTaskId: root.taskId,
         title: root.taskSpec?.title ?? (root.input.slice(0, 60) || "未命名任务"),
         status,
+        lifecycle: this.lifecycle.stateOf(root.taskId),
         createdAt: root.createdAt,
         updatedAt: messages.at(-1)?.createdAt ?? root.completedAt ?? root.createdAt,
         participants,
@@ -1931,7 +2020,9 @@ export class AgentHub {
         messageCount: messages.length,
         humanIntervention: this.publicIntervention(currentIntervention, true),
       };
-    }).sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+    })
+      .filter((item) => lifecycleFilter === "all" || item.lifecycle === lifecycleFilter)
+      .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
   }
 
   isWorkflowComplete(rootTaskId) {
@@ -2699,6 +2790,9 @@ export class AgentHub {
       if (request.method === "GET" && url.pathname === "/v1/agents") {
         return json(response, 200, { agents: [...this.agents.values()] });
       }
+      if (request.method === "GET" && url.pathname === "/v1/update-jobs") {
+        return json(response, 200, { jobs: this.updates.listJobs() });
+      }
       if (request.method === "GET" && url.pathname === "/v1/events") {
         return json(response, 200, { events: this.log.recent(url.searchParams.get("limit")) });
       }
@@ -2718,7 +2812,36 @@ export class AgentHub {
         return json(response, 200, { attempts });
       }
       if (request.method === "GET" && url.pathname === "/v1/conversations") {
-        return json(response, 200, { conversations: this.conversations() });
+        const lifecycle = url.searchParams.get("lifecycle") ?? "active";
+        if (!["active", "archived", "trashed", "all"].includes(lifecycle)) {
+          return json(response, 400, { error: "lifecycle must be one of active, archived, trashed, all", code: "VALIDATION_ERROR" });
+        }
+        return json(response, 200, { conversations: this.conversations({ lifecycle }) });
+      }
+      const conversationArchiveRoute = url.pathname.match(/^\/v1\/conversations\/([0-9a-f-]{36})\/archive$/i);
+      if (request.method === "POST" && conversationArchiveRoute) {
+        const result = await this.lifecycle.archive(conversationArchiveRoute[1], actor);
+        return json(response, 200, result);
+      }
+      const conversationRestoreRoute = url.pathname.match(/^\/v1\/conversations\/([0-9a-f-]{36})\/restore$/i);
+      if (request.method === "POST" && conversationRestoreRoute) {
+        const result = await this.lifecycle.restore(conversationRestoreRoute[1], actor);
+        return json(response, 200, result);
+      }
+      const conversationTrashRoute = url.pathname.match(/^\/v1\/conversations\/([0-9a-f-]{36})$/i);
+      if (request.method === "DELETE" && conversationTrashRoute) {
+        const result = await this.lifecycle.trash(conversationTrashRoute[1], actor);
+        return json(response, 200, result);
+      }
+      const trashRestoreRoute = url.pathname.match(/^\/v1\/trash\/([0-9a-f-]{36})\/restore$/i);
+      if (request.method === "POST" && trashRestoreRoute) {
+        const result = await this.lifecycle.restoreFromTrash(trashRestoreRoute[1], actor);
+        return json(response, 200, result);
+      }
+      const trashPurgeRoute = url.pathname.match(/^\/v1\/trash\/([0-9a-f-]{36})$/i);
+      if (request.method === "DELETE" && trashPurgeRoute) {
+        const result = await this.lifecycle.purge(trashPurgeRoute[1], actor);
+        return json(response, 200, result);
       }
       if (request.method === "GET" && url.pathname === "/v1/messages") {
         const rootTaskId = url.searchParams.get("rootTaskId");
@@ -2890,6 +3013,10 @@ export class AgentHub {
   }
 
   async handleCommand(command, actor = { id: "human", role: "admin" }) {
+    if (command.type === "device.update.request") {
+      if (actor.role !== "admin") throw httpError(403, "Administrator role required for device updates");
+      return this.updates.request(command, actor);
+    }
     if (command.type === "intervention.resolve") {
       return this.resolveIntervention(String(command.interventionId ?? ""), command, actor);
     }
@@ -3119,6 +3246,10 @@ function createDirtyState() {
     deletedDeliveries: new Map(),
     inboundMessages: new Map(),
     auditEvents: new Map(),
+    updateJobs: new Map(),
+    lifecycles: new Map(),
+    tombstones: new Map(),
+    removals: new Map(),
     metadata: false,
   };
 }
@@ -3134,7 +3265,11 @@ function hasDirtyState(dirty) {
     || dirty.deliveries.size > 0
     || dirty.deletedDeliveries.size > 0
     || dirty.inboundMessages.size > 0
-    || dirty.auditEvents.size > 0;
+    || dirty.auditEvents.size > 0
+    || dirty.updateJobs.size > 0
+    || dirty.lifecycles.size > 0
+    || dirty.tombstones.size > 0
+    || dirty.removals.size > 0;
 }
 
 function takeDirtyState(hub) {
@@ -3153,6 +3288,10 @@ function takeDirtyState(hub) {
     deletedDeliveries: structuredClone([...dirty.deletedDeliveries.values()]),
     inboundMessages: structuredClone([...dirty.inboundMessages.values()]),
     auditEvents: structuredClone([...dirty.auditEvents.values()]),
+    updateJobs: structuredClone([...dirty.updateJobs.values()]),
+    lifecycles: structuredClone([...dirty.lifecycles.values()]),
+    tombstones: structuredClone([...dirty.tombstones.values()]),
+    removals: Object.fromEntries([...dirty.removals.entries()].map(([kind, ids]) => [kind, [...ids]])),
     ...(dirty.metadata ? {
       metadata: {
         messageSeq: hub.messageSeq,
@@ -3179,6 +3318,17 @@ function mergeDirtyState(dirty, changes) {
   }
   for (const message of changes.inboundMessages ?? []) dirty.inboundMessages.set(message.messageId, message);
   for (const event of changes.auditEvents ?? []) dirty.auditEvents.set(event.seq, event);
+  for (const job of changes.updateJobs ?? []) dirty.updateJobs.set(job.jobId, job);
+  for (const record of changes.lifecycles ?? []) dirty.lifecycles.set(record.rootTaskId, record);
+  for (const stone of changes.tombstones ?? []) dirty.tombstones.set(stone.rootTaskId, stone);
+  for (const [kind, ids] of Object.entries(changes.removals ?? {})) {
+    let set = dirty.removals.get(kind);
+    if (!set) {
+      set = new Set();
+      dirty.removals.set(kind, set);
+    }
+    for (const id of ids) set.add(id);
+  }
   if (changes.metadata) dirty.metadata = true;
 }
 

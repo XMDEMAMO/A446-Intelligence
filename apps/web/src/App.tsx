@@ -1250,11 +1250,17 @@ function App() {
                 const nextAgent = compatiblePlanners.find((agent) => agent.agentId === nextPlannerId)
                 const nextModel = !nextPlannerId || nextAgent?.models?.some((model) => model.id === draft.modelPreference) ? draft.modelPreference : ''
                 const nextIntakeModel = !nextPlannerId || nextAgent?.models?.some((model) => model.id === draft.intakeModelPreference) ? draft.intakeModelPreference : ''
+                const plannerTarget = nextAgent?.models?.find((model) => model.id === nextModel)
+                const intakeTarget = nextAgent?.models?.find((model) => model.id === (nextIntakeModel || nextModel))
+                const plannerEffortValid = !draft.reasoningEffort || !plannerTarget?.reasoningEfforts?.length || plannerTarget.reasoningEfforts.includes(draft.reasoningEffort)
+                const intakeEffortValid = !draft.intakeReasoningEffort || !intakeTarget?.reasoningEfforts?.length || intakeTarget.reasoningEfforts.includes(draft.intakeReasoningEffort)
                 setDraft({
                   ...draft,
                   plannerAgentId: nextPlannerId,
                   modelPreference: nextModel,
+                  reasoningEffort: plannerEffortValid ? draft.reasoningEffort : '',
                   intakeModelPreference: nextIntakeModel,
+                  intakeReasoningEffort: intakeEffortValid ? draft.intakeReasoningEffort : '',
                 })
               }}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>执行 Agent<select value={draft.executorAgentId} onChange={(event) => setDraft({ ...draft, executorAgentId: event.target.value })}><option value="">自动调度</option>{compatibleExecutors.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId} · {executorStatus(agent)}</option>)}</select></label>
@@ -1262,10 +1268,13 @@ function App() {
                 const nextReviewerId = event.target.value
                 const nextAgent = compatibleReviewers.find((agent) => agent.agentId === nextReviewerId)
                 const nextModel = !nextReviewerId || nextAgent?.models?.some((model) => model.id === draft.reviewerModelPreference) ? draft.reviewerModelPreference : ''
+                const target = nextAgent?.models?.find((model) => model.id === nextModel)
+                const effortValid = !draft.reviewerReasoningEffort || !target?.reasoningEfforts?.length || target.reasoningEfforts.includes(draft.reviewerReasoningEffort)
                 setDraft({
                   ...draft,
                   reviewerAgentId: nextReviewerId,
                   reviewerModelPreference: nextModel,
+                  reviewerReasoningEffort: effortValid ? draft.reviewerReasoningEffort : '',
                 })
               }}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => {

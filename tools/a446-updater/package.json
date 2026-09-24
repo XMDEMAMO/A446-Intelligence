@@ -1,0 +1,14 @@
+{
+  "name": "a446-updater",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone GitHub Release + LAN updater plugin for A446 Intelligence multi-device packages (Windows).",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test test/util.test.mjs test/release.test.mjs test/layout.test.mjs test/updater-core.test.mjs test/redaction.test.mjs"
+  },
+  "dependencies": {}
+}

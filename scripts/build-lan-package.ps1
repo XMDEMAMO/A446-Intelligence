@@ -55,6 +55,7 @@ try {
     'apps\agent-hub\protocol',
     'apps\agent-hub\docs',
     'apps\agent-hub\test',
+    'tools\a446-updater',
     'apps\web\package.json',
     'apps\web\package-lock.json',
     'apps\web\index.html',
@@ -91,6 +92,7 @@ try {
   $manifest = [ordered]@{
     schemaVersion = 1
     package = $PackageName
+    version = $Version
     builtAt = (Get-Date).ToUniversalTime().ToString('o')
     sourceCommit = $sourceCommit
     sourceBranch = $sourceBranch

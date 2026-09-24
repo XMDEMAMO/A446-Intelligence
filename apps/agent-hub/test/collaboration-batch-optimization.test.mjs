@@ -496,7 +496,7 @@ test("P0/P1: createWorkflow pre-validates intakeModelPreference and reasoningEff
   hub.agents.set("planner-1", agent("planner-1", "planner", {
     models: [
       { id: "model-planner-1", reasoningEfforts: ["low", "medium"], capabilities: ["reasoning"], quota: { state: "Healthy" } },
-      { id: "model-planner-2", capabilities: ["reasoning"], quota: { state: "Healthy" } },
+      { id: "model-planner-2", reasoningEfforts: ["high"], capabilities: ["reasoning"], quota: { state: "Healthy" } },
     ],
   }));
   hub.agents.set("executor-1", agent("executor-1", "executor"));
@@ -573,7 +573,31 @@ test("P0/P1: createWorkflow pre-validates intakeModelPreference and reasoningEff
     }
   );
 
-  // 5. Valid workflow succeeds
+  // 5. Auto-selection with reasoningEffort: models[0] only has low/medium, but models[1] has high -> SUCCEEDS without throwing
+  const autoWorkflow = await hub.createWorkflow({
+    objective: "Auto-selection with reasoning test",
+    plannerAgentId: "planner-1",
+    plannerReasoningEffort: "high", // models[0] unsupported, models[1] supported
+  });
+  assert.ok(autoWorkflow.taskId);
+
+  // 6. Auto-selection with reasoningEffort unsupported by ANY candidate model -> FAILS with INCOMPATIBLE_REASONING_EFFORT
+  await assert.rejects(
+    async () => {
+      await hub.createWorkflow({
+        objective: "Auto-selection unsupported reasoning test",
+        plannerAgentId: "planner-1",
+        plannerReasoningEffort: "xhigh", // neither model supports xhigh
+      });
+    },
+    (err) => {
+      assert.equal(err.statusCode, 400);
+      assert.equal(err.code, "INCOMPATIBLE_REASONING_EFFORT");
+      return true;
+    }
+  );
+
+  // 7. Valid workflow with explicit model preferences succeeds
   const okWorkflow = await hub.createWorkflow({
     objective: "Test objective",
     plannerAgentId: "planner-1",

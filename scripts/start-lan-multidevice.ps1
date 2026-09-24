@@ -214,7 +214,7 @@ function Invoke-DevicePreparation {
   try {
     $manifestPath = Join-Path $LanRoot "device-$Id.json"
     if (Test-Path -LiteralPath $manifestPath) { Remove-Item -LiteralPath $manifestPath -Force -ErrorAction SilentlyContinue }
-    & node 'scripts/prepare-lan-device.mjs' --mode $RunMode --hub-ip $Address --device-id $Id --access $Access
+    $preparationOutput = & node 'scripts/prepare-lan-device.mjs' --mode $RunMode --hub-ip $Address --device-id $Id --access $Access
     if ($LASTEXITCODE -ne 0) { throw 'Device discovery and configuration generation failed.' }
     if (Test-Path -LiteralPath $manifestPath) {
       $text = [System.IO.File]::ReadAllText($manifestPath, [System.Text.Encoding]::UTF8)
@@ -258,10 +258,14 @@ function Show-ProviderDiagnostics {
 
 function Test-WorkerConfigs {
   param([object]$Manifest)
-  if (-not @($Manifest.workers).Count) {
+  $workers = @($Manifest.workers | Where-Object { $null -ne $_ })
+  if ($workers.Count -eq 0) {
     throw 'No ready provider was detected. Sign in to Codex or Antigravity on this device, then retry.'
   }
-  foreach ($worker in @($Manifest.workers)) {
+  foreach ($worker in $workers) {
+    if ([string]::IsNullOrWhiteSpace([string]$worker.agentId) -or [string]::IsNullOrWhiteSpace([string]$worker.configFile)) {
+      throw 'Device preparation returned an incomplete Worker entry. Run environment preflight and inspect provider diagnostics.'
+    }
     Write-Host "Checking $($worker.provider) as $($worker.agentId) ..."
     Push-Location $HubRoot
     try {

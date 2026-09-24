@@ -158,6 +158,7 @@ Antigravity 额度只在 CLI 版本确认不低于 1.1.12 时调用官方只读 
 - 额度快照与任务 Token 是两套数据：Token 可累计，订阅额度只能显示客户端官方接口实际返回的窗口，不能用 Token 反推。
 - 黑盒 CLI 正在执行的一轮模型调用无法做到 Token 级断点恢复；只能在任务阶段边界恢复。
 - QQ 机器人、跨公网访问、自动故障转移和多 Hub 高可用不在本安装包内。
+- 自动更新外挂只面向 Windows 设备、只从本包对应的 GitHub Releases 拉取；Hub 重启期间非终态更新任务记录会丢失，需要等 Worker 重连补报。
 
 ## 10. 常见处理
 
@@ -170,3 +171,22 @@ Antigravity 额度只在 CLI 版本确认不低于 1.1.12 时调用官方只读 
 额度显示 Unknown：先运行菜单中的“仅检查”。Codex 需保持官方客户端登录；Antigravity 需升级到 1.1.12 以上并保持 CLI 登录。探测失败时系统会保留最后一次可信值并标记为陈旧，不会伪造百分比。
 
 Codex 显示未登录但桌面应用已登录：同一台电脑可能同时存在旧的 `codex.cmd` 与桌面应用内置的 `codex.exe`。启动器会逐个检查可直接执行的 `codex.exe`，选择实际已登录的绝对路径，并在失败时列出每个候选入口的结果。确需手工指定时，在启动前设置用户环境变量 `A446_CODEX_EXE` 为已登录的 `codex.exe` 完整路径；不要把 Worker 改为调用 `codex.cmd`。
+
+## 11. 更新外挂（GitHub Release 自动更新）
+
+从 v0.5.0-preview16 起，安装包内置独立更新外挂 `a446-updater`，以 GitHub Releases 为唯一远程版本源，与协作逻辑完全解耦。
+
+**首次接入（每台设备一次）**：
+
+```powershell
+powershell -ExecutionPolicy Bypass -File tools\a446-updater\install-updater.ps1
+node "%LOCALAPPDATA%\A446-Updater\a446-updater.mjs" adopt --live "本包解压目录" --role coordinator
+```
+
+adopt 会把现有目录一次性迁移为"版本目录 + 共享持久数据 + junction"布局；`live` 路径不变，配对令牌、设置、日志、工作区都保留在 `shared\` 下不参与覆盖。迁移可中断重跑，`unadopt` 可完整还原。
+
+**局域网一键更新（推荐）**：在协调端网页控制面提交 `POST /v1/commands`（`type=device.update.request`，附 `deviceId`、`jobId`、可选 `version`），Hub 把指令经现有 WebSocket 通道投递给目标设备；设备上的 Worker 以独立进程拉起 Updater 完成"停设备 → 切换 → 重启 → 健康检查"，进度实时回传，可用 `GET /v1/update-jobs` 查看。健康检查不通过会自动回滚到上一版本并回报 `rolled_back`。
+
+**手工更新**：在任意设备上直接执行 `node "%LOCALAPPDATA%\A446-Updater\a446-updater.mjs" update`；也可用 `stage` / `apply` 分步执行，切换前人工检查 staged 内容。
+
+持久数据边界：更新流程绝不触碰 `shared\var`（配对令牌、设置、hub 状态、日志、Provider 缓存、artifacts）与 `shared\workspaces`；只替换版本目录与 junction。详细协议、状态机、断电恢复与人工恢复步骤见 `docs/UPDATER_PROTOCOL.md` 与 `tools/a446-updater/README.md`。

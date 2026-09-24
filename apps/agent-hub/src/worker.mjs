@@ -15,6 +15,7 @@ import { initialExecutorStatus, probeConfiguredAccount, probeConfiguredModels, p
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
 import { addUsage, bindModelQuotas, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
 import { probeQuota } from "./quota-probe.mjs";
+import { WorkerUpdateBridge } from "./worker-update-bridge.mjs";
 
 export class AgentWorker {
   constructor(config) {
@@ -74,6 +75,7 @@ export class AgentWorker {
       agentId: this.agentId,
       workspace: config.workspace,
     });
+    this.updateBridge = new WorkerUpdateBridge(this);
   }
 
   async start() {
@@ -96,6 +98,11 @@ export class AgentWorker {
       : detected;
     await this.saveState();
     for (const task of Object.values(this.state.pendingTasks)) this.enqueue(task);
+    // The worker may have been restarted by an updater apply step; report any
+    // terminal update status that was written to state.json while offline.
+    void this.updateBridge.reportPendingFinalStatuses().catch((error) => {
+      console.error(`[${this.agentId}] update status recovery error: ${error.message}`);
+    });
     void this.connectLoop();
     return this;
   }
@@ -203,6 +210,11 @@ export class AgentWorker {
         modelSnapshot: saved.modelSnapshot ?? null,
         quotaSnapshot: saved.quotaSnapshot ?? null,
         resourceSnapshot: saved.resourceSnapshot ?? null,
+        // Device update bridge records must survive a worker restart: after an
+        // update the worker is stopped and restarted, and only this persisted
+        // map lets reportPendingFinalStatuses() rebuild and re-report the
+        // terminal state of jobs whose reporting was interrupted.
+        updateJobs: saved.updateJobs ?? {},
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -359,6 +371,22 @@ export class AgentWorker {
         await this.removeQueuedTask(message.taskId, attemptId);
         if (this.current?.taskId === message.taskId && (!attemptId || this.current.payload?.attemptId === attemptId)) this.currentAbort?.abort();
         this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
+        return;
+      }
+      if (message.type === "device.update.request") {
+        // The ack must mean "reliably accepted": admit() synchronously claims
+        // the single update slot before any await. A rejected request stays
+        // unacked (the hub redelivers once) while the bridge reports a
+        // terminal `failed` status, after which the redelivery is replayed
+        // and acked. The update then runs in a detached updater process that
+        // survives this worker being restarted.
+        if (this.updateBridge.admit(message)) {
+          this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
+        }
+        void this.updateBridge.handleRequest(message).catch((error) => {
+          console.error(`[${this.agentId}] update bridge error: ${error.message}`);
+        });
+        return;
       }
     } catch (error) {
       console.error(`[${this.agentId}] message error: ${error.message}`);

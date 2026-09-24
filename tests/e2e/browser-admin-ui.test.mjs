@@ -17,12 +17,12 @@ test("browser E2E: admin UI manages users, sessions, and one-time Worker credent
 
     assert.equal(fixture.state.requests.some((item) => item.pathname === "/v1/messages" && item.search.includes("view=summary")), true, "conversation loading uses the summary message endpoint");
     assert.equal(fixture.state.requests.filter((item) => item.pathname === "/v1/messages/fixture-message-1").length, 0, "summary load does not fetch full message detail");
-    const fullResult = adminPage.locator("details.attachment").filter({ hasText: "完整成果" });
-    await fullResult.locator("summary").click();
+    const fullResultToggle = adminPage.getByText("完整成果", { exact: true });
+    await fullResultToggle.click();
     await adminPage.getByText("fixture full result").waitFor();
     assert.equal(fixture.state.requests.filter((item) => item.pathname === "/v1/messages/fixture-message-1").length, 1, "opening the attachment loads exactly one message detail");
-    await fullResult.locator("summary").click();
-    await fullResult.locator("summary").click();
+    await fullResultToggle.click();
+    await fullResultToggle.click();
     await adminPage.waitForTimeout(100);
     assert.equal(fixture.state.requests.filter((item) => item.pathname === "/v1/messages/fixture-message-1").length, 1, "reopening an already loaded result does not refetch without bound");
 
