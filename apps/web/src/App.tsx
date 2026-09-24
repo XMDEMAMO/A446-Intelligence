@@ -1,6 +1,10 @@
 import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 import AdminPanel from './AdminPanel'
+import { ConversationTimeline } from './components/ConversationTimeline'
+import { IssuePanel } from './components/IssueCard'
+import { TaskHeader, type ViewMode } from './components/TaskHeader'
+import { WorkflowFlowchart } from './components/WorkflowFlowchart'
 import { createDemoSnapshot } from './demo-data'
 import {
   clearLocalSession,
@@ -13,13 +17,21 @@ import {
   HubApiError,
   login as loginToHub,
   logout as logoutFromHub,
+  pauseBranch,
+  pauseWorkflow,
+  requestPlanChange,
   resolveIntervention as resolveHubIntervention,
+  resumeBranch,
+  resumeWorkflow,
   sendConversationMessage,
   sendHubCommand,
+  setBranchReviewPolicy,
   setLanAccessToken,
+  setWorkflowReviewPolicy,
   uploadAttachment,
 } from './hub-api'
 import { failedConnectionMode, nextPollDelay, NORMAL_POLL_MS, permitsServerMutation } from './sync-policy.js'
+import { deriveIssues, formatAgentDisplayName } from './workflow-view-model'
 import type {
   Agent,
   AgentRole,
@@ -126,9 +138,23 @@ function App() {
   const [connectionMode, setConnectionMode] = useState<ConnectionMode>('loading')
   const [lastSuccessfulAt, setLastSuccessfulAt] = useState<string | null>(null)
   const [syncing, setSyncing] = useState(false)
-  const [selectedRootId, setSelectedRootId] = useState<string | null>(null)
+  const [selectedRootId, setSelectedRootId] = useState<string | null>(() => {
+    try {
+      const params = new URLSearchParams(window.location.search)
+      const token = params.get('lanToken') || params.get('token')
+      if (token && token.trim()) {
+        setLanAccessToken(token.trim())
+      }
+      return params.get('task') || params.get('root') || params.get('conversation') || null
+    } catch {
+      return null
+    }
+  })
+
   const [selectedInterventionId, setSelectedInterventionId] = useState<string | null>(null)
   const [mainView, setMainView] = useState<MainView>('conversation')
+  const [viewMode, setViewMode] = useState<ViewMode>('split')
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null)
   const [modalOpen, setModalOpen] = useState(false)
   const [draft, setDraft] = useState<WorkflowDraft>(() => emptyDraft())
   const [messageText, setMessageText] = useState('')
@@ -148,6 +174,18 @@ function App() {
   const [loadingMessageIds, setLoadingMessageIds] = useState<Set<string>>(() => new Set())
   const chatEndRef = useRef<HTMLDivElement | null>(null)
   const pollAbortRef = useRef<AbortController | null>(null)
+
+  const handleSelectTask = useCallback((task: HubTask) => {
+    setSelectedTaskId(task.taskId)
+    const el =
+      document.getElementById(`msg-task-${task.taskId}`) ||
+      document.querySelector(`[data-task-id="${task.taskId}"]`)
+    if (el) {
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+      el.classList.add('highlight-pulse')
+      setTimeout(() => el.classList.remove('highlight-pulse'), 2200)
+    }
+  }, [])
   const overviewRef = useRef<HubOverview | null>(null)
   const demoSnapshotRef = useRef<HubSnapshot | null>(null)
   const currentUserId = currentUser?.id ?? null
@@ -331,6 +369,7 @@ function App() {
       : [],
     [detail, selectedConversation],
   )
+  const workflowIssues = useMemo(() => deriveIssues(selectedTasks), [selectedTasks])
 
   const selectedIntervention = pendingInterventions.find((item) => interventionKey(item) === selectedInterventionId) ?? pendingInterventions[0] ?? null
   const participants = useMemo(
@@ -344,34 +383,33 @@ function App() {
   const compatibleReviewers = (overview?.agents ?? []).filter((agent) => acceptsRole(agent, 'reviewer'))
   const models = [...new Set(compatiblePlanners.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
 
-  const selectedPlannerAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
-  const plannerModels = selectedPlannerAgent && selectedPlannerAgent.models?.length
-    ? [...new Set(selectedPlannerAgent.models.filter((m) => m.enabled !== false && m.id).map((m) => (typeof m === 'string' ? m : m.id as string)))]
+  const selectedPlannerAgent = compatiblePlanners.find((agent) => agent.agentId === draft.plannerAgentId)
+  const plannerModels = selectedPlannerAgent?.models?.length
+    ? [...new Set(selectedPlannerAgent.models.filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
     : models
 
-  const selectedReviewerAgent = compatibleReviewers.find((a) => a.agentId === draft.reviewerAgentId)
-  const reviewerModels = selectedReviewerAgent && selectedReviewerAgent.models?.length
-    ? [...new Set(selectedReviewerAgent.models.filter((m) => m.enabled !== false && m.id).map((m) => (typeof m === 'string' ? m : m.id as string)))]
+  const selectedReviewerAgent = compatibleReviewers.find((agent) => agent.agentId === draft.reviewerAgentId)
+  const reviewerModels = selectedReviewerAgent?.models?.length
+    ? [...new Set(selectedReviewerAgent.models.filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
     : [...new Set(compatibleReviewers.flatMap((agent) => agent.models ?? []).filter((model) => model.enabled !== false && model.id).map((model) => model.id as string))]
 
   const defaultReasoningEfforts = ['low', 'medium', 'high', 'xhigh']
-
-  const plannerModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
-    .find((m) => m && (typeof m === 'string' ? m : m.id) === draft.modelPreference)
-  const plannerReasoningOptions = (plannerModelObj && typeof plannerModelObj === 'object' && plannerModelObj.reasoningEfforts && plannerModelObj.reasoningEfforts.length > 0)
+  const plannerModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((agent) => agent.models ?? []))
+    .find((model) => model.id === draft.modelPreference)
+  const plannerReasoningOptions = plannerModelObj?.reasoningEfforts?.length
     ? plannerModelObj.reasoningEfforts
     : defaultReasoningEfforts
 
-  const reviewerModelObj = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((a) => a.models ?? []))
-    .find((m) => m && (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)
-  const reviewerReasoningOptions = (reviewerModelObj && typeof reviewerModelObj === 'object' && reviewerModelObj.reasoningEfforts && reviewerModelObj.reasoningEfforts.length > 0)
+  const reviewerModelObj = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((agent) => agent.models ?? []))
+    .find((model) => model.id === draft.reviewerModelPreference)
+  const reviewerReasoningOptions = reviewerModelObj?.reasoningEfforts?.length
     ? reviewerModelObj.reasoningEfforts
     : ['low', 'medium', 'high']
 
   const intakeTargetModel = draft.intakeModelPreference || draft.modelPreference
-  const intakeModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
-    .find((m) => m && (typeof m === 'string' ? m : m.id) === intakeTargetModel)
-  const intakeReasoningOptions = (intakeModelObj && typeof intakeModelObj === 'object' && intakeModelObj.reasoningEfforts && intakeModelObj.reasoningEfforts.length > 0)
+  const intakeModelObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((agent) => agent.models ?? []))
+    .find((model) => model.id === intakeTargetModel)
+  const intakeReasoningOptions = intakeModelObj?.reasoningEfforts?.length
     ? intakeModelObj.reasoningEfforts
     : ['low', 'medium', 'high']
 
@@ -396,44 +434,29 @@ function App() {
       setNotice('所选执行 Agent 已离线、暂停或角色不匹配，请重新选择。')
       return
     }
-    if (draft.plannerAgentId && draft.modelPreference) {
-      const pAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
-      if (pAgent && !pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.modelPreference)) {
-        setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持模型 '${draft.modelPreference}'，请重新选择。`)
-        return
-      }
+    if (draft.plannerAgentId && draft.modelPreference && !selectedPlannerAgent?.models?.some((model) => model.id === draft.modelPreference)) {
+      setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持模型 '${draft.modelPreference}'，请重新选择。`)
+      return
     }
-    if (draft.plannerAgentId && draft.intakeModelPreference) {
-      const pAgent = compatiblePlanners.find((a) => a.agentId === draft.plannerAgentId)
-      if (pAgent && !pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.intakeModelPreference)) {
-        setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持结果接收模型 '${draft.intakeModelPreference}'，请重新选择。`)
-        return
-      }
+    if (draft.plannerAgentId && draft.intakeModelPreference && !selectedPlannerAgent?.models?.some((model) => model.id === draft.intakeModelPreference)) {
+      setNotice(`所选规划 Agent '${draft.plannerAgentId}' 不支持结果接收模型 '${draft.intakeModelPreference}'，请重新选择。`)
+      return
     }
-    if (draft.reviewerAgentId && draft.reviewerModelPreference) {
-      const rAgent = compatibleReviewers.find((a) => a.agentId === draft.reviewerAgentId)
-      if (rAgent && !rAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)) {
-        setNotice(`所选审核 Agent '${draft.reviewerAgentId}' 不支持模型 '${draft.reviewerModelPreference}'，请重新选择。`)
-        return
-      }
+    if (draft.reviewerAgentId && draft.reviewerModelPreference && !selectedReviewerAgent?.models?.some((model) => model.id === draft.reviewerModelPreference)) {
+      setNotice(`所选审核 Agent '${draft.reviewerAgentId}' 不支持模型 '${draft.reviewerModelPreference}'，请重新选择。`)
+      return
     }
-    if (draft.reasoningEffort && plannerModelObj && typeof plannerModelObj === 'object' && plannerModelObj.reasoningEfforts?.length) {
-      if (!plannerModelObj.reasoningEfforts.includes(draft.reasoningEffort)) {
-        setNotice(`规划模型 '${plannerModelObj.id}' 不支持推理强度 '${draft.reasoningEffort}'，请重新选择。`)
-        return
-      }
+    if (draft.reasoningEffort && plannerModelObj?.reasoningEfforts?.length && !plannerModelObj.reasoningEfforts.includes(draft.reasoningEffort)) {
+      setNotice(`规划模型 '${plannerModelObj.id}' 不支持推理强度 '${draft.reasoningEffort}'，请重新选择。`)
+      return
     }
-    if (draft.reviewerReasoningEffort && reviewerModelObj && typeof reviewerModelObj === 'object' && reviewerModelObj.reasoningEfforts?.length) {
-      if (!reviewerModelObj.reasoningEfforts.includes(draft.reviewerReasoningEffort)) {
-        setNotice(`审核模型 '${reviewerModelObj.id}' 不支持推理强度 '${draft.reviewerReasoningEffort}'，请重新选择。`)
-        return
-      }
+    if (draft.reviewerReasoningEffort && reviewerModelObj?.reasoningEfforts?.length && !reviewerModelObj.reasoningEfforts.includes(draft.reviewerReasoningEffort)) {
+      setNotice(`审核模型 '${reviewerModelObj.id}' 不支持推理强度 '${draft.reviewerReasoningEffort}'，请重新选择。`)
+      return
     }
-    if (draft.intakeReasoningEffort && intakeModelObj && typeof intakeModelObj === 'object' && intakeModelObj.reasoningEfforts?.length) {
-      if (!intakeModelObj.reasoningEfforts.includes(draft.intakeReasoningEffort)) {
-        setNotice(`结果接收模型 '${intakeModelObj.id}' 不支持推理强度 '${draft.intakeReasoningEffort}'，请重新选择。`)
-        return
-      }
+    if (draft.intakeReasoningEffort && intakeModelObj?.reasoningEfforts?.length && !intakeModelObj.reasoningEfforts.includes(draft.intakeReasoningEffort)) {
+      setNotice(`结果接收模型 '${intakeModelObj.id}' 不支持推理强度 '${draft.intakeReasoningEffort}'，请重新选择。`)
+      return
     }
     setSubmitting(true)
     try {
@@ -676,6 +699,118 @@ function App() {
     }
   }
 
+  async function handlePauseWorkflow() {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction('workflow:pause')
+    try {
+      await pauseWorkflow(rootTaskId, 'human_requested')
+      setNotice('工作流已暂停')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '工作流暂停失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handleResumeWorkflow() {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction('workflow:resume')
+    try {
+      await resumeWorkflow(rootTaskId)
+      setNotice('工作流已恢复')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '工作流恢复失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handlePauseBranch(workUnitId: string) {
+    if (!requireLive() || currentUser?.role !== 'admin' || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction(`branch:pause:${workUnitId}`)
+    try {
+      await pauseBranch(rootTaskId, workUnitId, 'human_requested')
+      setNotice('分支已暂停')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '分支暂停失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handleResumeBranch(workUnitId: string) {
+    if (!requireLive() || currentUser?.role !== 'admin' || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction(`branch:resume:${workUnitId}`)
+    try {
+      await resumeBranch(rootTaskId, workUnitId)
+      setNotice('分支已恢复')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '分支恢复失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handleToggleBranchReviewPolicy(workUnitId: string, required: boolean) {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction(`branch:policy:${workUnitId}`)
+    try {
+      await setBranchReviewPolicy(rootTaskId, workUnitId, required)
+      setNotice(required ? '已开启该分支人工验收门禁' : '已关闭该分支人工验收门禁')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '分支验收策略更新失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handleToggleWorkflowReviewPolicy(finalHumanReviewRequired: boolean) {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction('workflow:review_policy')
+    try {
+      await setWorkflowReviewPolicy(rootTaskId, finalHumanReviewRequired)
+      setNotice(finalHumanReviewRequired ? '已开启全流程最终人工验收' : '已关闭全流程最终人工验收')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '工作流验收策略更新失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
+  async function handleRequestPlanChange(instructions: string) {
+    if (!requireLive() || !selectedConversation) return
+    const rootTaskId = selectedConversation.rootTaskId
+    setWorkingAction('workflow:plan_change')
+    try {
+      await requestPlanChange(rootTaskId, instructions)
+      setNotice('计划调整申请已提交，Planner 正在重新规划')
+      requestRefresh()
+    } catch (error) {
+      if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
+      else setNotice(formatApiError(error, '计划调整申请失败'))
+    } finally {
+      setWorkingAction('')
+    }
+  }
+
   async function resumeStalledWorkflow(action: 'replan' | 'force_complete') {
     if (!requireLive() || !selectedConversation) return
     const rootTaskId = selectedConversation.rootTaskId
@@ -823,103 +958,198 @@ function App() {
             )}
             {selectedConversation ? (
               <>
-                <header className="conversation-header">
-                  <div>
-                    <span className={`status-pill ${selectedConversation.status}`}>{statusName[selectedConversation.status] ?? selectedConversation.status}</span>
-                    <h1>{selectedConversation.title}</h1>
-                    <p>一个任务对应一个群聊 · {selectedConversation.taskCount} 个内部步骤</p>
-                  </div>
-                  <div className="avatar-stack" aria-label="参与者">{participants.slice(0, 5).map((agent) => <AgentAvatar agent={agent} key={agent.agentId} />)}</div>
-                </header>
+                <TaskHeader
+                  conversation={selectedConversation}
+                  tasks={selectedTasks}
+                  interventions={pendingInterventions}
+                  agents={overview.agents}
+                  currentUser={currentUser}
+                  canWrite={canWrite}
+                  workingAction={workingAction}
+                  viewMode={viewMode}
+                  onViewModeChange={setViewMode}
+                  onFocusIntervention={() => {
+                    const el = document.querySelector('.intervention-box')
+                    el?.scrollIntoView({ behavior: 'smooth' })
+                  }}
+                  onPauseWorkflow={() => void handlePauseWorkflow()}
+                  onResumeWorkflow={() => void handleResumeWorkflow()}
+                  onRequestPlanChange={(instructions) => void handleRequestPlanChange(instructions)}
+                />
 
-                <div className="workflow-strip">
-                  {selectedTasks.map((task, index) => {
-                    const duration = task.startedAt && task.completedAt ? formatDuration(task.startedAt, task.completedAt) : null
-                    const tokens = task.usageTotals?.totalTokens ?? task.usage?.totalTokens
-                    return (
-                      <div className={`workflow-step ${task.status} ${task.schedulingError ? 'has-error' : ''}`} key={task.taskId} title={task.taskSpec?.title}>
-                        <span>{index + 1}</span>
-                        <div>
-                          <strong>{roleName[task.role ?? ''] ?? 'Agent'}</strong>
-                          <small>{statusName[task.status] ?? task.status}{duration ? ` · ${duration}` : ''}{tokens ? ` · ${formatTokens(tokens)}` : ''}</small>
-                          {(task.targetAgentId || task.requestedAgentId) && <em>{task.targetAgentId ? `实际：${task.targetAgentId}` : `等待：${task.requestedAgentId}`}</em>}
-                          {task.schedulingError && <mark title={task.schedulingErrorCode ?? undefined}>{task.schedulingError}</mark>}
+                <div className={`workspace-content ${viewMode}`}>
+                  {/* 左侧：工作流全景流程图与异常监控区 */}
+                  {(viewMode === 'split' || viewMode === 'flowchart') && (
+                    <div className="flowchart-pane">
+                      <WorkflowFlowchart
+                        tasks={selectedTasks}
+                        agents={overview.agents}
+                        currentUser={currentUser}
+                        canWrite={canWrite}
+                        workingAction={workingAction}
+                        activeTaskStatuses={activeTaskStatuses}
+                        onCancelTask={(task) => void cancelTask(task)}
+                        onPauseBranch={(workUnitId) => void handlePauseBranch(workUnitId)}
+                        onResumeBranch={(workUnitId) => void handleResumeBranch(workUnitId)}
+                        onToggleBranchReviewPolicy={(workUnitId, required) =>
+                          void handleToggleBranchReviewPolicy(workUnitId, required)
+                        }
+                        onToggleWorkflowReviewPolicy={(required) =>
+                          void handleToggleWorkflowReviewPolicy(required)
+                        }
+                        selectedTaskId={selectedTaskId}
+                        onSelectTask={handleSelectTask}
+                      />
+
+                      {workflowIssues.length > 0 && <IssuePanel issues={workflowIssues} />}
+
+                      {selectedConversation.status === 'stalled' && (
+                        <div className="stalled-banner">
+                          <div className="stalled-copy">
+                            <strong>⚠️ 任务停滞未决</strong>
+                            <p>
+                              当前所有任务已停止，但未收到 Planner 明确结案指令。您可以通知 Planner 重新规划，或由管理员直接强制结案。
+                            </p>
+                          </div>
+                          <div className="stalled-actions">
+                            <button
+                              type="button"
+                              disabled={!canWrite || Boolean(workingAction)}
+                              onClick={() => void resumeStalledWorkflow('replan')}
+                            >
+                              🔄 重新规划
+                            </button>
+                            {currentUser?.role === 'admin' && (
+                              <button
+                                type="button"
+                                className="danger"
+                                disabled={!canWrite || Boolean(workingAction)}
+                                onClick={() => void resumeStalledWorkflow('force_complete')}
+                              >
+                                ✓ 强制结案
+                              </button>
+                            )}
+                          </div>
                         </div>
-                        {currentUser?.role === 'admin' && activeTaskStatuses.has(task.status) && <button type="button" disabled={!canWrite || Boolean(workingAction)} onClick={() => void cancelTask(task)}>取消</button>}
-                      </div>
-                    )
-                  })}
-                  {detail?.rootTaskId !== selectedConversation.rootTaskId && <div className="workflow-loading">正在加载当前会话摘要…</div>}
-                </div>
-
-                {selectedConversation.status === 'stalled' && (
-                  <div className="stalled-banner">
-                    <div className="stalled-copy">
-                      <strong>⚠️ 任务停滞未决</strong>
-                      <p>当前所有任务已停止，但未收到 Planner 明确结案指令。您可以通知 Planner 重新规划，或由管理员直接强制结案。</p>
-                    </div>
-                    <div className="stalled-actions">
-                      <button
-                        type="button"
-                        disabled={!canWrite || Boolean(workingAction)}
-                        onClick={() => void resumeStalledWorkflow('replan')}
-                      >
-                        🔄 重新规划
-                      </button>
-                      {currentUser?.role === 'admin' && (
-                        <button
-                          type="button"
-                          className="danger"
-                          disabled={!canWrite || Boolean(workingAction)}
-                          onClick={() => void resumeStalledWorkflow('force_complete')}
-                        >
-                          ✓ 强制结案
-                        </button>
                       )}
                     </div>
-                  </div>
-                )}
+                  )}
 
-                <section className="message-stream" aria-label="任务群聊消息">
-                  <div className="chat-date">任务创建于 {formatDate(selectedConversation.createdAt)}</div>
-                  {selectedMessages.map((message) => (
-                    <MessageBubble
-                      key={message.messageId}
-                      message={message}
-                      task={selectedTasks.find((task) => task.taskId === message.taskId)}
-                      agents={overview.agents}
-                      loadingFullResult={loadingMessageIds.has(message.messageId)}
-                      onLoadFullResult={() => void loadFullMessage(message)}
-                    />
-                  ))}
-                  {detail?.rootTaskId === selectedConversation.rootTaskId && selectedMessages.length === 0 && <div className="empty-chat">Agent 的任务简报和成果附件会显示在这里。</div>}
-                  <div ref={chatEndRef} />
-                </section>
+                  {/* 右侧：对话记录与成果产物区 */}
+                  {(viewMode === 'split' || viewMode === 'chat') && (
+                    <div className="chat-pane">
+                      <ConversationTimeline
+                        conversation={selectedConversation}
+                        messages={selectedMessages}
+                        tasks={selectedTasks}
+                        agents={overview.agents}
+                        loadingMessageIds={loadingMessageIds}
+                        onLoadFullResult={(message) => void loadFullMessage(message)}
+                        onDownloadArtifact={downloadArtifact}
+                        chatEndRef={chatEndRef}
+                      />
 
-                {selectedIntervention && (
-                  <form className="intervention-box" onSubmit={submitHumanResponse}>
-                    <div>
-                      <strong>需要你的决定 <b>{pendingInterventions.length > 1 ? `${pendingInterventions.indexOf(selectedIntervention) + 1}/${pendingInterventions.length}` : ''}</b></strong>
-                      <p>{selectedIntervention.question}</p>
-                      <small>{selectedIntervention.requesterRole ? `${roleName[selectedIntervention.requesterRole] ?? selectedIntervention.requesterRole} · ${selectedIntervention.requesterStage ?? '等待恢复'}` : '持久人工介入'}</small>
-                    </div>
-                    <div className="intervention-inputs">
-                      {pendingInterventions.length > 1 && <select aria-label="待处理人工介入" value={interventionKey(selectedIntervention)} onChange={(event) => { setSelectedInterventionId(event.target.value); setHumanResponse('') }}>{pendingInterventions.map((item, index) => <option key={interventionKey(item)} value={interventionKey(item)}>{index + 1}. {item.question.slice(0, 48)}</option>)}</select>}
-                      <input value={humanResponse} onChange={(event) => setHumanResponse(event.target.value)} placeholder={selectedIntervention.allowedActions?.includes('respond') ? '输入决定或补充信息' : '可选：说明批准或拒绝原因'} />
-                    </div>
-                    <div className="intervention-actions">
-                      {currentUser?.role === 'admin' && selectedIntervention.allowedActions?.includes('approve') && <button type="button" disabled={!canWrite || submitting} onClick={() => void decideIntervention('approve')}>批准</button>}
-                      {currentUser?.role === 'admin' && selectedIntervention.allowedActions?.includes('reject') && <button className="reject" type="button" disabled={!canWrite || submitting} onClick={() => void decideIntervention('reject')}>拒绝</button>}
-                      {(selectedIntervention.allowedActions?.includes('respond') ?? true) && <button type="submit" disabled={!canWrite || submitting || !humanResponse.trim()}>提交回复</button>}
-                    </div>
-                  </form>
-                )}
+                      {selectedIntervention && (
+                        <form className="intervention-box" onSubmit={submitHumanResponse}>
+                          <div>
+                            <strong>
+                              需要你的决定{' '}
+                              <b>
+                                {pendingInterventions.length > 1
+                                  ? `${pendingInterventions.indexOf(selectedIntervention) + 1}/${pendingInterventions.length}`
+                                  : ''}
+                              </b>
+                            </strong>
+                            <p>{selectedIntervention.question}</p>
+                            <small>
+                              {selectedIntervention.requesterRole
+                                ? `${roleName[selectedIntervention.requesterRole] ?? selectedIntervention.requesterRole} · ${selectedIntervention.requesterStage ?? '等待恢复'}`
+                                : '持久人工介入'}
+                            </small>
+                          </div>
+                          <div className="intervention-inputs">
+                            {pendingInterventions.length > 1 && (
+                              <select
+                                aria-label="待处理人工介入"
+                                value={interventionKey(selectedIntervention)}
+                                onChange={(event) => {
+                                  setSelectedInterventionId(event.target.value)
+                                  setHumanResponse('')
+                                }}
+                              >
+                                {pendingInterventions.map((item, index) => (
+                                  <option key={interventionKey(item)} value={interventionKey(item)}>
+                                    {index + 1}. {item.question.slice(0, 48)}
+                                  </option>
+                                ))}
+                              </select>
+                            )}
+                            <input
+                              value={humanResponse}
+                              onChange={(event) => setHumanResponse(event.target.value)}
+                              placeholder={
+                                selectedIntervention.allowedActions?.includes('respond')
+                                  ? '输入决定或补充信息'
+                                  : '可选：说明批准或拒绝原因'
+                              }
+                            />
+                          </div>
+                          <div className="intervention-actions">
+                            {currentUser?.role === 'admin' &&
+                              selectedIntervention.allowedActions?.includes('approve') && (
+                                <button
+                                  type="button"
+                                  disabled={!canWrite || submitting}
+                                  onClick={() => void decideIntervention('approve')}
+                                >
+                                  批准
+                                </button>
+                              )}
+                            {currentUser?.role === 'admin' &&
+                              selectedIntervention.allowedActions?.includes('reject') && (
+                                <button
+                                  className="reject"
+                                  type="button"
+                                  disabled={!canWrite || submitting}
+                                  onClick={() => void decideIntervention('reject')}
+                                >
+                                  拒绝
+                                </button>
+                              )}
+                            {(selectedIntervention.allowedActions?.includes('respond') ?? true) && (
+                              <button
+                                type="submit"
+                                disabled={!canWrite || submitting || !humanResponse.trim()}
+                              >
+                                提交回复
+                              </button>
+                            )}
+                          </div>
+                        </form>
+                      )}
 
-                <form className="message-composer" onSubmit={submitMessage}>
-                  <input disabled={!canWrite} value={messageText} onChange={(event) => setMessageText(event.target.value)} placeholder={canWrite ? '发送旁注，可用 @agent-id 提醒相关 Agent' : '恢复实时连接后可发送旁注'} />
-                  <button type="submit" disabled={!canWrite || submitting || !messageText.trim()}>发送</button>
-                  <small>群聊用于观察与沟通；任务状态仍由正式流程控制。</small>
-                </form>
+                      <form className="message-composer" onSubmit={submitMessage}>
+                        <input
+                          disabled={!canWrite}
+                          value={messageText}
+                          onChange={(event) => setMessageText(event.target.value)}
+                          placeholder={
+                            canWrite
+                              ? '发送旁注，可用 @agent-id 提醒相关 Agent'
+                              : '恢复实时连接后可发送旁注'
+                          }
+                        />
+                        <button
+                          type="submit"
+                          disabled={!canWrite || submitting || !messageText.trim()}
+                        >
+                          发送
+                        </button>
+                        <small>群聊用于观察与沟通；任务状态仍由正式流程控制。</small>
+                      </form>
+                    </div>
+                  )}
+                </div>
               </>
             ) : (
               <div className="no-conversation"><div>◎</div><h1>创建第一个协作任务</h1><p>规划、执行和审核 Agent 的简报会进入同一个群聊。</p><button disabled={!canWrite} onClick={() => setModalOpen(true)} type="button">新建任务</button></div>
@@ -1017,37 +1247,32 @@ function App() {
             <div className="form-grid">
               <label>规划 Agent<select value={draft.plannerAgentId} onChange={(event) => {
                 const nextPlannerId = event.target.value
-                const pAgent = compatiblePlanners.find((a) => a.agentId === nextPlannerId)
-                const validModel = pAgent && draft.modelPreference && pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.modelPreference)
-                const validIntakeModel = pAgent && draft.intakeModelPreference && pAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.intakeModelPreference)
+                const nextAgent = compatiblePlanners.find((agent) => agent.agentId === nextPlannerId)
+                const nextModel = !nextPlannerId || nextAgent?.models?.some((model) => model.id === draft.modelPreference) ? draft.modelPreference : ''
+                const nextIntakeModel = !nextPlannerId || nextAgent?.models?.some((model) => model.id === draft.intakeModelPreference) ? draft.intakeModelPreference : ''
                 setDraft({
                   ...draft,
                   plannerAgentId: nextPlannerId,
-                  modelPreference: validModel || !nextPlannerId ? draft.modelPreference : '',
-                  intakeModelPreference: validIntakeModel || !nextPlannerId ? draft.intakeModelPreference : '',
+                  modelPreference: nextModel,
+                  intakeModelPreference: nextIntakeModel,
                 })
               }}><option value="">自动选择</option>{compatiblePlanners.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>执行 Agent<select value={draft.executorAgentId} onChange={(event) => setDraft({ ...draft, executorAgentId: event.target.value })}><option value="">自动调度</option>{compatibleExecutors.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId} · {executorStatus(agent)}</option>)}</select></label>
               <label>审核 Agent<select value={draft.reviewerAgentId} onChange={(event) => {
                 const nextReviewerId = event.target.value
-                const rAgent = compatibleReviewers.find((a) => a.agentId === nextReviewerId)
-                const validModel = rAgent && draft.reviewerModelPreference && rAgent.models?.some((m) => (typeof m === 'string' ? m : m.id) === draft.reviewerModelPreference)
+                const nextAgent = compatibleReviewers.find((agent) => agent.agentId === nextReviewerId)
+                const nextModel = !nextReviewerId || nextAgent?.models?.some((model) => model.id === draft.reviewerModelPreference) ? draft.reviewerModelPreference : ''
                 setDraft({
                   ...draft,
                   reviewerAgentId: nextReviewerId,
-                  reviewerModelPreference: validModel || !nextReviewerId ? draft.reviewerModelPreference : '',
+                  reviewerModelPreference: nextModel,
                 })
               }}><option value="">自动选择</option>{compatibleReviewers.map((agent) => <option key={agent.agentId} value={agent.agentId}>{agent.agentId}</option>)}</select></label>
               <label>首轮规划模型<select value={draft.modelPreference} onChange={(event) => {
                 const nextModel = event.target.value
-                const targetObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
-                  .find((m) => m && (typeof m === 'string' ? m : m.id) === nextModel)
-                const validEffort = !draft.reasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.reasoningEffort)
-                setDraft({
-                  ...draft,
-                  modelPreference: nextModel,
-                  reasoningEffort: validEffort ? draft.reasoningEffort : '',
-                })
+                const target = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((agent) => agent.models ?? [])).find((model) => model.id === nextModel)
+                const effortValid = !draft.reasoningEffort || !target?.reasoningEfforts?.length || target.reasoningEfforts.includes(draft.reasoningEffort)
+                setDraft({ ...draft, modelPreference: nextModel, reasoningEffort: effortValid ? draft.reasoningEffort : '' })
               }}><option value="">自动选择</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
               <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option>{plannerReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
               <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
@@ -1057,31 +1282,21 @@ function App() {
               <div className="form-grid" style={{ marginTop: '0.75rem' }}>
                 <label>审核阶段模型<select value={draft.reviewerModelPreference} onChange={(event) => {
                   const nextModel = event.target.value
-                  const targetObj = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((a) => a.models ?? []))
-                    .find((m) => m && (typeof m === 'string' ? m : m.id) === nextModel)
-                  const validEffort = !draft.reviewerReasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.reviewerReasoningEffort)
-                  setDraft({
-                    ...draft,
-                    reviewerModelPreference: nextModel,
-                    reviewerReasoningEffort: validEffort ? draft.reviewerReasoningEffort : '',
-                  })
+                  const target = (selectedReviewerAgent?.models ?? compatibleReviewers.flatMap((agent) => agent.models ?? [])).find((model) => model.id === nextModel)
+                  const effortValid = !draft.reviewerReasoningEffort || !target?.reasoningEfforts?.length || target.reasoningEfforts.includes(draft.reviewerReasoningEffort)
+                  setDraft({ ...draft, reviewerModelPreference: nextModel, reviewerReasoningEffort: effortValid ? draft.reviewerReasoningEffort : '' })
                 }}><option value="">自动分级（推荐轻量模型）</option>{reviewerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
                 <label>审核推理强度<select value={draft.reviewerReasoningEffort} onChange={(event) => setDraft({ ...draft, reviewerReasoningEffort: event.target.value })}><option value="">默认</option>{reviewerReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
                 <label>结果接收模型<select value={draft.intakeModelPreference} onChange={(event) => {
                   const nextModel = event.target.value
-                  const targetObj = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((a) => a.models ?? []))
-                    .find((m) => m && (typeof m === 'string' ? m : m.id) === (nextModel || draft.modelPreference))
-                  const validEffort = !draft.intakeReasoningEffort || !targetObj || typeof targetObj !== 'object' || !targetObj.reasoningEfforts?.length || targetObj.reasoningEfforts.includes(draft.intakeReasoningEffort)
-                  setDraft({
-                    ...draft,
-                    intakeModelPreference: nextModel,
-                    intakeReasoningEffort: validEffort ? draft.intakeReasoningEffort : '',
-                  })
+                  const target = (selectedPlannerAgent?.models ?? compatiblePlanners.flatMap((agent) => agent.models ?? [])).find((model) => model.id === (nextModel || draft.modelPreference))
+                  const effortValid = !draft.intakeReasoningEffort || !target?.reasoningEfforts?.length || target.reasoningEfforts.includes(draft.intakeReasoningEffort)
+                  setDraft({ ...draft, intakeModelPreference: nextModel, intakeReasoningEffort: effortValid ? draft.intakeReasoningEffort : '' })
                 }}><option value="">继承规划模型</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
                 <label>结果接收推理强度<select value={draft.intakeReasoningEffort} onChange={(event) => setDraft({ ...draft, intakeReasoningEffort: event.target.value })}><option value="">默认</option>{intakeReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
                 <label style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
                   <input type="checkbox" checked={draft.fastPath} onChange={(event) => setDraft({ ...draft, fastPath: event.target.checked })} />
-                  <span>[实验性] 启用 Hub 确定性结案 (Fast Path)：仅在当前批次子任务全部审核通过时直接由 Hub 结案，跳过额外 LLM 汇总问答</span>
+                  <span>[实验性] 启用 Hub 确定性结案（仅在当前批次子任务全部审核通过时跳过额外 LLM 汇总问答）</span>
                 </label>
               </div>
             </details>
@@ -1104,47 +1319,6 @@ function LoadingGate({ label, user }: { label: string; user?: WebUser | null }) 
   return <main className="loading-gate"><div className="brand-mark">A4</div><div className="loading-spinner" /><h1>{label}</h1><p>{user ? `${user.username} · ${user.role}` : '不会显示演示数据或过期业务内容'}</p></main>
 }
 
-function MessageBubble({ message, task, agents, loadingFullResult, onLoadFullResult }: { message: HubMessage; task?: HubTask; agents: Agent[]; loadingFullResult: boolean; onLoadFullResult: () => void }) {
-  const agent = agents.find((item) => item.agentId === message.senderId)
-  const isStatus = message.kind === 'status'
-  if (isStatus) return <div className="system-message"><span>{message.text}</span><time>{formatTime(message.createdAt)}</time></div>
-  return (
-    <article className={`message ${message.senderRole}`}>
-      {agent ? <AgentAvatar agent={agent} role={isAgentRole(message.senderRole) ? message.senderRole : undefined} /> : <div className={`avatar ${message.senderRole}`}>{message.senderRole === 'human' ? '你' : '系'}</div>}
-      <div className="message-body">
-        <header><strong>{agent?.agentId ?? message.senderId}</strong><span className={`role-tag ${message.senderRole}`}>{roleName[message.senderRole] ?? message.senderRole}</span><time>{formatTime(message.createdAt)}</time></header>
-        <p>{message.text}</p>
-        {message.mentions.length > 0 && <div className="mentions">{message.mentions.map((mention) => <span key={mention}>{mention.startsWith('@') ? mention : `@${mention}`}</span>)}</div>}
-        {message.attachments.map((attachment, index) => (
-          <details className="attachment" key={`${attachment.taskId ?? message.taskId}-${index}`} onToggle={(event) => event.currentTarget.open && attachment.type === 'full_result' && attachment.content === undefined && onLoadFullResult()}>
-            <summary><span>▧</span><div><strong>{attachment.label}</strong><small>{attachment.version ?? '成果附件'} · 点击按需加载</small></div><i>⌄</i></summary>
-            {loadingFullResult && attachment.type === 'full_result' && attachment.content === undefined && <div className="attachment-loading">正在加载完整成果…</div>}
-            {attachment.content !== undefined && <pre>{attachment.content}</pre>}
-            {(attachment.artifacts?.files ?? []).map((file) => <div className="artifact-file" key={file.path}>{file.status === 'ready' && file.downloadUrl ? <button type="button" onClick={() => void downloadArtifact(file.downloadUrl!, file.path).catch((error) => window.alert(error instanceof Error ? error.message : '成果下载失败'))}>{file.path}</button> : <span>{file.path}</span>}<small>{file.status} · {formatBytes(file.size)}</small></div>)}
-          </details>
-        ))}
-        {['task_brief', 'review_decision'].includes(message.kind) && (task?.model || task?.usage || task?.usageTotals) && (
-          <div className="message-metrics">
-            <span>{task.model ?? task.execution?.model ?? '默认模型'}</span>
-            {(task.usageTotals || task.usage) && (() => {
-              const u = task.usageTotals ?? task.usage!
-              const dur = task.startedAt && task.completedAt ? formatDuration(task.startedAt, task.completedAt) : null
-              return (
-                <>
-                  <span>输入 {formatTokens(u.inputTokens)}</span>
-                  <span>输出 {formatTokens(u.outputTokens)}</span>
-                  <b>共 {formatTokens(u.totalTokens)} tokens</b>
-                  {dur && <span>耗时 {dur}</span>}
-                </>
-              )
-            })()}
-          </div>
-        )}
-      </div>
-    </article>
-  )
-}
-
 function AgentAvatar({ agent, role: roleOverride }: { agent: Agent; role?: AgentRole }) {
   const role = roleOverride ?? agent.roles?.[0] ?? 'executor'
   return <div className={`avatar ${role}`} title={agent.agentId}>{role === 'planner' ? '规' : role === 'reviewer' ? '审' : '执'}<i className={agent.status === 'online' ? 'online' : 'offline'} /></div>
@@ -1156,19 +1330,47 @@ function Participant({ agent }: { agent: Agent }) {
   const memory = resource?.capabilities?.device?.memory?.totalBytes
   const resourceLabel = resource?.state === 'available' ? '资源可用' : resource?.state === 'stale' ? '资源陈旧' : resource?.state === 'unavailable' ? '部分不可用' : '资源未知'
   const modelResourceLabel = resource?.models?.state === 'available' ? '模型可用' : resource?.models?.state === 'stale' ? '模型陈旧' : resource?.models?.state === 'unavailable' ? '模型不可用' : '模型来源待确认'
-  const sanitizedError = resource?.errorSummary ? resource.errorSummary.split(/[\r\n]/)[0].slice(0, 120) : null
+  const sanitizedError = resource?.errorSummary?.split(/[\r\n]/)[0].slice(0, 120) ?? null
   const resourceTitle = resource ? `探测：${formatDate(resource.checkedAt)}${sanitizedError ? `；${sanitizedError}` : ''}` : '尚未收到统一资源快照'
+  const agentDisplay = formatAgentDisplayName(agent.agentId, agent.deviceId, agent.account, agent.adapter)
+  const isStaleQuota = Boolean(agent.quotaSnapshot?.stale)
+
   return (
     <div className="participant">
       <AgentAvatar agent={agent} />
-      <div><strong>{agent.agentId}</strong><small>{(agent.roles ?? []).map((role) => roleName[role]).join(' / ') || '通用 Agent'} · {agent.deviceId ?? agent.agentId}</small><em>{agent.models?.map((model) => model.label ?? model.id).filter(Boolean).join(' · ') || '默认模型'}</em><small className={`resource-summary ${resource?.state ?? 'unknown'}`} title={resourceTitle}>{resourceLabel} · {modelResourceLabel}{cpu ? ` · ${cpu} 线程` : ''}{memory ? ` · ${formatBytes(memory)}` : ''}</small></div>
-      <span className={agent.busy ? 'busy' : agent.paused ? 'paused' : ''}>{agent.status !== 'online' ? '离线' : agent.paused ? '暂停' : agent.busy ? '忙碌' : '空闲'}</span>
+      <div className="participant-info">
+        <div className="participant-names">
+          <strong className="participant-friendly-name">{agentDisplay.name}</strong>
+          {isStaleQuota && <span className="stale-warn-badge" title="额度快照已陈旧，不可作为可信实时数据">额度陈旧</span>}
+        </div>
+        <small className="participant-sub" title={`完整 ID: ${agent.agentId}`}>
+          {agent.agentId} · {agentDisplay.device} · {(agent.roles ?? []).map((role) => roleName[role]).join(' / ') || '通用 Agent'}
+        </small>
+        <em>{agent.models?.map((model) => model.label ?? model.id).filter(Boolean).join(' · ') || '默认模型'}</em>
+        <small className={`resource-summary ${resource?.state ?? 'unknown'}`} title={resourceTitle}>
+          {resourceLabel} · {modelResourceLabel}{cpu ? ` · ${cpu} 线程` : ''}{memory ? ` · ${formatBytes(memory)}` : ''}
+        </small>
+      </div>
+      <span className={agent.busy ? 'busy' : agent.paused ? 'paused' : ''}>
+        {agent.status !== 'online' ? '离线' : agent.paused ? '暂停' : agent.busy ? '忙碌' : '空闲'}
+      </span>
     </div>
   )
 }
 
 function AgentOperation({ agent, disabled, onToggle }: { agent: Agent; disabled: boolean; onToggle: () => void }) {
-  return <div className="agent-operation"><div><strong>{agent.agentId}</strong><small>{agent.status === 'online' ? agent.paused ? '在线 · 已暂停' : agent.busy ? '在线 · 忙碌' : '在线 · 空闲' : '离线'}</small></div><button type="button" disabled={disabled || agent.status !== 'online'} onClick={onToggle}>{agent.paused ? '恢复' : '暂停'}</button></div>
+  const agentDisplay = formatAgentDisplayName(agent.agentId, agent.deviceId, agent.account, agent.adapter)
+  return (
+    <div className="agent-operation">
+      <div>
+        <strong>{agentDisplay.name}</strong>
+        <small>{agent.agentId} · {agent.status === 'online' ? (agent.paused ? '在线 · 已暂停' : agent.busy ? '在线 · 忙碌' : '在线 · 空闲') : '离线'}</small>
+      </div>
+      <button type="button" disabled={disabled || agent.status !== 'online'} onClick={onToggle}>
+        {agent.paused ? '恢复' : '暂停'}
+      </button>
+    </div>
+  )
 }
 
 function isPartiallyLimited(quota: QuotaSnapshot | null | undefined) {
@@ -1186,20 +1388,48 @@ function isPartiallyLimited(quota: QuotaSnapshot | null | undefined) {
 function QuotaBadge({ quota }: { quota: QuotaSnapshot | null }) {
   const state = quota?.state ?? 'Unknown'
   const partiallyLimited = isPartiallyLimited(quota)
-  const style = quota?.stale ? 'stale' : partiallyLimited ? 'partial' : state.toLowerCase()
-  const label = quota?.stale ? '陈旧' : partiallyLimited ? '部分受限' : state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'
-  return <span className={`quota-badge ${style}`}>{label}</span>
+  const isStale = Boolean(quota?.stale)
+  const style = isStale ? 'stale' : partiallyLimited ? 'partial' : state.toLowerCase()
+  const label = isStale ? '快照陈旧' : partiallyLimited ? '部分受限' : state === 'Healthy' ? '充足' : state === 'Low' ? '偏低' : state === 'Exhausted' ? '耗尽' : '未知'
+  return (
+    <span className={`quota-badge ${style}`} title={isStale ? '注意：额度快照已陈旧，非实时数字' : undefined}>
+      {isStale ? '⚠️ ' : ''}{label}
+    </span>
+  )
 }
 
 function QuotaMeter({ quota }: { quota: QuotaSnapshot | null }) {
   const windows = (quota?.windows ?? []).map((window) => ({ window, remaining: quotaRemaining(window) })).filter((item): item is { window: QuotaWindow; remaining: number } => item.remaining != null)
-  if (!windows.length) return <div className={`quota-unknown ${quota?.stale ? 'stale' : ''}`}>{quota?.stale ? '最近可信额度已陈旧' : '客户端暂无可读取的额度快照'}<small>来源：{quota?.source ?? 'unavailable'}</small></div>
+  if (!windows.length) return <div className={`quota-unknown ${quota?.stale ? 'stale' : ''}`}>{quota?.stale ? '最近可信额度已陈旧（非实时）' : '客户端暂无可读取的额度快照'}<small>来源：{quota?.source ?? 'unavailable'}</small></div>
   const groups = new Map<string, typeof windows>()
   for (const item of windows) {
     const group = quotaGroupLabel(item.window)
     groups.set(group, [...(groups.get(group) ?? []), item])
   }
-  return <div className="quota-groups">{[...groups.entries()].map(([group, items]) => <section className="quota-group" key={group}><strong>{group}</strong>{items.map(({ window, remaining }) => <div className="quota-meter" key={window.id ?? `${window.name}-${window.windowType ?? ''}`}><div><span>{quotaDurationLabel(window)}</span><b>剩余 {Math.round(remaining)}%</b></div><progress aria-label={`${group} ${quotaDurationLabel(window)}剩余额度`} max="100" value={remaining} /><small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small></div>)}</section>)}</div>
+  return (
+    <div className="quota-groups">
+      {quota?.stale && (
+        <div className="stale-quota-notice">
+          <span>⚠️ 额度快照已陈旧，以下百分比仅供参考</span>
+        </div>
+      )}
+      {[...groups.entries()].map(([group, items]) => (
+        <section className="quota-group" key={group}>
+          <strong>{group}</strong>
+          {items.map(({ window, remaining }) => (
+            <div className="quota-meter" key={window.id ?? `${window.name}-${window.windowType ?? ''}`}>
+              <div>
+                <span>{quotaDurationLabel(window)}</span>
+                <b>剩余 {Math.round(remaining)}%</b>
+              </div>
+              <progress aria-label={`${group} ${quotaDurationLabel(window)}剩余额度`} max="100" value={remaining} />
+              <small>{window.resetsAt ? `${formatDate(window.resetsAt)} 重置` : `来源：${quota?.source ?? 'client'}`}</small>
+            </div>
+          ))}
+        </section>
+      ))}
+    </div>
+  )
 }
 
 function quotaRemaining(window: QuotaWindow) {
@@ -1243,21 +1473,6 @@ function executorStatus(agent: Agent) {
   }
   if (agent.busy) return '忙碌，创建后排队'
   return '在线可用'
-}
-
-function isAgentRole(value: string): value is AgentRole {
-  return value === 'planner' || value === 'executor' || value === 'reviewer'
-}
-
-function formatDuration(start: string, end?: string | null): string {
-  const s = Date.parse(start)
-  const e = Date.parse(end ?? new Date().toISOString())
-  if (!s || !e || e < s) return ''
-  const diffSec = Math.round((e - s) / 1000)
-  if (diffSec < 60) return `${diffSec}s`
-  const min = Math.floor(diffSec / 60)
-  const sec = diffSec % 60
-  return sec > 0 ? `${min}m${sec}s` : `${min}m`
 }
 
 function isPreferredQuotaSnapshot(candidate: QuotaSnapshot | null | undefined, current: QuotaSnapshot | null | undefined): boolean {

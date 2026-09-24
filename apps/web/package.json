@@ -7,7 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
-    "test": "node test/sync-policy.test.mjs",
+    "test": "node test/sync-policy.test.mjs && node test/lan-token.test.mjs && node test/workflow-view-model.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

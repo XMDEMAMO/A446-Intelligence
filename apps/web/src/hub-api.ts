@@ -15,9 +15,9 @@ import type {
   WebUserStatus,
   WorkerCredential,
 } from './types'
+import { selectLanAccessToken } from './lan-token'
 
 const API_BASE = (import.meta.env.VITE_HUB_API_BASE ?? '/api').replace(/\/$/, '')
-const LAN_MODE = import.meta.env.VITE_LAN_MODE === 'true'
 const DEFAULT_TIMEOUT_MS = 8_000
 let csrfToken = readCookie('a446_csrf') || window.sessionStorage.getItem('a446.csrf') || ''
 
@@ -60,7 +60,7 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   }, timeoutMs)
   const headers = new Headers(init.headers)
   if (init.body && !headers.has('content-type')) headers.set('content-type', 'application/json')
-  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  const lanToken = getLanAccessToken()
   if (lanToken && !headers.has('x-a446-lan-token')) headers.set('x-a446-lan-token', lanToken)
   const method = init.method ?? 'GET'
   if (!['GET', 'HEAD'].includes(method) && csrfToken && !headers.has('x-csrf-token')) headers.set('x-csrf-token', csrfToken)
@@ -134,6 +134,28 @@ export function clearLocalSession() {
   window.sessionStorage.removeItem('a446.csrf')
 }
 
+export function getLanAccessToken(): string {
+  try {
+    const fromSession = window.sessionStorage.getItem('a446.lan-token')
+    const selected = selectLanAccessToken(window.location?.search ?? '', fromSession)
+    if (selected.source === 'query') {
+      window.sessionStorage.setItem('a446.lan-token', selected.token)
+
+      // Keep the token out of copied URLs and browser history after pairing.
+      const params = new URLSearchParams(window.location.search)
+      params.delete('lanToken')
+      params.delete('token')
+      const query = params.toString()
+      const cleanUrl = `${window.location.pathname}${query ? `?${query}` : ''}${window.location.hash}`
+      window.history.replaceState(window.history.state, '', cleanUrl)
+    }
+    return selected.token
+  } catch {
+    // Ignore storage or window location errors
+  }
+  return ''
+}
+
 export function setLanAccessToken(token: string) {
   const normalized = token.trim()
   if (normalized) window.sessionStorage.setItem('a446.lan-token', normalized)
@@ -142,7 +164,7 @@ export function setLanAccessToken(token: string) {
 
 export async function downloadArtifact(downloadUrl: string, filename: string) {
   const headers = new Headers()
-  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  const lanToken = getLanAccessToken()
   if (lanToken) headers.set('x-a446-lan-token', lanToken)
   const response = await fetch(`${API_BASE}${downloadUrl}`, { credentials: 'include', headers })
   if (!response.ok) {
@@ -171,7 +193,7 @@ export async function uploadAttachment(file: File, signal?: AbortSignal): Promis
   headers.set('content-type', file.type || 'application/octet-stream')
   headers.set('x-file-name', encodeURIComponent(file.name))
   if (csrfToken) headers.set('x-csrf-token', csrfToken)
-  const lanToken = LAN_MODE ? window.sessionStorage.getItem('a446.lan-token') ?? '' : ''
+  const lanToken = getLanAccessToken()
   if (lanToken) headers.set('x-a446-lan-token', lanToken)
 
   const response = await fetch(`${API_BASE}/v1/attachments?filename=${encodeURIComponent(file.name)}`, {
@@ -265,6 +287,34 @@ export function sendHubCommand(command: Record<string, unknown>, signal?: AbortS
     body: JSON.stringify(command),
     signal,
   })
+}
+
+export function pauseWorkflow(rootTaskId: string, reason = 'human_requested', signal?: AbortSignal) {
+  return sendHubCommand({ type: 'workflow.pause', rootTaskId, reason }, signal)
+}
+
+export function resumeWorkflow(rootTaskId: string, signal?: AbortSignal) {
+  return sendHubCommand({ type: 'workflow.resume', rootTaskId }, signal)
+}
+
+export function pauseBranch(rootTaskId: string, workUnitId: string, reason = 'human_requested', signal?: AbortSignal) {
+  return sendHubCommand({ type: 'branch.pause', rootTaskId, workUnitId, reason }, signal)
+}
+
+export function resumeBranch(rootTaskId: string, workUnitId: string, signal?: AbortSignal) {
+  return sendHubCommand({ type: 'branch.resume', rootTaskId, workUnitId }, signal)
+}
+
+export function setBranchReviewPolicy(rootTaskId: string, workUnitId: string, required: boolean, signal?: AbortSignal) {
+  return sendHubCommand({ type: 'branch.review_policy', rootTaskId, workUnitId, required }, signal)
+}
+
+export function setWorkflowReviewPolicy(rootTaskId: string, finalHumanReviewRequired: boolean, signal?: AbortSignal) {
+  return sendHubCommand({ type: 'workflow.review_policy', rootTaskId, finalHumanReviewRequired }, signal)
+}
+
+export function requestPlanChange(rootTaskId: string, instructions: string, signal?: AbortSignal) {
+  return sendHubCommand({ type: 'workflow.request_plan_change', rootTaskId, instructions }, signal)
 }
 
 export function resolveIntervention(interventionId: string, decision: 'approve' | 'reject' | 'respond', response = '', signal?: AbortSignal) {

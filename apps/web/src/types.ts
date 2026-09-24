@@ -218,6 +218,8 @@ export interface RoleSubmission {
   needsHuman?: boolean
   humanQuestion?: string | null
   upstreamIssue?: Record<string, unknown> | null
+  decision?: 'complete' | 'replan' | 'continue' | string
+  approvedResults?: unknown[] | number
 }
 
 export interface HumanIntervention {
@@ -252,9 +254,40 @@ export interface HubTask {
   sourceAgentId?: string
   input: string
   role?: AgentRole | null
-  stage?: string
   route?: string[]
   metadata?: Record<string, unknown>
+  sessionScopeId?: string | null
+  taskSpec?: TaskSpec | null
+  contextBundle?: Record<string, unknown>
+  execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
+  model?: string | null
+  reasoningEffort?: string | null
+  usage?: TokenUsage | null
+  usageTotals?: TokenUsage | null
+  submission?: RoleSubmission
+  logicalBranchId?: string | null
+  replacesWorkUnitId?: string | null
+  supersedesTaskId?: string | null
+  workUnitId?: string | null
+  plannerBatchId?: string | null
+  revision?: number | null
+  superseded?: boolean | null
+  supersededBy?: string | null
+  reviewTaskId?: string | null
+  reviewBrief?: string | null
+  reviewStatus?: string
+  reviewCycle?: number
+  requiresApproval?: boolean
+  stage?: string
+  finalReviewStatus?: string | null
+  finalReviewBrief?: string | null
+  finalReviewTaskId?: string | null
+  finalHumanReviewStatus?: string | null
+  humanReviewRequired?: boolean
+  humanReviewStatus?: string | null
+  dispatchHold?: string | null
+  pausedFromStatus?: string | null
+  planRevision?: number
   workflow?: {
     enabled?: boolean
     plannerAgentId?: string | null
@@ -268,19 +301,26 @@ export interface HubTask {
     reviewerReasoningEffort?: string | null
     intakeModelPreference?: string | null
     intakeReasoningEffort?: string | null
-    stageModels?: Record<string, { modelPreference?: string | null; reasoningEffort?: string | null }> | null
-  } | null
-  sessionScopeId?: string | null
-  taskSpec?: TaskSpec | null
-  contextBundle?: Record<string, unknown>
-  execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
-  model?: string | null
-  usage?: TokenUsage | null
-  usageTotals?: TokenUsage | null
-  submission?: RoleSubmission
-  reviewStatus?: string
-  reviewCycle?: number
-  requiresApproval?: boolean
+    stageModels?: Record<string, StageModelPolicy> | null
+    paused?: boolean
+    pausedAt?: string | null
+    pausedBy?: string | null
+    pauseReason?: string | null
+    planningHold?: boolean
+    planChangeRequestedAt?: string | null
+    planChangeRequestedBy?: string | null
+    planChangeInstructions?: string | null
+    finalHumanReviewRequired?: boolean
+    finalHumanReviewRecommended?: boolean
+    planRevision?: number
+    branchControls?: Record<string, {
+      paused?: boolean
+      pausedAt?: string | null
+      pausedBy?: string | null
+      reason?: string | null
+      humanReviewRequired?: boolean
+    }>
+  }
   status: string
   schedulingError?: string | null
   schedulingErrorCode?:
@@ -307,6 +347,102 @@ export interface HubTask {
   error?: { name?: string; message?: string; code?: string; reasons?: string[] }
   artifacts?: ArtifactManifest
   humanIntervention?: HumanIntervention | null
+}
+
+export interface AgentDisplayInfo {
+  name: string
+  rawId: string
+  device: string
+  engine: string
+  roleLabel: string
+}
+
+export interface ModelDisplayInfo {
+  modelLabel: string
+  effortLabel: string | null
+  isHighCost: boolean
+  fullLabel: string
+}
+
+export interface WorkflowNodeStep {
+  task: HubTask
+  isSuperseded: boolean
+  displayAgent: AgentDisplayInfo
+  displayModel: ModelDisplayInfo
+  reviewerTask?: HubTask
+  reviewerDisplayAgent?: AgentDisplayInfo
+  reviewerDisplayModel?: ModelDisplayInfo
+}
+
+export interface WorkflowBranch {
+  workUnitId: string
+  title: string
+  steps: WorkflowNodeStep[]
+  latestStep: WorkflowNodeStep
+  isApproved: boolean
+  isRejected: boolean
+  isPending: boolean
+  isSuperseded: boolean
+  hasRevisions: boolean
+  isBranchPaused: boolean
+  humanReviewRequired: boolean
+  humanReviewStatus: 'not_required' | 'pending' | 'approved' | 'rejected' | null
+}
+
+export interface WorkflowGraph {
+  planningTask?: HubTask
+  planningDisplayAgent?: AgentDisplayInfo
+  planningDisplayModel?: ModelDisplayInfo
+  branches: WorkflowBranch[]
+  intakeTask?: HubTask
+  intakeDisplayAgent?: AgentDisplayInfo
+  intakeDisplayModel?: ModelDisplayInfo
+  finalReviewTask?: HubTask
+  finalReviewDisplayAgent?: AgentDisplayInfo
+  finalReviewDisplayModel?: ModelDisplayInfo
+  finalReviewStatus?: string | null
+  finalHumanReviewStatus?: string | null
+  finalHumanReviewRequired?: boolean
+  isWorkflowPaused: boolean
+  planningHold: boolean
+  planRevision: number
+  approvedResultCount: number
+  totalBranches: number
+  completedBranches: number
+  hasRejections: boolean
+  hasUnresolvedIssues: boolean
+  isConverged: boolean
+  isFullyCompleted: boolean
+  allTasks: HubTask[]
+}
+
+export interface WorkflowIssue {
+  issueId: string
+  taskId: string
+  taskTitle: string
+  role: string
+  agentName: string
+  affectedBranch: string
+  kind: 'rejection' | 'error' | 'scheduling'
+  whatHappened: string
+  actionTaken: string
+  isResolved: boolean
+  finalOutcome: string
+  details?: string[]
+}
+
+export interface WorkflowSummary {
+  title: string
+  statusText: string
+  statusTone: 'active' | 'success' | 'warning' | 'error' | 'neutral'
+  stageText: string
+  parallelCount: number
+  completedStepCount: number
+  totalStepCount: number
+  startTime?: string
+  durationOrCompletionTime?: string
+  needsHuman: boolean
+  rawStatus: string
 }
 
 export interface MessageAttachment {
