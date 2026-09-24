@@ -20,8 +20,7 @@
 
 ## 已通过的验证
 
-- `tools/a446-updater`：37/37 测试通过，使用本地假 Release 与进程控制器，不调用真实 GitHub Release。
-- `scripts/check-all.ps1`：Hub 测试、Server Hub 包检查、Web lint/生产构建、组合冒烟、浏览器契约和三个包的生产依赖审计通过。未配置专用 PostgreSQL 测试库；此缺口属于 Server Ready 验收，LAN 候选使用本地 JSON Store。
+- `scripts/check-all.ps1` 已纳入更新外挂测试并全绿：Hub 118/118、更新外挂 37/37、Server Hub 包检查 3/3、浏览器契约 3/3；Web lint/生产构建、组合冒烟和三个包的生产依赖审计也通过。更新外挂使用本地假 Release 与进程控制器，不调用真实 GitHub Release。未配置专用 PostgreSQL 测试库；此缺口属于 Server Ready 验收，LAN 候选使用本地 JSON Store。
 - 候选 ZIP：路径穿越和绝对路径检查通过；118 个文件与清单逐一匹配；伴随 `.sha256` 匹配；模拟 Windows 默认解压后没有双层目录。
 - 未运行真实 Codex/Antigravity 调用、真实双机升级、断网恢复或自动回滚验收。
 

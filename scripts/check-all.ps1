@@ -40,6 +40,10 @@ Invoke-ProjectStep -Name 'Running Hub tests...' -Reproduce 'cd apps\agent-hub; n
   Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'apps\agent-hub') -Arguments @('test')
 }
 
+Invoke-ProjectStep -Name 'Running LAN updater tests...' -Reproduce 'cd tools\a446-updater; npm.cmd test' -Action {
+  Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'tools\a446-updater') -Arguments @('test')
+}
+
 Invoke-ProjectStep -Name 'Checking PostgreSQL Server Hub package...' -Reproduce 'cd apps\server-hub; npm.cmd run check' -Action {
   Invoke-NpmStep -WorkingDirectory (Join-Path $ProjectRoot 'apps\server-hub') -Arguments @('run', 'check')
 }
