@@ -239,6 +239,12 @@ node scripts/smoke-antigravity.mjs --model gemini-3.8-flash-low
 
 `stdio-json` 适配器仍保留，供其他能够实现通用请求/响应 JSONL 的长期进程使用。
 
+## 预发布双击启动器
+
+Windows 设备可从仓库根目录双击 `启动预发布Worker.cmd`。启动器自动检测已登录的 Codex 和 Antigravity CLI，为可用的验收角色生成互相隔离的配置，并通过隐藏输入读取每个 Worker Token。没有对应 Token 时可直接按 Enter 跳过该角色。Token 不会写入磁盘、日志或子进程命令行。
+
+启动器的 PowerShell 入口是 `scripts/start-staging-workers.ps1`，独立 Worker 窗口由 `scripts/run-staging-worker.ps1` 承载。默认连接 `staging.a446intelligence.party`；完整身份、可选环境变量和手工备用流程见 `docs/V0.5_MANUAL_RELEASE_ACCEPTANCE_GUIDE.md` 第 8.3 节。
+
 ## 文件说明
 
 - `src/hub.mjs`：本地 Hub 与 HTTP 控制面
