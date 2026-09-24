@@ -71,7 +71,13 @@ function Invoke-ReadinessCommand {
 }
 
 function Test-CodexReadiness {
-  $command = Get-Command 'codex' -ErrorAction SilentlyContinue
+  # Prefer the native Windows shims over codex.ps1. The npm PowerShell shim can
+  # print a successful login status without setting $LASTEXITCODE reliably.
+  $command = $null
+  foreach ($name in @('codex.cmd', 'codex.exe', 'codex')) {
+    $command = Get-Command $name -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { break }
+  }
   if (-not $command) {
     return [pscustomobject]@{ Ready = $false; Detail = '未找到 codex 命令'; ModelsOutput = '' }
   }
@@ -93,12 +99,14 @@ function Test-CodexReadiness {
 }
 
 function Find-AgyCommand {
-  $command = Get-Command 'agy' -ErrorAction SilentlyContinue
-  if ($command) { return $command.Source }
   if ($env:LOCALAPPDATA) {
     $candidate = Join-Path $env:LOCALAPPDATA 'agy\bin\agy.exe'
     if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
   }
+  $command = Get-Command 'agy.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($command) { return $command.Source }
+  $command = Get-Command 'agy' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($command) { return $command.Source }
   return $null
 }
 
