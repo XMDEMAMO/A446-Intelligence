@@ -56,8 +56,8 @@ function Invoke-ReadinessCommand {
   )
   try {
     if ($PassThrough) {
-      & $Command @Arguments
-      $exitCode = $LASTEXITCODE
+      $process = Start-Process -FilePath $Command -ArgumentList $Arguments -NoNewWindow -Wait -PassThru
+      $exitCode = $process.ExitCode
       return [pscustomobject]@{
         Ok = ($exitCode -eq 0)
         Output = ''
