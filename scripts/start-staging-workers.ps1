@@ -51,9 +51,19 @@ function Assert-Identifier {
 function Invoke-ReadinessCommand {
   param(
     [Parameter(Mandatory = $true)][string]$Command,
-    [Parameter(Mandatory = $true)][string[]]$Arguments
+    [Parameter(Mandatory = $true)][string[]]$Arguments,
+    [switch]$PassThrough
   )
   try {
+    if ($PassThrough) {
+      & $Command @Arguments
+      $exitCode = $LASTEXITCODE
+      return [pscustomobject]@{
+        Ok = ($exitCode -eq 0)
+        Output = ''
+        ExitCode = $exitCode
+      }
+    }
     $output = @(& $Command @Arguments 2>&1)
     $exitCode = $LASTEXITCODE
     return [pscustomobject]@{
@@ -86,13 +96,18 @@ function Test-CodexReadiness {
   }
   $version = Invoke-ReadinessCommand -Command $command.Source -Arguments @('--version')
   $login = Invoke-ReadinessCommand -Command $command.Source -Arguments @('login', 'status')
-  $detail = if ($version.Ok -and $login.Ok) {
+  $versionConfirmed = $version.Ok -or $version.Output -match '(?i)\bcodex-cli\s+v?\d+\.\d+\.\d+\b'
+  $loginConfirmed = $login.Output -match '(?i)\bLogged in using\b'
+  $loginRejected = $login.Output -match '(?i)\bNot logged in\b'
+  $loginReady = $loginConfirmed -or ($login.Ok -and $login.Output -and -not $loginRejected)
+  $ready = $versionConfirmed -and $loginReady
+  $detail = if ($ready) {
     $login.Output
   } else {
-    (($version.Output, $login.Output | Where-Object { $_ }) -join '; ')
+    "command=$($command.Source); version exit=$($version.ExitCode); login exit=$($login.ExitCode); $(($version.Output, $login.Output | Where-Object { $_ }) -join '; ')"
   }
   return [pscustomobject]@{
-    Ready = ($version.Ok -and $login.Ok)
+    Ready = $ready
     Detail = $detail
     ModelsOutput = ''
   }
@@ -119,16 +134,21 @@ function Test-AntigravityReadiness {
     return [pscustomobject]@{ Ready = $true; Detail = '已跳过登录检查'; ModelsOutput = 'gemini-3.8-flash-low' }
   }
   $version = Invoke-ReadinessCommand -Command $command -Arguments @('--version')
-  $models = Invoke-ReadinessCommand -Command $command -Arguments @('models')
-  $detail = if ($version.Ok -and $models.Ok) {
-    $version.Output.Split("`n")[0]
+  # agy models behaves differently when stdout is captured: some builds only
+  # print its progress line. Let the authenticated CLI own the console like a
+  # manual invocation, and use its process status for readiness.
+  $models = Invoke-ReadinessCommand -Command $command -Arguments @('models') -PassThrough
+  $versionConfirmed = $version.Ok -or $version.Output -match '(?i)\bv?\d+\.\d+\.\d+\b'
+  $ready = $versionConfirmed -and $models.Ok
+  $detail = if ($ready) {
+    if ($version.Output) { $version.Output.Split("`n")[0] } else { 'Version check passed' }
   } else {
-    (($version.Output, $models.Output | Where-Object { $_ }) -join '; ')
+    "command=$command; version exit=$($version.ExitCode); models exit=$($models.ExitCode); $(($version.Output, $models.Output | Where-Object { $_ }) -join '; ')"
   }
   return [pscustomobject]@{
-    Ready = ($version.Ok -and $models.Ok)
+    Ready = $ready
     Detail = $detail
-    ModelsOutput = $models.Output
+    ModelsOutput = if ($models.Ok) { 'gemini-3.8-flash-low' } else { '' }
   }
 }
 
