@@ -61,7 +61,11 @@ export function MessageBubble({
     ? resolveTaskModelInfo(task)
     : formatModelDisplayName(null)
 
-  const roleLabel = roleChineseName[message.senderRole] ?? message.senderRole
+  const roleLabel = message.kind === 'plan_discussion'
+    ? '方案质疑'
+    : message.kind === 'plan_refinement'
+      ? '方案回应'
+      : roleChineseName[message.senderRole] ?? message.senderRole
 
   return (
     <article
@@ -118,7 +122,7 @@ export function MessageBubble({
               key={`${attachment.taskId ?? message.taskId}-${idx}`}
               onToggle={(event) =>
                 event.currentTarget.open &&
-                attachment.type === 'full_result' &&
+                ['full_result', 'plan'].includes(attachment.type) &&
                 attachment.content === undefined &&
                 onLoadFullResult()
               }
@@ -127,15 +131,15 @@ export function MessageBubble({
                 <span className="attachment-icon">📦</span>
                 <div className="attachment-meta">
                   <strong>{attachment.label}</strong>
-                  <small>{attachment.version ?? '完整成果附件'} · 点击展开或按需加载</small>
+                  <small>{attachment.version ?? (attachment.type === 'plan' ? '方案详情' : '完整成果附件')} · 点击展开或按需加载</small>
                 </div>
                 <span className="attachment-toggle-icon">⌄</span>
               </summary>
 
               {loadingFullResult &&
-                attachment.type === 'full_result' &&
+                ['full_result', 'plan'].includes(attachment.type) &&
                 attachment.content === undefined && (
-                  <div className="attachment-loading-hint">正在从 Hub 加载完整成果…</div>
+                  <div className="attachment-loading-hint">正在从 Hub 加载附件详情…</div>
                 )}
 
               {attachment.content !== undefined && (
@@ -169,7 +173,7 @@ export function MessageBubble({
           ))}
 
           {/* Token 指标展示 */}
-          {['task_brief', 'review_decision'].includes(message.kind) && (task?.usageTotals || task?.usage) && (
+          {['task_brief', 'review_decision', 'plan_discussion', 'plan_refinement'].includes(message.kind) && (task?.usageTotals || task?.usage) && (
             <div className="message-token-metrics">
               <span>输入 {formatTokens((task.usageTotals ?? task.usage)!.inputTokens)}</span>
               <span>输出 {formatTokens((task.usageTotals ?? task.usage)!.outputTokens)}</span>

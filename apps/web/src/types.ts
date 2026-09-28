@@ -214,6 +214,7 @@ export interface RoleSubmission {
   verdict?: 'approved' | 'rejected' | 'upstream_confirmed' | 'upstream_denied'
   assignments?: Array<Record<string, unknown>>
   issues?: string[]
+  recommendation?: string | null
   correctionBrief?: string | null
   needsHuman?: boolean
   humanQuestion?: string | null
@@ -295,6 +296,7 @@ export interface HubTask {
     reviewerAgentId?: string | null
     maxReviewCycles?: number
     fastPath?: boolean
+    planDiscussion?: boolean
     plannerModelPreference?: string | null
     plannerReasoningEffort?: string | null
     reviewerModelPreference?: string | null
@@ -551,6 +553,7 @@ export interface CreateWorkflowRequest {
   modelPreference?: string | null
   reasoningEffort?: string | null
   maxReviewCycles: number
+  planDiscussion?: boolean
   attachments?: UploadedAttachment[]
   plannerModelPreference?: string | null
   plannerReasoningEffort?: string | null

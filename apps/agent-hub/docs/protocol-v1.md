@@ -219,9 +219,13 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
                      +----------->  | 确认：只把纠错简报交给规划 Agent 重排
 ```
 
+`POST /v1/workflows` 可选 `planDiscussion: boolean`（默认 `false`）。启用后，首次规划或重新规划先进入 `plan_discussion`（与规划 Agent 不同的审核 Agent 提出问题），再进入 `plan_refinement`（原规划 Agent 回应并提交最终 assignments），之后才派发执行任务。讨论意见不等同于成果审核；执行完成后仍须独立审核。两步均为同一根任务的子任务、沿用现有 v1 `task.assign` payload 和可靠投递机制，消息保留在同一个任务群聊。没有独立可用的讨论 Agent 时进入人工介入，不静默跳过；本功能每轮规划增加两次 Agent 调用，并受工作流 50 次调用上限约束。
+
+`plan_discussion` 的 Reviewer 输出 `{ "brief": "...", "issues": ["具体问题"], "recommendation": "..." }`，至少提供一项问题；`plan_refinement` 的 Planner 沿用规划输出的 `brief + assignments + needsHuman + humanQuestion` 契约。规划 Agent 只接收方案和讨论意见，不接收执行 Agent 的完整成果。讨论和修订沿用各自 Agent 的独立会话范围；修订任务沿用原规划任务的 `sessionScopeId`。
+
 - 规划 Agent 只拆分、指派、接收通过审核的简报，不读取完整成果。
 - 执行 Agent 提交 `brief + fullResult`；发现上游错误时提交 `upstreamIssue`，不得静默篡改上游结论。
-- 审核 Agent 只审核完整成果或上游错误报告，返回结构化 verdict。
+- 审核 Agent 可在执行前质疑方案；执行后只审核完整成果或上游错误报告，返回结构化 verdict。方案质疑不能代替成果审核。
 - `approved` 后，规划 Agent 只收到执行简报、审核简报和成果引用。
 - `rejected` 后，原执行 Agent 获得纠错简报；超过最大次数才请求人工介入。
 - 规划任务不得生成会修改同一成果的重叠执行任务；一个成果始终只有一个执行负责人。

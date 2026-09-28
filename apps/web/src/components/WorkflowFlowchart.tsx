@@ -39,6 +39,9 @@ export function WorkflowFlowchart({
   onSelectTask,
 }: WorkflowFlowchartProps) {
   const graph = buildWorkflowGraph(tasks, agents)
+  const discussionSteps = tasks
+    .filter((task) => task.stage === 'plan_discussion' || task.stage === 'plan_refinement')
+    .sort((a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt))
   const [activeInspectorTask, setActiveInspectorTask] = useState<HubTask | null>(null)
   const [laneLayout, setLaneLayout] = useState<'columns' | 'rows'>('columns')
   const [focusedBranchIndex, setFocusedBranchIndex] = useState<number | 'all'>('all')
@@ -168,6 +171,29 @@ export function WorkflowFlowchart({
                 </p>
               </div>
             </div>
+          </div>
+        )}
+
+        {discussionSteps.length > 0 && (
+          <div className="fc-stage-block stage-planning" aria-label="方案讨论步骤">
+            <div className="fc-stage-label">
+              <span className="stage-num">02a</span>
+              <span className="stage-name">执行前方案讨论</span>
+            </div>
+            {discussionSteps.map((step) => (
+              <div
+                key={step.taskId}
+                className={`fc-node process-node ${step.stage === 'plan_discussion' ? 'reviewer-node' : 'planner-node'} ${step.status} ${inspectedTask?.taskId === step.taskId ? 'selected' : ''}`}
+                onClick={() => handleNodeClick(step)}
+              >
+                <div className="fc-node-header">
+                  <span className={`fc-role-badge ${step.role}`}>{step.stage === 'plan_discussion' ? '审核 Agent 质疑' : '规划 Agent 回应'}</span>
+                  <strong className="fc-agent-name">{resolveTaskAgentInfo(step, agents).name}</strong>
+                  <span className={`fc-status-tag ${step.status}`}>{step.status === 'completed' ? (step.stage === 'plan_discussion' ? '✓ 已提出意见' : '✓ 已回应') : step.status}</span>
+                </div>
+                <div className="fc-node-content"><p>{step.submission?.brief ?? step.taskSpec?.title}</p></div>
+              </div>
+            ))}
           </div>
         )}
 
