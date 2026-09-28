@@ -1186,6 +1186,7 @@ export class AgentHub {
   }
 
   async advanceWorkflow(task) {
+    if (task.superseded) return;
     const submission = task.submission ?? {};
     const root = this.tasks.get(task.rootTaskId) ?? task;
 
@@ -1208,7 +1209,11 @@ export class AgentHub {
         if (decision === "complete") {
           task.workflowDecision = "complete";
           this.markTask(task);
-          this.checkAndFinalizeWorkflow(root.taskId);
+          if (root.workflow?.finalReviewRequired) {
+            await this.createFinalReview(task);
+          } else {
+            this.checkAndFinalizeWorkflow(root.taskId);
+          }
           return;
         }
         this.requireHuman(task, `规划 Agent 返回未知的结案决策: ${decision}`);
@@ -1340,8 +1345,24 @@ export class AgentHub {
 
     if (task.role !== "reviewer") return;
     const reviewed = this.tasks.get(task.parentTaskId);
-    if (!reviewed) return;
+    if (!reviewed || reviewed.superseded) return;
     const verdict = submission.verdict;
+    if (task.stage === "final_review") {
+      if (reviewed.role !== "planner" || reviewed.stage !== "result_intake") {
+        this.requireHuman(task, "最终审核任务缺少有效的汇总任务，无法自动结案。");
+        return;
+      }
+      reviewed.finalReviewStatus = verdict;
+      reviewed.finalReviewedAt = new Date().toISOString();
+      reviewed.finalReviewBrief = submission.brief;
+      this.markTask(reviewed);
+      if (verdict === "approved") {
+        this.checkAndFinalizeWorkflow(task.rootTaskId);
+      } else {
+        await this.reopenFinalIntake(task, reviewed, submission);
+      }
+      return;
+    }
     reviewed.reviewStatus = verdict;
     reviewed.reviewedAt = new Date().toISOString();
     reviewed.reviewBrief = submission.brief;
@@ -1406,26 +1427,30 @@ export class AgentHub {
         return;
       }
 
-      // Aggregate briefs from ALL completed executors in this batch
-      const aggregatedBrief = batchExecutors.length === 1
-        ? (batchExecutors[0].submission?.brief ?? "执行完成")
-        : batchExecutors.map((t) => `【${t.taskSpec?.title ?? t.taskId}】: ${t.submission?.brief ?? "执行完成"}`).join("\n");
-      const aggregatedArtifacts = batchExecutors.flatMap((t) => (t.artifacts?.files ?? []).map(toArtifactReference));
+      // Carry forward approved branches from earlier plans and batches.
+      // The Planner only receives approved briefs and artifact references.
+      const approvedExecutors = activeTasks.filter((t) =>
+        t.role === "executor" && t.status === "completed" && t.reviewStatus === "approved");
+      const aggregatedBrief = approvedExecutors.length === 1
+        ? (approvedExecutors[0].submission?.brief ?? "执行完成")
+        : approvedExecutors.map((t) =>
+            `【${t.taskSpec?.title ?? t.taskId}】: ${t.submission?.brief ?? "执行完成"}`).join("\n");
+      const aggregatedArtifacts = approvedExecutors.flatMap((t) =>
+        (t.artifacts?.files ?? []).map(toArtifactReference));
+      const reviewBriefFor = (executor) => executor.reviewBrief
+        ?? tasks.find((candidate) =>
+          !candidate.superseded
+          && candidate.role === "reviewer"
+          && candidate.parentTaskId === executor.taskId
+          && candidate.status === "completed"
+          && candidate.submission?.verdict === "approved")?.submission?.brief
+        ?? "审核通过";
+      const aggregatedReviewBrief = approvedExecutors.length === 1
+        ? reviewBriefFor(approvedExecutors[0])
+        : approvedExecutors.map((t) =>
+            `【${t.taskSpec?.title ?? t.taskId}】: ${reviewBriefFor(t)}`).join("\n");
 
-      // Aggregate briefs from ALL completed reviewers in this batch
-      const batchReviewers = tasks.filter((t) => {
-        if (t.role !== "reviewer" || t.status !== "completed") return false;
-        const p = this.tasks.get(t.parentTaskId);
-        return (p?.batchId === currentBatchId || p?.parentTaskId === currentBatchId);
-      });
-      const aggregatedReviewBrief = batchReviewers.length <= 1
-        ? (submission.brief ?? "审核通过")
-        : batchReviewers.map((r) => {
-            const p = this.tasks.get(r.parentTaskId);
-            return `【${p?.taskSpec?.title ?? r.taskId}】: ${r.submission?.brief ?? r.submission?.verdict ?? "审核通过"}`;
-          }).join("\n");
-
-      if (root.workflow?.fastPath) {
+      if (root.workflow?.fastPath && !root.workflow?.finalReviewRequired) {
         const reservation = this.reserveWorkflowInvocations(task.rootTaskId, 1);
         if (!reservation.ok) {
           this.requireHuman(task, `工作流累计任务调用已达上限（50次），无法执行快速结案：${reservation.error}`);
@@ -1455,7 +1480,7 @@ export class AgentHub {
             approved: true,
             fastPath: true,
             batchId: currentBatchId,
-            batchCount: batchExecutors.length,
+            batchCount: approvedExecutors.length,
             executorBrief: aggregatedBrief,
             reviewBrief: aggregatedReviewBrief,
             artifactReferences: aggregatedArtifacts,
@@ -1465,7 +1490,7 @@ export class AgentHub {
         finalization.completedAt = new Date().toISOString();
         finalization.submission = {
           decision: "complete",
-          brief: `当前批次所有子任务（${batchExecutors.length}个）均已通过审核并交付完整成果，Hub 确定性结案（实验功能）完成。`,
+          brief: `当前工作流所有子任务（${approvedExecutors.length}个）均已通过审核并交付完整成果，Hub 确定性结案（实验功能）完成。`,
           assignments: [],
           needsHuman: false,
         };
@@ -1480,7 +1505,7 @@ export class AgentHub {
       await this.createPlannerIntake(task, reviewed, "result_intake", {
         approved: true,
         batchId: currentBatchId,
-        batchCount: batchExecutors.length,
+        batchCount: approvedExecutors.length,
         executorBrief: aggregatedBrief,
         reviewBrief: aggregatedReviewBrief,
         artifactReferences: aggregatedArtifacts,
@@ -1529,6 +1554,114 @@ export class AgentHub {
       issues: submission.issues ?? [],
       correctionBrief: submission.correctionBrief,
     }, nextCycle);
+  }
+
+  async createFinalReview(intake) {
+    const root = this.getCanonicalRootTask(intake.rootTaskId);
+    const rawModel = root?.workflow?.reviewerModelPreference
+      ?? root?.workflow?.stageModels?.reviewer?.modelPreference
+      ?? null;
+    const reviewerModel = typeof rawModel === "string" ? rawModel.trim() || null : null;
+    const rawReasoning = root?.workflow?.reviewerReasoningEffort
+      ?? root?.workflow?.stageModels?.reviewer?.reasoningEffort
+      ?? null;
+    const reviewerReasoning = typeof rawReasoning === "string" ? rawReasoning.trim() || null : null;
+
+    let reviewerAgentId = root?.workflow?.reviewerAgentId;
+    if (reviewerAgentId === intake.targetAgentId) reviewerAgentId = null;
+    if (!reviewerAgentId) {
+      const candidates = new Map([...this.agents.entries()].filter(([id, agent]) => (
+        id !== intake.targetAgentId
+        && (!this.leasesEnabled() || agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
+      )));
+      this.refreshAccountLoads();
+      try {
+        reviewerAgentId = chooseAgent(candidates, {
+          role: "reviewer",
+          modelPreference: reviewerModel,
+          reasoningEffort: reviewerReasoning,
+          requireDeclaredRole: false,
+        }).agent.agentId;
+      } catch {
+        reviewerAgentId = null;
+      }
+    }
+
+    if (!reviewerAgentId) {
+      intake.finalReviewStatus = "waiting_for_human_review";
+      this.markTask(intake);
+      this.createIntervention(intake, {
+        kind: "workflow_input",
+        question: "最终汇总缺少可调度的独立 Reviewer，请人工审核后决定是否结案。",
+        allowedActions: ["approve", "reject"],
+        continuation: { type: "final_review", taskId: intake.taskId },
+      });
+      return;
+    }
+
+    const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
+    if (!reservation.ok) {
+      this.requireHuman(intake, `工作流累计 Agent 调用已达上限（50次），无法审核最终汇总：${reservation.error}`);
+      return;
+    }
+    const reviewer = this.createTask({
+      targetAgentId: reviewerAgentId,
+      input: "独立审核最终汇总是否覆盖全部已审核分支与验收条件。",
+      rootTaskId: root.taskId,
+      parentTaskId: intake.taskId,
+      batchId: intake.batchId,
+      sourceAgentId: intake.targetAgentId,
+      role: "reviewer",
+      stage: "final_review",
+      quotaReserved: true,
+      workflow: root.workflow,
+      modelPreference: reviewerModel,
+      reasoningEffort: reviewerReasoning,
+      reviewCycle: intake.reviewCycle,
+      taskSpec: {
+        title: "审核最终汇总",
+        type: "final_review",
+        priority: intake.taskSpec?.priority ?? "P1",
+        inputs: [],
+        expected_outputs: [],
+        permissions_required: { project_workspace: true },
+        checkpoint_policy: { mode: "stage" },
+        acceptance: root.taskSpec?.acceptance ?? [],
+      },
+      contextBundle: {
+        objective: root.contextBundle?.objective ?? root.input,
+        acceptance: root.taskSpec?.acceptance ?? [],
+        finalBrief: intake.submission?.brief,
+        executorBrief: intake.contextBundle?.executorBrief,
+        reviewBrief: intake.contextBundle?.reviewBrief,
+        artifactReferences: intake.contextBundle?.artifactReferences ?? [],
+        batchId: intake.batchId,
+      },
+    });
+    intake.finalReviewStatus = "pending";
+    intake.finalReviewTaskId = reviewer.taskId;
+    this.markTask(intake);
+    await this.queueOrDispatch(reviewer);
+  }
+
+  async reopenFinalIntake(reviewTask, intake, feedback) {
+    const nextCycle = Number(intake.reviewCycle ?? 0) + 1;
+    const maxCycles = Math.min(5, Math.max(0, Number(intake.workflow?.maxReviewCycles ?? 2)));
+    if (nextCycle > maxCycles) {
+      this.requireHuman(reviewTask, `最终汇总连续 ${nextCycle} 次未通过审核：${feedback.brief ?? "缺少审核意见"}`);
+      return;
+    }
+    intake.superseded = true;
+    this.markTask(intake);
+    await this.createPlannerIntake(reviewTask, intake, "result_intake", {
+      ...intake.contextBundle,
+      batchId: intake.batchId,
+      finalReviewRejected: true,
+      finalReviewBrief: feedback.brief ?? null,
+      finalReviewIssues: feedback.issues ?? [],
+      correctionBrief: feedback.correctionBrief ?? null,
+      reviewCycle: nextCycle,
+    });
   }
 
   async dispatchAssignments(task, assignments) {
@@ -1658,6 +1791,7 @@ export class AgentHub {
       quotaReserved: true,
       workflow: root?.workflow ?? reviewTask.workflow,
       sessionScopeId,
+      reviewCycle: details.reviewCycle ?? 0,
       modelPreference: plannerModel,
       reasoningEffort: plannerReasoning,
       taskSpec: {
@@ -1961,6 +2095,22 @@ export class AgentHub {
         await this.createRevisionTask(task, task, { reviewBrief: task.reviewBrief }, (task.reviewCycle ?? 0) + 1);
         resumedTask = task;
       }
+    } else if (intervention.continuation?.type === "final_review") {
+      const intake = origin;
+      if (decision === "approve") {
+        intake.finalReviewStatus = "approved";
+        intake.finalReviewHumanApproved = true;
+        intake.finalReviewedAt = resolvedAt;
+        intake.finalReviewBrief = response || "人工审核最终汇总通过";
+        this.markTask(intake);
+        this.checkAndFinalizeWorkflow(intake.rootTaskId);
+      } else {
+        intake.finalReviewStatus = "rejected";
+        intake.finalReviewBrief = response || "人工审核最终汇总驳回";
+        this.markTask(intake);
+        await this.reopenFinalIntake(intake, intake, { brief: intake.finalReviewBrief });
+      }
+      resumedTask = intake;
     }
 
     await this.recordEvent("intervention.resolved", {
@@ -2054,19 +2204,32 @@ export class AgentHub {
     // Pillar 2: Every active execution task approved by an independent reviewer (or human)
     for (const execTask of executionTasks) {
       if (execTask.reviewStatus !== "approved") return false;
-      const reviewTask = tasks.find((t) => t.parentTaskId === execTask.taskId && t.role === "reviewer");
+      const reviewTask = tasks.find((t) => !t.superseded && t.parentTaskId === execTask.taskId && t.role === "reviewer");
       if (reviewTask && reviewTask.targetAgentId === execTask.targetAgentId) {
         return false;
       }
     }
 
     // Pillar 3: Planner explicitly decided 'complete' in result_intake stage OR Hub deterministic finalization completed
-    const intakeTask = tasks.filter((t) => (
+    const intakeTask = tasks.filter((t) => !t.superseded && (
       (t.role === "planner" && t.stage === "result_intake") ||
       (t.role === "system" && t.stage === "hub_finalization")
     ) && t.status === "completed").at(-1);
     if (!intakeTask || intakeTask.submission?.decision !== "complete") {
       return false;
+    }
+    if (root.workflow.finalReviewRequired && intakeTask.stage === "result_intake") {
+      if (intakeTask.finalReviewStatus !== "approved") return false;
+      if (!intakeTask.finalReviewHumanApproved) {
+        const finalReview = tasks.find((t) => !t.superseded
+          && t.role === "reviewer"
+          && t.stage === "final_review"
+          && t.parentTaskId === intakeTask.taskId
+          && t.status === "completed"
+          && t.submission?.verdict === "approved"
+          && t.targetAgentId !== intakeTask.targetAgentId);
+        if (!finalReview) return false;
+      }
     }
 
     return true;
@@ -3103,36 +3266,63 @@ export class AgentHub {
     if (command.type === "workflow.replan") {
       const root = this.tasks.get(command.rootTaskId);
       if (!root || root.rootTaskId !== root.taskId) throw httpError(404, `Unknown workflow ${command.rootTaskId}`);
-      if (root.status === "completed" || root.status === "cancelled" || root.forceCompleted) {
+      if (!root.workflow?.enabled) {
+        throw httpError(400, "Cannot replan a task without an enabled workflow");
+      }
+      if (root.status === "cancelled" || root.forceCompleted || this.isWorkflowComplete(root.taskId)) {
         throw httpError(400, "Cannot replan a completed or cancelled workflow");
+      }
+      const plannerId = root.workflow?.plannerAgentId ?? (root.role === "planner" ? root.targetAgentId : null);
+      if (!plannerId) {
+        throw httpError(400, "Workflow does not specify a planner Agent");
       }
       const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
       if (!reservation.ok) {
         throw httpError(400, `工作流累计任务调用已达上限（50次），无法重新规划：${reservation.error}`);
       }
 
-      // Cancel and supersede any active child tasks from previous plan
+      // Preserve independently approved deliverables; retire the old planning
+      // and unreviewed branches so they cannot block or finalize the new plan.
+      const preservedExecutors = [...this.tasks.values()].filter((task) =>
+        task.rootTaskId === root.taskId
+        && !task.superseded
+        && task.role === "executor"
+        && task.status === "completed"
+        && task.reviewStatus === "approved");
+      const preservedExecutorIds = new Set(preservedExecutors.map((task) => task.taskId));
       for (const t of this.tasks.values()) {
-        if (t.rootTaskId === root.taskId && t.taskId !== root.taskId && ACTIVE_TASK_STATUSES.has(t.status)) {
-          t.status = "cancelled";
-          t.superseded = true;
-          t.completedAt = new Date().toISOString();
-          this.finishTaskActivity(t);
-          this.markTask(t);
-          if (t.targetAgentId) {
-            this.deliver(t.targetAgentId, makeEnvelope("task.cancel", {
-              agentId: t.targetAgentId,
-              taskId: t.taskId,
-              payload: { attemptId: t.currentAttemptId ?? null },
-            }));
+        if (t.rootTaskId !== root.taskId || t.taskId === root.taskId) continue;
+        const keep = preservedExecutorIds.has(t.taskId)
+          || (t.role === "reviewer"
+            && preservedExecutorIds.has(t.parentTaskId)
+            && !t.superseded
+            && t.status === "completed"
+            && t.submission?.verdict === "approved");
+        if (!keep) {
+          if (ACTIVE_TASK_STATUSES.has(t.status)) {
+            t.status = "cancelled";
+            t.completedAt = new Date().toISOString();
+            this.finishTaskActivity(t);
+            if (t.targetAgentId) {
+              this.deliver(t.targetAgentId, makeEnvelope("task.cancel", {
+                agentId: t.targetAgentId,
+                taskId: t.taskId,
+                payload: { attemptId: t.currentAttemptId ?? null },
+              }));
+            }
           }
+          t.superseded = true;
+          this.markTask(t);
         }
+        this.closePendingInterventions(t, actor.id, "Superseded by manual replan");
       }
-      const plannerId = root.workflow?.plannerAgentId ?? (root.role === "planner" ? root.targetAgentId : null);
-      if (!plannerId) {
-        this.refundWorkflowInvocation(root.taskId, 1);
-        throw httpError(400, "Workflow does not specify a planner Agent");
+      this.closePendingInterventions(root, actor.id, "Superseded by manual replan");
+      root.workflow = { ...root.workflow, finalReviewRequired: true };
+      if (root.status === "failed" || root.status === "rejected") {
+        root.status = "completed";
+        root.error = null;
       }
+      this.markTask(root);
       const replanModel = command.modelPreference
         ?? root.workflow?.plannerModelPreference
         ?? root.workflow?.stageModels?.planner?.modelPreference
@@ -3167,6 +3357,20 @@ export class AgentHub {
           reason: command.reason || "workflow_stalled",
           requestedBy: actor.id,
           schedulerCatalog: this.schedulerCatalog(),
+          approvedBriefs: preservedExecutors.map((task) => ({
+            taskId: task.taskId,
+            title: task.taskSpec?.title ?? task.taskId,
+            brief: task.submission?.brief ?? null,
+            reviewBrief: task.reviewBrief
+              ?? [...this.tasks.values()].find((candidate) =>
+                !candidate.superseded
+                && candidate.role === "reviewer"
+                && candidate.parentTaskId === task.taskId
+                && candidate.status === "completed"
+                && candidate.submission?.verdict === "approved")?.submission?.brief
+              ?? null,
+            artifactReferences: (task.artifacts?.files ?? []).map(toArtifactReference),
+          })),
         },
       });
       await this.queueOrDispatch(replanTask);

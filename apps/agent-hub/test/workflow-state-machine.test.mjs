@@ -974,3 +974,211 @@ function agent(agentId, role) {
     executors: [{ health: "Healthy", quota: "Healthy" }],
   };
 }
+test("FLOW-001: manual replan of a stalled workflow reviews every new branch and finalizes", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+  hub.agents.set("reviewer-1", agent("reviewer-1", "reviewer"));
+
+  const root = hub.createTask({
+    input: "Build three independent deliverables",
+    targetAgentId: "planner-1",
+    role: "planner",
+    stage: "planning",
+    workflow: {
+      enabled: true,
+      plannerAgentId: "planner-1",
+      executorAgentId: "executor-1",
+      reviewerAgentId: "reviewer-1",
+    },
+  });
+  root.status = "completed";
+  root.submission = { brief: "Original plan", assignments: [] };
+  const oldExecutor = hub.createTask({
+    input: "Old incomplete branch",
+    rootTaskId: root.taskId,
+    parentTaskId: root.taskId,
+    targetAgentId: "executor-1",
+    role: "executor",
+    stage: "execution",
+    workflow: root.workflow,
+  });
+  oldExecutor.status = "completed";
+  oldExecutor.submission = { brief: "Old unreviewed result", fullResult: "Old result" };
+  const approvedExecutor = hub.createTask({
+    input: "Previously approved branch",
+    rootTaskId: root.taskId,
+    parentTaskId: root.taskId,
+    targetAgentId: "executor-1",
+    role: "executor",
+    stage: "execution",
+    workflow: root.workflow,
+    taskSpec: { title: "Previously approved branch", acceptance: [] },
+  });
+  approvedExecutor.status = "completed";
+  approvedExecutor.submission = { brief: "Prior approved result", fullResult: "Private prior result" };
+  approvedExecutor.reviewStatus = "approved";
+  const priorReview = hub.createTask({
+    input: "Review prior branch",
+    rootTaskId: root.taskId,
+    parentTaskId: approvedExecutor.taskId,
+    targetAgentId: "reviewer-1",
+    role: "reviewer",
+    stage: "result_review",
+    workflow: root.workflow,
+  });
+  priorReview.status = "completed";
+  priorReview.submission = { verdict: "approved", brief: "Prior branch verified" };
+  assert.equal(hub.conversations()[0].status, "stalled");
+
+  const { task: replan } = await hub.handleCommand({
+    type: "workflow.replan",
+    rootTaskId: root.taskId,
+    instructions: "Replace the old plan with three independent branches",
+  }, { id: "admin-1", role: "admin" });
+  assert.equal(replan.status, "dispatched");
+  assert.equal(oldExecutor.superseded, true);
+  assert.equal(approvedExecutor.superseded, false);
+  assert.equal(priorReview.superseded, false);
+  assert.match(replan.contextBundle.approvedBriefs[0].brief, /Prior approved result/);
+  assert.match(replan.contextBundle.approvedBriefs[0].reviewBrief, /Prior branch verified/);
+  assert.equal(JSON.stringify(replan.contextBundle).includes("Private prior result"), false);
+
+  let sequence = 0;
+  async function finish(task, output) {
+    assert.equal(task.status, "dispatched", task.taskSpec?.title ?? task.stage);
+    await hub.handleWorkerMessage(task.targetAgentId, {
+      id: `flow-001-${++sequence}`,
+      type: "task.result",
+      taskId: task.taskId,
+      payload: { output: JSON.stringify(output) },
+    });
+    assert.equal(task.status, "completed", task.taskSpec?.title ?? task.stage);
+  }
+
+  await finish(replan, {
+    brief: "Three branches",
+    assignments: ["A", "B", "C"].map((name) => ({
+      title: `Branch ${name}`,
+      instructions: `Produce ${name}`,
+      acceptance: [`${name} is complete`],
+      expectedOutputs: [],
+    })),
+    needsHuman: false,
+  });
+
+  const executors = [...hub.tasks.values()].filter((task) =>
+    task.role === "executor" && task.parentTaskId === replan.taskId);
+  assert.equal(executors.length, 3);
+  for (const [index, executor] of executors.entries()) {
+    await finish(executor, {
+      brief: `Branch ${index + 1} done`,
+      fullResult: `Complete result for branch ${index + 1}`,
+      upstreamIssue: null,
+    });
+  }
+
+  const reviewers = executors.map((executor) =>
+    [...hub.tasks.values()].find((task) => task.role === "reviewer" && task.parentTaskId === executor.taskId));
+  assert.equal(reviewers.filter(Boolean).length, 3);
+  for (const [index, reviewer] of reviewers.entries()) {
+    assert.notEqual(reviewer.targetAgentId, executors[index].targetAgentId);
+    await finish(reviewer, {
+      verdict: "approved",
+      brief: `Branch ${index + 1} verified`,
+      issues: [],
+    });
+  }
+
+  const intakes = [...hub.tasks.values()].filter((task) => task.stage === "result_intake" && !task.superseded);
+  assert.equal(intakes.length, 1);
+  assert.equal(intakes[0].contextBundle.batchCount, 4);
+  assert.match(intakes[0].contextBundle.executorBrief, /Prior approved result/);
+  assert.match(intakes[0].contextBundle.reviewBrief, /Prior branch verified/);
+  await finish(intakes[0], { decision: "complete", brief: "Prior branch and all three new branches verified", assignments: [] });
+  assert.equal(hub.isWorkflowComplete(root.taskId), false, "Final aggregation still needs independent review");
+  const finalReview = [...hub.tasks.values()].find((task) =>
+    task.role === "reviewer" && task.stage === "final_review" && task.parentTaskId === intakes[0].taskId);
+  assert.ok(finalReview, "Final aggregation received an independent Reviewer task");
+  assert.notEqual(finalReview.targetAgentId, intakes[0].targetAgentId);
+  assert.equal("fullResult" in finalReview.contextBundle, false);
+  await finish(finalReview, {
+    verdict: "rejected",
+    brief: "The final brief omits branch C",
+    issues: ["Add branch C"],
+    correctionBrief: "Summarize all three branches",
+  });
+  assert.equal(hub.isWorkflowComplete(root.taskId), false);
+  assert.equal(intakes[0].superseded, true);
+  const correctedIntake = [...hub.tasks.values()].find((task) =>
+    task.stage === "result_intake" && !task.superseded && task.taskId !== intakes[0].taskId);
+  assert.ok(correctedIntake);
+  assert.equal(correctedIntake.reviewCycle, 1);
+  assert.match(correctedIntake.contextBundle.finalReviewBrief, /omits branch C/);
+  await finish(correctedIntake, { decision: "complete", brief: "Prior branch plus A, B, and C verified", assignments: [] });
+  const secondFinalReview = [...hub.tasks.values()].find((task) =>
+    task.stage === "final_review" && task.parentTaskId === correctedIntake.taskId);
+  assert.ok(secondFinalReview);
+  await finish(secondFinalReview, { verdict: "approved", brief: "Aggregate covers all three branches", issues: [] });
+  assert.equal(hub.isWorkflowComplete(root.taskId), true);
+  assert.equal(hub.conversations()[0].status, "completed");
+  assert.equal([...hub.interventions.values()].filter((item) => item.status === "pending").length, 0);
+});
+test("FLOW-001: final review without an independent Reviewer requests human intervention", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  const root = hub.createTask({
+    input: "Review final summary",
+    targetAgentId: "planner-1",
+    role: "planner",
+    workflow: { enabled: true, plannerAgentId: "planner-1", finalReviewRequired: true },
+  });
+  root.status = "completed";
+  const executor = hub.createTask({
+    input: "Completed branch",
+    rootTaskId: root.taskId,
+    parentTaskId: root.taskId,
+    targetAgentId: "executor-1",
+    role: "executor",
+    workflow: root.workflow,
+  });
+  executor.status = "completed";
+  executor.submission = { brief: "Done", fullResult: "Complete result" };
+  executor.reviewStatus = "approved";
+  const branchReview = hub.createTask({
+    input: "Independent branch review",
+    rootTaskId: root.taskId,
+    parentTaskId: executor.taskId,
+    targetAgentId: "reviewer-offline",
+    role: "reviewer",
+    workflow: root.workflow,
+  });
+  branchReview.status = "completed";
+  branchReview.submission = { verdict: "approved", brief: "Passed" };
+  const intake = hub.createTask({
+    input: "Final summary",
+    rootTaskId: root.taskId,
+    parentTaskId: branchReview.taskId,
+    targetAgentId: "planner-1",
+    role: "planner",
+    stage: "result_intake",
+    workflow: root.workflow,
+  });
+  intake.status = "completed";
+  intake.submission = { decision: "complete", brief: "Branch complete", assignments: [] };
+
+  await hub.createFinalReview(intake);
+  const pending = [...hub.interventions.values()].find((item) =>
+    item.taskId === intake.taskId && item.status === "pending");
+  assert.ok(pending);
+  assert.equal(pending.continuation.type, "final_review");
+  assert.equal(hub.conversations()[0].status, "needs_human");
+  assert.equal(hub.isWorkflowComplete(root.taskId), false);
+
+  await hub.resolveIntervention(pending.interventionId, {
+    action: "approve",
+    response: "Final summary verified",
+  }, { id: "admin-1", role: "admin" });
+  assert.equal(intake.finalReviewHumanApproved, true);
+  assert.equal(hub.conversations()[0].status, "completed");
+});

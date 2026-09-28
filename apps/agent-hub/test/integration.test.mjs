@@ -59,7 +59,7 @@ test("two workers preserve sessions, route output, pause, and approval", { timeo
     assert.equal(workers[0].state.sessionId, firstSession);
 
     await post(hub, "/v1/commands", { type: "agent.pause", targetAgentId: "agent-a" });
-    await waitUntil(() => workers[0].state.paused === true);
+    await waitUntil(() => workers[0].state.paused === true && hub.agents.get("agent-a")?.paused === true);
     const paused = await post(hub, "/v1/tasks", { targetAgentId: "agent-a", input: "queued while paused" });
     assert.equal(hub.tasks.get(paused.task.taskId).status, "queued");
     assert.equal(hub.tasks.get(paused.task.taskId).schedulingErrorCode, "EXECUTOR_PAUSED");
@@ -276,3 +276,130 @@ async function waitUntil(predicate, timeoutMs = 5000) {
   }
   throw new Error("Timed out waiting for condition");
 }
+test("manual replan closes three reviewed branches and an independently reviewed final summary over real Workers", { timeout: 20000 }, async () => {
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-flow-001-integration-"));
+  const hub = new AgentHub({
+    host: "127.0.0.1",
+    port: 0,
+    heartbeatMs: 100,
+    delivery: { ackTimeoutMs: 100, maxAttemptsPerConnection: 5 },
+    logs: { file: path.join(tempRoot, "events.jsonl"), includePayloads: true },
+  });
+  const workers = [];
+  try {
+    await hub.start();
+    const definitions = [
+      {
+        agentId: "planner-flow-001",
+        role: "planner",
+        roleOutputs: {
+          "planner:replan": {
+            brief: "Three independent branches",
+            assignments: ["A", "B", "C"].map((name) => ({
+              title: `Branch ${name}`,
+              instructions: `Produce ${name}`,
+              acceptance: [`${name} complete`],
+              expectedOutputs: [],
+            })),
+            needsHuman: false,
+          },
+          "planner:result_intake": {
+            decision: "complete",
+            brief: "All approved branches are included",
+            assignments: [],
+          },
+        },
+      },
+      {
+        agentId: "executor-flow-001",
+        role: "executor",
+        roleOutputs: {
+          executor: { brief: "Branch produced", fullResult: "Private complete result", upstreamIssue: null },
+        },
+      },
+      {
+        agentId: "reviewer-flow-001",
+        role: "reviewer",
+        roleOutputs: {
+          "reviewer:result_review": { verdict: "approved", brief: "Branch verified", issues: [] },
+          "reviewer:final_review": { verdict: "approved", brief: "Final summary verified", issues: [] },
+        },
+      },
+    ];
+    for (const definition of definitions) {
+      const worker = new AgentWorker({
+        agentId: definition.agentId,
+        deviceId: `${definition.agentId}-device`,
+        account: { id: `${definition.agentId}-account`, provider: "test", plan: "test" },
+        roles: [definition.role],
+        models: [{ id: `${definition.role}-model`, capabilities: ["task.execute", "reasoning", "validation"], quota: { state: "Healthy" } }],
+        capabilities: ["task.execute", "reasoning", "validation"],
+        hubUrl: `ws://127.0.0.1:${hub.port}/worker`,
+        stateFile: path.join(tempRoot, `${definition.agentId}.json`),
+        workspace: path.join(tempRoot, definition.agentId),
+        heartbeatMs: 100,
+        reconnect: { baseMs: 50, maxMs: 200 },
+        adapter: { type: "mock", delayMs: 5, roleOutputs: definition.roleOutputs },
+      });
+      workers.push(worker);
+      await worker.start();
+    }
+    await waitUntil(() => definitions.every(({ agentId }) => hub.agents.get(agentId)?.status === "online"));
+
+    const root = hub.createTask({
+      input: "Complete three branches after manual replan",
+      targetAgentId: "planner-flow-001",
+      role: "planner",
+      stage: "planning",
+      workflow: {
+        enabled: true,
+        plannerAgentId: "planner-flow-001",
+        executorAgentId: "executor-flow-001",
+        reviewerAgentId: "reviewer-flow-001",
+      },
+    });
+    root.status = "completed";
+    hub.markTask(root);
+    const old = hub.createTask({
+      input: "Old unreviewed result",
+      rootTaskId: root.taskId,
+      parentTaskId: root.taskId,
+      targetAgentId: "executor-flow-001",
+      role: "executor",
+      workflow: root.workflow,
+    });
+    old.status = "completed";
+    old.submission = { brief: "Old branch", fullResult: "Old private result" };
+    hub.markTask(old);
+    assert.equal(hub.conversations()[0].status, "stalled");
+
+    await post(hub, "/v1/commands", {
+      type: "workflow.replan",
+      rootTaskId: root.taskId,
+      instructions: "Replace the unreviewed branch with three independent branches",
+    });
+    await waitUntil(() => hub.conversations().find((item) => item.rootTaskId === root.taskId)?.status === "completed", 10000);
+
+    const tasks = [...hub.tasks.values()].filter((task) => task.rootTaskId === root.taskId);
+    const branches = tasks.filter((task) => task.role === "executor" && !task.superseded);
+    const branchReviews = tasks.filter((task) => task.role === "reviewer" && task.stage === "result_review");
+    const finalReview = tasks.find((task) => task.stage === "final_review");
+    const intake = tasks.find((task) => task.stage === "result_intake");
+    assert.equal(old.superseded, true);
+    assert.equal(branches.length, 3);
+    assert.equal(branchReviews.length, 3);
+    assert.ok(branches.every((task) => task.status === "completed" && task.reviewStatus === "approved"));
+    assert.ok(branchReviews.every((task) => task.status === "completed" && task.targetAgentId !== hub.tasks.get(task.parentTaskId)?.targetAgentId));
+    assert.equal(intake?.contextBundle.batchCount, 3);
+    assert.equal(intake?.status, "completed");
+    assert.equal(intake?.finalReviewStatus, "approved");
+    assert.equal(finalReview?.status, "completed");
+    assert.notEqual(finalReview?.targetAgentId, intake?.targetAgentId);
+    assert.equal("fullResult" in finalReview.contextBundle, false);
+    assert.equal(hub.isWorkflowComplete(root.taskId), true);
+  } finally {
+    await Promise.all(workers.map((worker) => worker.stop()));
+    await hub.stop();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});

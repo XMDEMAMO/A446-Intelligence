@@ -280,6 +280,7 @@ export interface HubTask {
   requiresApproval?: boolean
   stage?: string
   finalReviewStatus?: string | null
+  finalReviewHumanApproved?: boolean
   finalReviewBrief?: string | null
   finalReviewTaskId?: string | null
   finalHumanReviewStatus?: string | null
@@ -295,6 +296,7 @@ export interface HubTask {
     reviewerAgentId?: string | null
     maxReviewCycles?: number
     fastPath?: boolean
+    finalReviewRequired?: boolean
     plannerModelPreference?: string | null
     plannerReasoningEffort?: string | null
     reviewerModelPreference?: string | null

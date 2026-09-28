@@ -223,6 +223,8 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - 执行 Agent 提交 `brief + fullResult`；发现上游错误时提交 `upstreamIssue`，不得静默篡改上游结论。
 - 审核 Agent 只审核完整成果或上游错误报告，返回结构化 verdict。
 - `approved` 后，规划 Agent 只收到执行简报、审核简报和成果引用。
+- 人工 `workflow.replan` 可以接管根 Planner 已完成但工作流尚未结案的停滞状态；旧计划中未获审核通过的子任务标记为 `superseded`，已通过独立审核的成果保留并以简报及成果引用进入新计划汇总。
+- 人工重新规划后，每条新分支仍先经独立 Reviewer 审核。Planner 汇总已审核简报并决定 `complete` 后，另建 `final_review` Reviewer 任务，独立核对最终简报对全部分支和验收条件的覆盖。最终 Reviewer 只收到已审核简报与成果引用，不收到分支完整成果；驳回时返回 Planner 修正汇总，缺少独立 Reviewer 时转人工介入。
 - `rejected` 后，原执行 Agent 获得纠错简报；超过最大次数才请求人工介入。
 - 规划任务不得生成会修改同一成果的重叠执行任务；一个成果始终只有一个执行负责人。
 - 群聊中的 `@` 用于人类观察和提醒，不直接改变任务状态。

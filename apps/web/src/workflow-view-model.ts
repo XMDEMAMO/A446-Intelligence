@@ -291,9 +291,9 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
   const intakeCandidates = allTasks.filter(
     (t) => t.role === 'planner' && t.stage === 'result_intake',
   )
-  const intakeTask =
-    latestTask(intakeCandidates.filter((task) => task.status !== 'cancelled')) ??
-    latestTask(intakeCandidates)
+  const intakeTask = latestTask(
+    intakeCandidates.filter((task) => !task.superseded && task.status !== 'cancelled'),
+  )
 
   // 3. 筛选所有执行与修订任务
   const executorTasks = allTasks.filter(
@@ -355,8 +355,11 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
 
     const latestStep = steps[steps.length - 1]
     const latestVerdict = latestStep.reviewerTask?.submission?.verdict
-    const branchApproved = latestVerdict === 'approved'
-    const branchRejected = latestVerdict === 'rejected'
+    const branchApproved =
+      latestVerdict === 'approved' ||
+      (!latestStep.reviewerTask && latestStep.task.reviewStatus === 'approved')
+    const branchRejected =
+      latestVerdict === 'rejected' || latestStep.task.reviewStatus === 'rejected'
     const branchTitle =
       latestStep.task.taskSpec?.title ??
       latestStep.task.input.slice(0, 30) ??
@@ -366,7 +369,9 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
     const isPending = Boolean(
       isActiveStatus(latestStep.task.status) ||
         (latestStep.reviewerTask && isActiveStatus(latestStep.reviewerTask.status)) ||
-        (latestStep.task.status === 'completed' && !latestStep.reviewerTask),
+        (latestStep.task.status === 'completed' &&
+          !latestStep.reviewerTask &&
+          latestStep.task.reviewStatus !== 'approved'),
     )
 
     if (
@@ -411,13 +416,14 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
     })
   }
 
-  // 6. 计算汇合结果数量
-  let approvedResultCount = branches.filter((b) => b.isApproved).length
+  // 6. 旧计划分支保留在图中，但不计入当前计划的完成条件。
+  const effectiveBranches = branches.filter((branch) => !branch.isSuperseded)
+  let approvedResultCount = effectiveBranches.filter((b) => b.isApproved).length
   if (intakeTask?.contextBundle && Array.isArray(intakeTask.contextBundle.approvedResults)) {
     approvedResultCount = intakeTask.contextBundle.approvedResults.length
   }
 
-  const completedBranches = branches.filter(
+  const completedBranches = effectiveBranches.filter(
     (branch) =>
       branch.isApproved &&
       !branch.isPending &&
@@ -428,10 +434,11 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
   const finalReviewTask = latestTask(
     allTasks.filter(
       (t) =>
+        intakeTask &&
+        !t.superseded &&
         t.role === 'reviewer' &&
-        (t.stage === 'final_review' ||
-          t.taskId === intakeTask?.finalReviewTaskId ||
-          (intakeTask && t.parentTaskId === intakeTask.taskId)),
+        t.parentTaskId === intakeTask.taskId &&
+        (t.stage === 'final_review' || t.taskId === intakeTask.finalReviewTaskId),
     ),
   )
 
@@ -465,10 +472,10 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
   const isConverged = isIntakeConverged(intakeTask)
   const isFullyCompleted = Boolean(
     isConverged &&
-      finalReviewTask &&
+      (finalReviewTask || intakeTask?.finalReviewHumanApproved) &&
       finalReviewStatus === 'approved' &&
-      branches.length > 0 &&
-      completedBranches === branches.length &&
+      effectiveBranches.length > 0 &&
+      completedBranches === effectiveBranches.length &&
       (!finalHumanReviewRequired || finalHumanReviewStatus === 'approved'),
   )
 
@@ -494,7 +501,7 @@ export function buildWorkflowGraph(tasks: HubTask[] = [], agents: Agent[] = []):
     planningHold,
     planRevision,
     approvedResultCount,
-    totalBranches: branches.length,
+    totalBranches: effectiveBranches.length,
     completedBranches,
     hasRejections,
     hasUnresolvedIssues,
