@@ -7,6 +7,7 @@ export const STAGE_SET = new Set([
   "execution",
   "revision",
   "result_review",
+  "final_review",
   "upstream_review",
   "result_intake",
   "hub_finalization",
@@ -210,6 +211,8 @@ export function buildRolePrompt(role, input, payload = {}) {
   } else if (role === "reviewer") {
     if (stage === "upstream_review") {
       contract = `Return JSON only: {"verdict":"upstream_confirmed|upstream_denied","brief":"review summary","correctionBrief":null}. Evaluate the upstream issue claim made by the executor.`;
+    } else if (stage === "final_review") {
+      contract = `Return JSON only: {"verdict":"approved|rejected","brief":"review summary","issues":[],"correctionBrief":null}. Independently verify that the final brief covers every approved branch and the acceptance criteria using only the approved briefs and artifact references. Do not claim to have inspected the full executor results.`;
     } else {
       contract = `Return JSON only: {"verdict":"approved|rejected","brief":"review summary","issues":[],"correctionBrief":null}. Review only the submitted full result against the acceptance criteria.`;
     }

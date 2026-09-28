@@ -577,3 +577,22 @@ test("preview14: isPathSafe blocks Windows superscript device names COM¹/²/³ 
   assert.equal(isPathSafe("common.txt"), true);
 });
 
+test("final_review prompt checks aggregate coverage without exposing full executor results", () => {
+  const prompt = buildRolePrompt("reviewer", "Review final summary", {
+    stage: "final_review",
+    contextBundle: {
+      finalBrief: "A, B, C complete",
+      executorBrief: "Approved branch briefs",
+      artifactReferences: [],
+    },
+  });
+  assert.match(prompt, /STAGE: final_review/);
+  assert.match(prompt, /approved branch/);
+  assert.equal(prompt.includes("fullResult"), false);
+  const submission = parseRoleSubmission("reviewer", "final_review", JSON.stringify({
+    verdict: "approved",
+    brief: "All approved branches are covered",
+    issues: [],
+  }));
+  assert.equal(submission.ok, true);
+});

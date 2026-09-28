@@ -618,3 +618,65 @@ test('Intervention controls: branch pause, workflow pause, planning hold, and fi
   assert.equal(finalIssue.isResolved, false)
   assert.ok(finalIssue.details.includes('吞吐量不足 500 RPS'))
 })
+test('FLOW-001: replanned graph excludes retired branches and stale final reviews', () => {
+  const root = {
+    taskId: 'flow-root', rootTaskId: 'flow-root', role: 'planner', stage: 'planning',
+    status: 'completed', createdAt: '2026-09-28T10:00:00Z', input: 'Finish all branches',
+    workflow: { enabled: true, finalReviewRequired: true },
+  }
+  const retired = {
+    taskId: 'retired-exec', rootTaskId: root.taskId, parentTaskId: root.taskId,
+    role: 'executor', stage: 'execution', status: 'completed', superseded: true,
+    workUnitId: 'retired', createdAt: '2026-09-28T10:01:00Z', input: 'Old branch',
+  }
+  const approved = {
+    taskId: 'new-exec', rootTaskId: root.taskId, parentTaskId: root.taskId,
+    role: 'executor', stage: 'execution', status: 'completed', reviewStatus: 'approved',
+    workUnitId: 'current', createdAt: '2026-09-28T10:02:00Z', input: 'New branch',
+  }
+  const branchReview = {
+    taskId: 'new-review', rootTaskId: root.taskId, parentTaskId: approved.taskId,
+    role: 'reviewer', stage: 'result_review', status: 'completed',
+    createdAt: '2026-09-28T10:03:00Z', submission: { verdict: 'approved', brief: 'Passed' },
+  }
+  const retiredIntake = {
+    taskId: 'old-intake', rootTaskId: root.taskId, parentTaskId: branchReview.taskId,
+    role: 'planner', stage: 'result_intake', status: 'completed', superseded: true,
+    createdAt: '2026-09-28T10:04:00Z',
+  }
+  const retiredFinalReview = {
+    taskId: 'old-final-review', rootTaskId: root.taskId, parentTaskId: retiredIntake.taskId,
+    role: 'reviewer', stage: 'final_review', status: 'completed',
+    createdAt: '2026-09-28T10:05:00Z', submission: { verdict: 'rejected', brief: 'Incomplete' },
+  }
+  const intake = {
+    taskId: 'new-intake', rootTaskId: root.taskId, parentTaskId: retiredFinalReview.taskId,
+    role: 'planner', stage: 'result_intake', status: 'running',
+    createdAt: '2026-09-28T10:06:00Z',
+  }
+  const tasks = [root, retired, approved, branchReview, retiredIntake, retiredFinalReview, intake]
+  const duringCorrection = buildWorkflowGraph(tasks)
+  assert.equal(duringCorrection.intakeTask?.taskId, intake.taskId)
+  assert.equal(duringCorrection.finalReviewTask, undefined)
+  assert.equal(duringCorrection.totalBranches, 1)
+  assert.equal(duringCorrection.completedBranches, 1)
+  assert.equal(duringCorrection.isFullyCompleted, false)
+
+  intake.status = 'completed'
+  intake.finalReviewStatus = 'approved'
+  intake.submission = { decision: 'complete', brief: 'All approved branches covered' }
+  const finalReview = {
+    taskId: 'new-final-review', rootTaskId: root.taskId, parentTaskId: intake.taskId,
+    role: 'reviewer', stage: 'final_review', status: 'completed',
+    createdAt: '2026-09-28T10:07:00Z', submission: { verdict: 'approved', brief: 'Complete' },
+  }
+  const complete = buildWorkflowGraph([...tasks, finalReview])
+  assert.equal(complete.branches.length, 2, 'Retired branch remains visible in history')
+  assert.equal(complete.finalReviewTask?.taskId, finalReview.taskId)
+  assert.equal(complete.isFullyCompleted, true)
+
+  intake.finalReviewHumanApproved = true
+  const humanApproved = buildWorkflowGraph(tasks)
+  assert.equal(humanApproved.finalReviewTask, undefined)
+  assert.equal(humanApproved.isFullyCompleted, true)
+})
