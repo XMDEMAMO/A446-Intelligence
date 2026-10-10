@@ -80,8 +80,8 @@ stale        本次刷新失败，仍保留最后一次可信成功值
 
 ## Reliable delivery
 
-- Hub 发送的 `task.assign`、`task.cancel`、`agent.pause`、`agent.resume` 需要 Worker 回 `ack`。
-- Worker 发送的 `task.started`、`task.result`、`task.error`、`task.rejected`、`approval.request` 需要 Hub 回 `ack`。
+- Hub 发送的 `task.assign`、`task.cancel`、`agent.pause`、`agent.resume`、`device.update.request` 需要 Worker 回 `ack`。
+- Worker 发送的 `task.started`、`task.result`、`task.error`、`task.rejected`、`approval.request`、`device.update.status` 需要 Hub 回 `ack`。
 - `ack.replyTo` 等于被确认消息的 `id`。
 - 未确认消息可在超时或重连后重复发送；接收方必须以消息 `id` 去重。
 - `worker.heartbeat` 和 `hub.welcome` 不要求确认。
@@ -223,6 +223,8 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - 执行 Agent 提交 `brief + fullResult`；发现上游错误时提交 `upstreamIssue`，不得静默篡改上游结论。
 - 审核 Agent 只审核完整成果或上游错误报告，返回结构化 verdict。
 - `approved` 后，规划 Agent 只收到执行简报、审核简报和成果引用。
+- 人工 `workflow.replan` 可以接管根 Planner 已完成但工作流尚未结案的停滞状态；旧计划中未获审核通过的子任务标记为 `superseded`，已通过独立审核的成果保留并以简报及成果引用进入新计划汇总。
+- 人工重新规划后，每条新分支仍先经独立 Reviewer 审核。Planner 汇总已审核简报并决定 `complete` 后，另建 `final_review` Reviewer 任务，独立核对最终简报对全部分支和验收条件的覆盖。最终 Reviewer 只收到已审核简报与成果引用，不收到分支完整成果；驳回时返回 Planner 修正汇总，缺少独立 Reviewer 时转人工介入。
 - `rejected` 后，原执行 Agent 获得纠错简报；超过最大次数才请求人工介入。
 - 规划任务不得生成会修改同一成果的重叠执行任务；一个成果始终只有一个执行负责人。
 - 群聊中的 `@` 用于人类观察和提醒，不直接改变任务状态。
@@ -240,6 +242,49 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 
 `task.started`、`task.rejected` 和 `approval.request` 也必须在 payload 中回传当前 `attemptId`。未协商 `attempt-lease-v1` 的旧版本地模式保持 v1 原有行为。
 
+## Device update bridge (v0.5 LAN)
+
+设备更新桥接把 GitHub Release 更新指令通过现有 Hub WebSocket 通道转发给指定设备，由设备上独立运行的 Updater 完成 check/download/verify/stage/切换/重启/健康检查/回滚。Hub 只做权限校验、路由与状态记录，不参与更新执行。完整状态机、安装布局与断电恢复见 `docs/UPDATER_PROTOCOL.md`。
+
+### 6.1 Hub -> Worker：`device.update.request`
+
+由 `POST /v1/commands` 提交（LAN 共享 token 即 admin）：
+
+```json
+{ "type": "device.update.request", "deviceId": "laptop-01", "version": "0.5.0-preview16", "jobId": "uuid-or-slug" }
+```
+
+Hub 行为：
+
+1. 校验 admin 角色、`deviceId`、`jobId`（必填，8-200 字符）。
+2. `jobId` 已存在 -> 返回既有任务（幂等，`duplicate: true`），不重新下发；重试必须使用新的 `jobId`（Worker 桥接与设备 Updater 对已知 jobId 都重放终态，重复下发不会重跑）。
+3. 同一 `deviceId` 已有活动更新任务 -> HTTP 409 `UPDATE_JOB_ALREADY_RUNNING`。
+4. 无该 deviceId 的在线 Agent -> HTTP 409 `DEVICE_OFFLINE`。
+5. 通过现有可靠投递（at-least-once，需 ack，按消息 id 去重）发送 envelope 给该设备任一在线 Agent。
+
+### 6.2 Worker -> Hub：`device.update.status`
+
+Worker 桥接收到 request 后：ack -> 以独立进程拉起本机 Updater（`update --job-id <id> [--version <v>]`）-> 轮询 Updater `state.json`，phase 变化即上报；Worker 自身被重启后，在启动时检查 Updater state，对未补报终态的 job 补发一次最终状态（在 Worker 自身状态中记录 `finalSent` 防重复）。
+
+```json
+{
+  "v": 1, "id": "...", "type": "device.update.status", "agentId": "...",
+  "payload": {
+    "jobId": "...", "deviceId": "...", "phase": "downloading",
+    "version": "0.5.0-preview16", "fromVersion": "0.5.0-preview15",
+    "error": null, "checkedAt": "ISO-8601"
+  }
+}
+```
+
+phase 取值：`checking|downloading|staged|applying|restarting|verifying|completed|failed|rolled_back`。该消息加入可靠投递集合（需 ack、按 id 去重）。
+
+### 6.3 Hub 侧状态
+
+- 内存注册表 `updateJobs: Map<jobId, job>`（Hub 重启后丢失非终态记录属 v1 已知限制；Worker 重连补报会按 upsert 重建）。
+- `GET /v1/update-jobs` 返回任务列表（Web 会话/admin）。
+- 每次请求与上报都写入审计事件 `device.update.requested` / `device.update.status`。
+
 ## Human intervention
 
 人工介入是独立持久记录，至少包含 `interventionId`、`rootTaskId`、`taskId`、`kind`、发起角色、发起阶段、`sessionScopeId`、最小上下文、允许动作和继续节点。记录初始状态为 `pending`，只能通过数据库条件更新转换一次为 `resolved`；重复或并发提交返回 HTTP `409`。
@@ -251,6 +296,7 @@ Hub 通过新建子任务实现 A → B。子任务沿用 `rootTaskId`，`parent
 - `GET /health`
 - `POST /v1/auth/login`、`POST /v1/auth/logout`、`GET /v1/auth/me`
 - `GET /v1/agents`
+- `GET /v1/update-jobs`
 - `GET /v1/events?limit=N`
 - `GET /v1/tasks?rootTaskId=UUID`
 - `GET /v1/attempts?taskId=UUID`
@@ -298,4 +344,4 @@ Worker 管理沿用现有路径。同一 `agentId` 最多存在一个 active 凭
 
 现有客户端可以继续只读取 `error`。`details` 不得包含密码、Token、Session Secret、CSRF Secret 或其他敏感值。完整字段、查询摘要规则、冻结错误码和跨账号所有权见 `docs/V0.5_SHARED_CONTRACT.md`。
 
-开发 Hub 使用 Memory Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。
+开发 Hub 默认使用 Memory Store；私人 LAN 包可显式使用单进程 JSON 文件 Store 和协调设备本地 Artifact Store；`apps/server-hub` 使用 PostgreSQL。新增 Artifact 字段位于 v1 payload 内，未启用 `artifact-transfer-v1` 的本地模式保持旧行为。共享 Token 的 LAN Artifact HTTP 请求还携带 `x-a446-agent-id`，但 Hub 仍必须依据当前任务与 Attempt 的所有权校验，不能只相信该请求头。

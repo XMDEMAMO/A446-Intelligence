@@ -36,12 +36,19 @@ if (args.config) {
     ].filter(Boolean).join("; "),
   });
   for (const tool of observed.tools) {
-    results.push({ check: `capability ${tool.name}`, ok: tool.available, detail: tool.version ?? tool.error ?? "unknown" });
+    results.push({
+      check: `capability ${tool.name}`,
+      ok: true,
+      status: tool.available ? "PASS" : "WARN",
+      detail: tool.available ? (tool.version ?? "available") : `not detected (optional: tasks requiring ${tool.name} will not be scheduled here)`,
+    });
   }
   results.push({
     check: "quota telemetry",
     ok: true,
-    detail: "Unknown before execution; runtime reports Healthy/Low/Exhausted from trusted outcomes",
+    detail: config.quotaProbe?.command
+      ? `trusted runtime probe configured (${config.quotaProbe.source ?? "official-client"}); Unknown remains the failure fallback`
+      : "no trusted snapshot probe configured; runtime outcomes report Healthy/Low/Exhausted with Unknown fallback",
   });
 }
 
@@ -52,7 +59,8 @@ if (args.codex) {
 }
 
 for (const result of results) {
-  console.log(`${result.ok ? "PASS" : "FAIL"}  ${result.check}: ${result.detail}`);
+  const badge = result.status ?? (result.ok ? "PASS" : "FAIL");
+  console.log(`${badge.padEnd(4, " ")}  ${result.check}: ${result.detail}`);
 }
 process.exitCode = results.some((result) => !result.ok) ? 1 : 0;
 

@@ -37,7 +37,11 @@ export interface TokenUsage {
 }
 
 export interface QuotaWindow {
+  id?: string
   name: string
+  quotaGroup?: string
+  windowType?: string
+  durationMinutes?: number | null
   usedPercent: number | null
   remainingPercent: number | null
   resetsAt: string | null
@@ -58,15 +62,20 @@ export interface AccountProfile {
   provider?: string
   plan?: string
   label?: string
+  maxConcurrency?: number
 }
 
 export interface ModelProfile {
   id: string | null
   label?: string
+  family?: string
+  quotaGroup?: string
   enabled?: boolean
   capabilities?: string[]
   reasoningEfforts?: string[]
+  defaultReasoningEffort?: string | null
   quota?: QuotaSnapshot | null
+  quotaState?: QuotaState
   availability?: ResourceState
   source?: string
   checkedAt?: string
@@ -126,6 +135,17 @@ export interface ResourceSnapshot {
   stale: boolean
   errorSummary?: string | null
   capabilities?: ObservedCapabilities
+  account?: {
+    state: ResourceState
+    source: string
+    checkedAt: string
+    lastSuccessAt?: string | null
+    stale?: boolean
+    errorSummary?: string | null
+    profile?: AccountProfile | null
+    authMode?: string | null
+    identityVerified?: boolean | null
+  }
   models?: {
     state: ResourceState
     source: string
@@ -198,6 +218,8 @@ export interface RoleSubmission {
   needsHuman?: boolean
   humanQuestion?: string | null
   upstreamIssue?: Record<string, unknown> | null
+  decision?: 'complete' | 'replan' | 'continue' | string
+  approvedResults?: unknown[] | number
 }
 
 export interface HumanIntervention {
@@ -232,26 +254,75 @@ export interface HubTask {
   sourceAgentId?: string
   input: string
   role?: AgentRole | null
-  stage?: string
   route?: string[]
   metadata?: Record<string, unknown>
+  sessionScopeId?: string | null
+  taskSpec?: TaskSpec | null
+  contextBundle?: Record<string, unknown>
+  execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
+  model?: string | null
+  reasoningEffort?: string | null
+  usage?: TokenUsage | null
+  usageTotals?: TokenUsage | null
+  submission?: RoleSubmission
+  logicalBranchId?: string | null
+  replacesWorkUnitId?: string | null
+  supersedesTaskId?: string | null
+  workUnitId?: string | null
+  plannerBatchId?: string | null
+  revision?: number | null
+  superseded?: boolean | null
+  supersededBy?: string | null
+  reviewTaskId?: string | null
+  reviewBrief?: string | null
+  reviewStatus?: string
+  reviewCycle?: number
+  requiresApproval?: boolean
+  stage?: string
+  finalReviewStatus?: string | null
+  finalReviewHumanApproved?: boolean
+  finalReviewBrief?: string | null
+  finalReviewTaskId?: string | null
+  finalHumanReviewStatus?: string | null
+  humanReviewRequired?: boolean
+  humanReviewStatus?: string | null
+  dispatchHold?: string | null
+  pausedFromStatus?: string | null
+  planRevision?: number
   workflow?: {
     enabled?: boolean
     plannerAgentId?: string | null
     executorAgentId?: string | null
     reviewerAgentId?: string | null
     maxReviewCycles?: number
-  } | null
-  sessionScopeId?: string | null
-  taskSpec?: TaskSpec | null
-  contextBundle?: Record<string, unknown>
-  execution?: { model?: string | null; reasoningEffort?: string | null; reason?: string }
-  model?: string | null
-  usage?: TokenUsage | null
-  submission?: RoleSubmission
-  reviewStatus?: string
-  reviewCycle?: number
-  requiresApproval?: boolean
+    fastPath?: boolean
+    finalReviewRequired?: boolean
+    plannerModelPreference?: string | null
+    plannerReasoningEffort?: string | null
+    reviewerModelPreference?: string | null
+    reviewerReasoningEffort?: string | null
+    intakeModelPreference?: string | null
+    intakeReasoningEffort?: string | null
+    stageModels?: Record<string, StageModelPolicy> | null
+    paused?: boolean
+    pausedAt?: string | null
+    pausedBy?: string | null
+    pauseReason?: string | null
+    planningHold?: boolean
+    planChangeRequestedAt?: string | null
+    planChangeRequestedBy?: string | null
+    planChangeInstructions?: string | null
+    finalHumanReviewRequired?: boolean
+    finalHumanReviewRecommended?: boolean
+    planRevision?: number
+    branchControls?: Record<string, {
+      paused?: boolean
+      pausedAt?: string | null
+      pausedBy?: string | null
+      reason?: string | null
+      humanReviewRequired?: boolean
+    }>
+  }
   status: string
   schedulingError?: string | null
   schedulingErrorCode?:
@@ -273,10 +344,107 @@ export interface HubTask {
   dispatchedAt?: string
   startedAt?: string
   completedAt?: string
+  workflowCompletedAt?: string
   output?: string
   error?: { name?: string; message?: string; code?: string; reasons?: string[] }
   artifacts?: ArtifactManifest
   humanIntervention?: HumanIntervention | null
+}
+
+export interface AgentDisplayInfo {
+  name: string
+  rawId: string
+  device: string
+  engine: string
+  roleLabel: string
+}
+
+export interface ModelDisplayInfo {
+  modelLabel: string
+  effortLabel: string | null
+  isHighCost: boolean
+  fullLabel: string
+}
+
+export interface WorkflowNodeStep {
+  task: HubTask
+  isSuperseded: boolean
+  displayAgent: AgentDisplayInfo
+  displayModel: ModelDisplayInfo
+  reviewerTask?: HubTask
+  reviewerDisplayAgent?: AgentDisplayInfo
+  reviewerDisplayModel?: ModelDisplayInfo
+}
+
+export interface WorkflowBranch {
+  workUnitId: string
+  title: string
+  steps: WorkflowNodeStep[]
+  latestStep: WorkflowNodeStep
+  isApproved: boolean
+  isRejected: boolean
+  isPending: boolean
+  isSuperseded: boolean
+  hasRevisions: boolean
+  isBranchPaused: boolean
+  humanReviewRequired: boolean
+  humanReviewStatus: 'not_required' | 'pending' | 'approved' | 'rejected' | null
+}
+
+export interface WorkflowGraph {
+  planningTask?: HubTask
+  planningDisplayAgent?: AgentDisplayInfo
+  planningDisplayModel?: ModelDisplayInfo
+  branches: WorkflowBranch[]
+  intakeTask?: HubTask
+  intakeDisplayAgent?: AgentDisplayInfo
+  intakeDisplayModel?: ModelDisplayInfo
+  finalReviewTask?: HubTask
+  finalReviewDisplayAgent?: AgentDisplayInfo
+  finalReviewDisplayModel?: ModelDisplayInfo
+  finalReviewStatus?: string | null
+  finalHumanReviewStatus?: string | null
+  finalHumanReviewRequired?: boolean
+  isWorkflowPaused: boolean
+  planningHold: boolean
+  planRevision: number
+  approvedResultCount: number
+  totalBranches: number
+  completedBranches: number
+  hasRejections: boolean
+  hasUnresolvedIssues: boolean
+  isConverged: boolean
+  isFullyCompleted: boolean
+  allTasks: HubTask[]
+}
+
+export interface WorkflowIssue {
+  issueId: string
+  taskId: string
+  taskTitle: string
+  role: string
+  agentName: string
+  affectedBranch: string
+  kind: 'rejection' | 'error' | 'scheduling'
+  whatHappened: string
+  actionTaken: string
+  isResolved: boolean
+  finalOutcome: string
+  details?: string[]
+}
+
+export interface WorkflowSummary {
+  title: string
+  statusText: string
+  statusTone: 'active' | 'success' | 'warning' | 'error' | 'neutral'
+  stageText: string
+  parallelCount: number
+  completedStepCount: number
+  totalStepCount: number
+  startTime?: string
+  durationOrCompletionTime?: string
+  needsHuman: boolean
+  rawStatus: string
 }
 
 export interface MessageAttachment {
@@ -306,7 +474,7 @@ export interface HubMessage {
 export interface Conversation {
   rootTaskId: string
   title: string
-  status: 'active' | 'completed' | 'failed' | 'needs_human' | 'cancelled' | string
+  status: 'active' | 'completed' | 'failed' | 'needs_human' | 'cancelled' | 'stalled' | string
   createdAt: string
   updatedAt: string
   participants: string[]
@@ -361,6 +529,20 @@ export interface ConversationDetail {
   interventions: HumanIntervention[]
 }
 
+export interface UploadedAttachment {
+  artifactId: string
+  path: string
+  size: number
+  sha256: string
+  originalName?: string
+  downloadUrl?: string
+}
+
+export interface StageModelPolicy {
+  modelPreference?: string | null
+  reasoningEffort?: string | null
+}
+
 export interface CreateWorkflowRequest {
   title: string
   objective: string
@@ -371,4 +553,17 @@ export interface CreateWorkflowRequest {
   modelPreference?: string | null
   reasoningEffort?: string | null
   maxReviewCycles: number
+  attachments?: UploadedAttachment[]
+  plannerModelPreference?: string | null
+  plannerReasoningEffort?: string | null
+  reviewerModelPreference?: string | null
+  reviewerReasoningEffort?: string | null
+  intakeModelPreference?: string | null
+  intakeReasoningEffort?: string | null
+  stageModels?: {
+    planner?: StageModelPolicy
+    reviewer?: StageModelPolicy
+    intake?: StageModelPolicy
+  } | null
+  fastPath?: boolean
 }

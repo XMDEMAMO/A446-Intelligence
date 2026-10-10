@@ -11,10 +11,11 @@ import { AntigravityAdapter } from "./adapters/antigravity.mjs";
 import { buildArtifactManifest } from "./artifact-manifest.mjs";
 import { ArtifactClient } from "./artifact-client.mjs";
 import { CheckpointStore } from "./checkpoint-store.mjs";
-import { initialExecutorStatus, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
+import { initialExecutorStatus, probeConfiguredAccount, probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities, statusAfterError, statusAfterSuccess } from "./capability-probe.mjs";
 import { evaluateTaskPolicy, normalizePolicy, PolicyDeniedError, resolveAllowedPath } from "./local-policy.mjs";
-import { addUsage, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
+import { addUsage, bindModelQuotas, buildRolePrompt, normalizeModels, normalizeQuotaSnapshot, normalizeRoles, normalizeUsage, parseRoleSubmission } from "./collaboration.mjs";
 import { probeQuota } from "./quota-probe.mjs";
+import { WorkerUpdateBridge } from "./worker-update-bridge.mjs";
 
 export class AgentWorker {
   constructor(config) {
@@ -43,6 +44,7 @@ export class AgentWorker {
       usageTotals: null,
       sessions: {},
       observedCapabilities: null,
+      accountSnapshot: null,
       modelSnapshot: null,
       quotaSnapshot: null,
       resourceSnapshot: null,
@@ -56,6 +58,8 @@ export class AgentWorker {
       maxOutputChars: config.checkpoints?.maxOutputChars ?? 200_000,
     });
     this.observedCapabilities = null;
+    this.accountSnapshot = null;
+    this.accountProfile = config.account ?? null;
     this.modelSnapshot = null;
     this.models = normalizeModels(config.models, config.adapter);
     this.dynamicCapabilities = config.capabilities ?? ["task.execute", "pause", "resume", "cancel"];
@@ -71,6 +75,7 @@ export class AgentWorker {
       agentId: this.agentId,
       workspace: config.workspace,
     });
+    this.updateBridge = new WorkerUpdateBridge(this);
   }
 
   async start() {
@@ -81,6 +86,8 @@ export class AgentWorker {
     await this.loadState();
     await this.adapter.start(this.state);
     this.observedCapabilities = this.state.observedCapabilities ?? this.observedCapabilities;
+    this.accountSnapshot = this.state.accountSnapshot ?? this.accountSnapshot;
+    this.accountProfile = this.accountSnapshot?.profile ?? this.accountProfile;
     this.modelSnapshot = this.state.modelSnapshot ?? this.modelSnapshot;
     this.quotaSnapshot = normalizeQuotaSnapshot(this.state.quotaSnapshot) ?? this.quotaSnapshot;
     this.resourceSnapshot = this.state.resourceSnapshot ?? this.resourceSnapshot;
@@ -91,6 +98,11 @@ export class AgentWorker {
       : detected;
     await this.saveState();
     for (const task of Object.values(this.state.pendingTasks)) this.enqueue(task);
+    // The worker may have been restarted by an updater apply step; report any
+    // terminal update status that was written to state.json while offline.
+    void this.updateBridge.reportPendingFinalStatuses().catch((error) => {
+      console.error(`[${this.agentId}] update status recovery error: ${error.message}`);
+    });
     void this.connectLoop();
     return this;
   }
@@ -108,6 +120,8 @@ export class AgentWorker {
 
   async refreshQuota() {
     if (!this.config.quotaProbe?.command) {
+      this.models = bindModelQuotas(this.models, this.quotaSnapshot);
+      if (this.modelSnapshot) this.modelSnapshot = { ...this.modelSnapshot, items: this.models };
       this.state.quotaSnapshot = this.quotaSnapshot;
       return this.quotaSnapshot;
     }
@@ -129,6 +143,8 @@ export class AgentWorker {
         errorSummary: message,
       });
     }
+    this.models = bindModelQuotas(this.models, this.quotaSnapshot);
+    if (this.modelSnapshot) this.modelSnapshot = { ...this.modelSnapshot, items: this.models };
     this.state.quotaSnapshot = this.quotaSnapshot;
     if (this.resourceSnapshot) this.updateResourceSnapshot();
     return this.quotaSnapshot;
@@ -138,12 +154,15 @@ export class AgentWorker {
     if (this.resourceRefresh) return this.resourceRefresh;
     this.resourceRefresh = (async () => {
       this.observedCapabilities = probeLocalCapabilities(this.config, this.observedCapabilities);
+      this.accountSnapshot = await probeConfiguredAccount(this.config, this.accountSnapshot, { workspace: this.config.workspace });
+      this.accountProfile = this.accountSnapshot.profile ?? this.accountProfile;
       this.modelSnapshot = await probeConfiguredModels(this.config, this.modelSnapshot, { workspace: this.config.workspace });
       this.models = this.modelSnapshot.items;
       await this.refreshQuota();
       this.dynamicCapabilities = schedulingCapabilities(this.config, this.observedCapabilities);
       this.updateResourceSnapshot();
       this.state.observedCapabilities = this.observedCapabilities;
+      this.state.accountSnapshot = this.accountSnapshot;
       this.state.modelSnapshot = this.modelSnapshot;
       this.state.quotaSnapshot = this.quotaSnapshot;
       return this.resourceSnapshot;
@@ -156,7 +175,7 @@ export class AgentWorker {
   }
 
   updateResourceSnapshot() {
-    const sections = [this.observedCapabilities, this.modelSnapshot, this.quotaSnapshot];
+    const sections = [this.observedCapabilities, this.accountSnapshot, this.modelSnapshot, this.quotaSnapshot];
     const stale = sections.some((section) => section?.stale);
     const unavailable = [this.observedCapabilities?.state, this.modelSnapshot?.state].includes("unavailable");
     this.resourceSnapshot = {
@@ -166,6 +185,7 @@ export class AgentWorker {
       stale,
       errorSummary: sections.map((section) => section?.errorSummary).filter(Boolean).join("; ").slice(0, 500) || null,
       capabilities: this.observedCapabilities,
+      account: this.accountSnapshot,
       models: this.modelSnapshot,
       quota: this.quotaSnapshot,
     };
@@ -186,9 +206,15 @@ export class AgentWorker {
         usageTotals: saved.usageTotals ?? null,
         sessions: saved.sessions ?? {},
         observedCapabilities: saved.observedCapabilities ?? null,
+        accountSnapshot: saved.accountSnapshot ?? null,
         modelSnapshot: saved.modelSnapshot ?? null,
         quotaSnapshot: saved.quotaSnapshot ?? null,
         resourceSnapshot: saved.resourceSnapshot ?? null,
+        // Device update bridge records must survive a worker restart: after an
+        // update the worker is stopped and restarted, and only this persisted
+        // map lets reportPendingFinalStatuses() rebuild and re-report the
+        // terminal state of jobs whose reporting was interrupted.
+        updateJobs: saved.updateJobs ?? {},
       };
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
@@ -290,6 +316,7 @@ export class AgentWorker {
         usageTotals: this.state.usageTotals,
         quotaSnapshot: this.quotaSnapshot,
         quotaProbeError: this.quotaProbeError,
+        account: this.accountProfile,
       },
     }));
     beat();
@@ -344,6 +371,22 @@ export class AgentWorker {
         await this.removeQueuedTask(message.taskId, attemptId);
         if (this.current?.taskId === message.taskId && (!attemptId || this.current.payload?.attemptId === attemptId)) this.currentAbort?.abort();
         this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
+        return;
+      }
+      if (message.type === "device.update.request") {
+        // The ack must mean "reliably accepted": admit() synchronously claims
+        // the single update slot before any await. A rejected request stays
+        // unacked (the hub redelivers once) while the bridge reports a
+        // terminal `failed` status, after which the redelivery is replayed
+        // and acked. The update then runs in a detached updater process that
+        // survives this worker being restarted.
+        if (this.updateBridge.admit(message)) {
+          this.send(makeEnvelope("ack", { agentId: this.agentId, replyTo: message.id }));
+        }
+        void this.updateBridge.handleRequest(message).catch((error) => {
+          console.error(`[${this.agentId}] update bridge error: ${error.message}`);
+        });
+        return;
       }
     } catch (error) {
       console.error(`[${this.agentId}] message error: ${error.message}`);
@@ -479,7 +522,7 @@ export class AgentWorker {
       const usage = normalizeUsage(result.usage);
       if (usage) this.state.usageTotals = addUsage(this.state.usageTotals, usage);
       await this.refreshQuota();
-      const submission = parseRoleSubmission(role, result.output);
+      const submission = parseRoleSubmission(role, result.output, message.payload?.stage ?? null);
       const checkpoint = await this.checkpoints.save(message, "COMPLETED", {
         sessionId: this.state.sessionId,
         output: result.output,
@@ -545,11 +588,12 @@ export class AgentWorker {
   agentProfile() {
     return {
       deviceId: this.config.deviceId ?? this.agentId,
-      account: this.config.account && typeof this.config.account === "object" ? {
-        id: this.config.account.id ? String(this.config.account.id) : undefined,
-        provider: this.config.account.provider ? String(this.config.account.provider) : undefined,
-        plan: this.config.account.plan ? String(this.config.account.plan) : undefined,
-        label: this.config.account.label ? String(this.config.account.label) : undefined,
+      account: this.accountProfile && typeof this.accountProfile === "object" ? {
+        id: this.accountProfile.id ? String(this.accountProfile.id) : undefined,
+        provider: this.accountProfile.provider ? String(this.accountProfile.provider) : undefined,
+        plan: this.accountProfile.plan ? String(this.accountProfile.plan) : undefined,
+        label: this.accountProfile.label ? String(this.accountProfile.label) : undefined,
+        maxConcurrency: Number.isFinite(Number(this.accountProfile.maxConcurrency)) ? Math.max(1, Number(this.accountProfile.maxConcurrency)) : 1,
       } : null,
       roles: normalizeRoles(this.config.roles ?? this.config.role),
       models: this.models,

@@ -127,7 +127,7 @@ async function startWorkflowFixture(disconnectRole) {
           }],
           needsHuman: false,
         },
-        planner: { brief: "reviewed result received", assignments: [], needsHuman: false },
+        planner: { decision: "complete", brief: "reviewed result received", assignments: [], needsHuman: false },
       },
     },
     {

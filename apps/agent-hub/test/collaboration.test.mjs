@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
-import { addUsage, buildRolePrompt, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
+import { addUsage, bindModelQuotas, buildRolePrompt, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
 import { delay } from "../src/common.mjs";
 
 test("usage normalization and scheduler keep account, role, model, and quota separate", () => {
@@ -75,6 +75,10 @@ test("a named executor is a hard scheduling constraint with stable failure codes
   executor.activeTaskCount = 1;
   assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_AT_CAPACITY");
   executor.activeTaskCount = 0;
+  executor.accountActiveTaskCount = 1;
+  executor.accountMaxConcurrency = 1;
+  assert.throws(() => chooseAgent(agents, request), (error) => error.code === "ACCOUNT_AT_CAPACITY");
+  executor.accountActiveTaskCount = 0;
   executor.quotaSnapshot = { state: "Exhausted" };
   assert.throws(() => chooseAgent(agents, request), (error) => error.code === "EXECUTOR_QUOTA_UNAVAILABLE");
   executor.quotaSnapshot = { state: "Unknown" };
@@ -97,6 +101,69 @@ test("a queued named executor reports an unsupported lease protocol without drif
   assert.equal(task.schedulingErrorDetails.reason, "lease_protocol_unsupported");
 });
 
+test("Antigravity model families use only their own quota pool", () => {
+  const quotaSnapshot = {
+    state: "Exhausted",
+    source: "antigravity-cli-usage",
+    checkedAt: "2026-09-19T00:00:00.000Z",
+    windows: [
+      { name: "Gemini Models 5h", quotaGroup: "Gemini Models", windowType: "5h", durationMinutes: 300, remainingPercent: 100 },
+      { name: "Gemini Models weekly", quotaGroup: "Gemini Models", windowType: "7d", durationMinutes: 10_080, remainingPercent: 80 },
+      { name: "Claude and GPT models 5h", quotaGroup: "Claude and GPT models", windowType: "5h", durationMinutes: 300, remainingPercent: 0 },
+      { name: "Claude and GPT models weekly", quotaGroup: "Claude and GPT models", windowType: "7d", durationMinutes: 10_080, remainingPercent: 30 },
+    ],
+  };
+  const models = bindModelQuotas([
+    { id: "gemini-3.8-flash-high", family: "gemini", quotaGroup: "Gemini Models" },
+    { id: "claude-sonnet-4-6", family: "claude", quotaGroup: "Claude and GPT models" },
+  ], quotaSnapshot);
+  assert.equal(models[0].quota.state, "Healthy");
+  assert.equal(models[0].quota.windows.length, 2);
+  assert.equal(models[1].quota.state, "Exhausted");
+
+  const antigravity = {
+    agentId: "antigravity",
+    status: "online",
+    paused: false,
+    roles: ["executor"],
+    models,
+    quotaSnapshot,
+    executors: [{ health: "Healthy" }],
+  };
+  const agents = new Map([[antigravity.agentId, antigravity]]);
+  assert.equal(chooseAgent(agents, { role: "executor" }).model.id, "gemini-3.8-flash-high");
+  assert.throws(
+    () => chooseAgent(agents, { targetAgentId: "antigravity", role: "executor", modelPreference: "claude-sonnet-4-6" }),
+    (error) => error.code === "EXECUTOR_QUOTA_UNAVAILABLE",
+  );
+
+  const hub = new AgentHub({ logs: { includePayloads: false } });
+  hub.agents = agents;
+  const catalog = hub.schedulerCatalog();
+  assert.equal(catalog[0].models[0].quotaGroup, "Gemini Models");
+  assert.equal(catalog[0].models[0].quotaState, "Healthy");
+  assert.equal(catalog[0].models[1].quotaGroup, "Claude and GPT models");
+  assert.equal(catalog[0].models[1].quotaState, "Exhausted");
+  assert.equal(catalog[0].quota.windows[0].durationMinutes, 300);
+});
+
+test("two Agent identities sharing one login are serialized at account level", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: false } });
+  const first = agent("account-agent-a", "executor");
+  const second = agent("account-agent-b", "executor");
+  first.account = { id: "shared", provider: "openai", maxConcurrency: 1 };
+  second.account = { id: "shared", provider: "openai", maxConcurrency: 1 };
+  hub.agents = new Map([[first.agentId, first], [second.agentId, second]]);
+  const active = hub.createTask({ input: "already running", targetAgentId: first.agentId, role: "executor" });
+  active.status = "running";
+  active.activeSlotAgentId = first.agentId;
+  const queued = hub.createTask({ input: "must wait", targetAgentId: second.agentId, role: "executor" });
+  await hub.queueOrDispatch(queued);
+  assert.equal(queued.status, "queued");
+  assert.equal(queued.schedulingErrorCode, "ACCOUNT_AT_CAPACITY");
+  assert.equal(queued.schedulingErrorDetails.reason, "account_at_capacity");
+});
+
 test("workflow creation binds an explicit executor and revisions keep its session", async () => {
   const hub = new AgentHub({ logs: { includePayloads: false } });
   hub.agents = new Map([
@@ -117,11 +184,13 @@ test("workflow creation binds an explicit executor and revisions keep its sessio
   hub.agents.get("chosen").paused = false;
   const root = await hub.createWorkflow({ objective: "work", plannerAgentId: "planner", executorAgentId: "chosen" });
   assert.equal(root.workflow.executorAgentId, "chosen");
-  root.submission = { brief: "plan", assignments: [{ title: "part", instructions: "do work", targetAgentId: "other" }] };
+  assert.ok(root.contextBundle.schedulerCatalog.some((entry) => entry.agentId === "chosen"));
+  root.submission = { brief: "plan", assignments: [{ title: "part", instructions: "do work", targetAgentId: "other", reasoningEffort: "high" }] };
   await hub.advanceWorkflow(root);
   const execution = [...hub.tasks.values()].find((task) => task.role === "executor");
   assert.equal(execution.requestedAgentId, "chosen");
   assert.equal(execution.targetAgentId, "chosen");
+  assert.equal(execution.reasoningEffort, "high");
   assert.equal(execution.sessionScopeId, execution.taskId);
   assert.ok(hub.log.recent(100).some((event) => event.type === "workflow.executor_override"));
   const review = hub.createTask({
@@ -136,8 +205,9 @@ test("workflow creation binds an explicit executor and revisions keep its sessio
   assert.equal(revisedTask.sessionScopeId, execution.sessionScopeId);
 });
 
-test("role output parser defaults an unstructured review to rejection", () => {
-  assert.equal(parseRoleSubmission("reviewer", "looks okay").verdict, "rejected");
+test("role output parser rejects unstructured review and accepts structured executor", () => {
+  assert.equal(parseRoleSubmission("reviewer", "looks okay").ok, false);
+  assert.equal(parseRoleSubmission("executor", '{"brief":"done","fullResult":"complete"}').ok, true);
   assert.equal(parseRoleSubmission("executor", '{"brief":"done","fullResult":"complete"}').fullResult, "complete");
 });
 
@@ -204,6 +274,61 @@ test("a repeatedly denied upstream-error claim stops for human intervention", as
   assert.equal([...hub.tasks.values()].some((task) => task.stage === "revision"), false);
 });
 
+test("workflow creation accepts initial attachments and propagates them to executor subtasks", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-01", agent("planner-01", "planner"));
+  hub.agents.set("executor-01", agent("executor-01", "executor"));
+
+  const artifactId = "11111111-2222-3333-4444-555555555555";
+  hub.artifacts.set(artifactId, {
+    artifactId,
+    path: "spec.pdf",
+    originalName: "spec.pdf",
+    size: 2048,
+    sha256: "a".repeat(64),
+    status: "ready",
+  });
+
+  const task = await hub.createWorkflow({
+    title: "Task with attachment",
+    objective: "Analyze spec.pdf",
+    plannerAgentId: "planner-01",
+    executorAgentId: "executor-01",
+    attachments: [artifactId],
+  });
+
+  assert.equal(task.artifacts.files.length, 1);
+  assert.equal(task.artifacts.files[0].artifactId, artifactId);
+  assert.equal(task.taskSpec.inputs.length, 1);
+  assert.equal(task.taskSpec.inputs[0].path, "spec.pdf");
+  assert.equal(task.contextBundle.artifactReferences.length, 1);
+  assert.equal(task.contextBundle.artifactReferences[0].artifactId, artifactId);
+
+  const initialMessage = hub.messages.find((msg) => msg.rootTaskId === task.rootTaskId && msg.attachments?.length);
+  assert.ok(initialMessage);
+  assert.equal(initialMessage.attachments[0].type, "artifacts");
+  assert.equal(initialMessage.attachments[0].artifacts.files[0].path, "spec.pdf");
+
+  task.submission = {
+    brief: "Planned the execution",
+    assignments: [
+      {
+        title: "Execute spec analysis",
+        targetAgentId: "executor-01",
+        instructions: "Read spec.pdf and report",
+      },
+    ],
+  };
+  await hub.advanceWorkflow(task);
+
+  const executorTask = [...hub.tasks.values()].find((t) => t.role === "executor" && t.parentTaskId === task.taskId);
+  assert.ok(executorTask);
+  assert.equal(executorTask.taskSpec.inputs.length, 1);
+  assert.equal(executorTask.taskSpec.inputs[0].path, "spec.pdf");
+  assert.equal(executorTask.contextBundle.artifactReferences.length, 1);
+  assert.equal(executorTask.contextBundle.artifactReferences[0].artifactId, artifactId);
+});
+
 test("planner, executor, and reviewer form one minimal-context task conversation", { timeout: 15000 }, async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "agent-collaboration-test-"));
   const hub = new AgentHub({
@@ -223,7 +348,7 @@ test("planner, executor, and reviewer form one minimal-context task conversation
         models: [{ id: "plan-model", capabilities: ["reasoning"], quota: { state: "Healthy" } }],
         roleOutputs: {
           "planner:planning": { brief: "split once", assignments: [{ title: "draft", instructions: "produce result", acceptance: ["complete"], targetAgentId: "unavailable-executor" }], needsHuman: false },
-          planner: { brief: "accepted result", assignments: [], needsHuman: false },
+          planner: { decision: "complete", brief: "accepted result", assignments: [], needsHuman: false },
         },
       },
       {
@@ -285,9 +410,9 @@ test("planner, executor, and reviewer form one minimal-context task conversation
     assert.deepEqual(hub.messages.filter((message) => message.kind === "task_instruction").map((message) => message.senderRole), ["human", "planner", "executor", "reviewer"]);
     assert.equal(hub.conversations()[0].messageCount, hub.messages.length);
     assert.equal(hub.usageTotals.totalTokens, 40);
-    assert.deepEqual(Object.keys(workers[0].state.sessions), [rootId]);
+    assert.deepEqual(Object.keys(workers[0].state.sessions).sort(), [rootId, `${rootId}:intake`].sort());
     assert.deepEqual(Object.keys(workers[1].state.sessions), [tasks.find((task) => task.role === "executor").sessionScopeId]);
-    assert.equal(tasks.find((task) => task.stage === "result_intake").sessionScopeId, rootId);
+    assert.equal(tasks.find((task) => task.stage === "result_intake").sessionScopeId, `${rootId}:intake`);
   } finally {
     await Promise.all(workers.map((worker) => worker.stop()));
     await hub.stop();

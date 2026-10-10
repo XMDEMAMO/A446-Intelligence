@@ -22,6 +22,8 @@
         "approval.request",
         "agent.pause",
         "agent.resume",
+        "device.update.request",
+        "device.update.status",
         "ack"
       ]
     },

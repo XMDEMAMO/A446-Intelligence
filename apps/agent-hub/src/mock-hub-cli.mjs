@@ -2,6 +2,8 @@
 import path from "node:path";
 import { AgentHub } from "./hub.mjs";
 import { loadJsonConfig, parseArgs, resolveFrom } from "./common.mjs";
+import { JsonFileHubStore } from "./hub-store.mjs";
+import { LocalArtifactStore } from "./local-artifact-store.mjs";
 
 const args = parseArgs(process.argv.slice(2));
 if (!args.config) {
@@ -15,8 +17,19 @@ if (config.logs?.file) config.logs.file = resolveFrom(loaded.dir, config.logs.fi
 if (config.tls?.keyFile) config.tls.keyFile = resolveFrom(loaded.dir, config.tls.keyFile);
 if (config.tls?.certFile) config.tls.certFile = resolveFrom(loaded.dir, config.tls.certFile);
 
-const hub = await new AgentHub(config).start();
-console.log(`Mock Hub listening at ${hub.url()} (worker endpoint: ${hub.url().replace(/^http/, "ws")}/worker)`);
+const services = {};
+if (config.storage?.driver === "json-file") {
+  services.store = new JsonFileHubStore(resolveFrom(loaded.dir, config.storage.file ?? "../var/hub-state.json"));
+}
+if (config.artifacts?.rootDirectory) {
+  services.artifactStore = new LocalArtifactStore({
+    rootDirectory: resolveFrom(loaded.dir, config.artifacts.rootDirectory),
+    maxFileBytes: config.artifacts.maxFileBytes,
+  });
+}
+
+const hub = await new AgentHub(config, services).start();
+console.log(`Local Hub listening at ${hub.url()} (worker endpoint: ${hub.url().replace(/^http/, "ws")}/worker)`);
 
 let stopping = false;
 async function stop(signal) {
