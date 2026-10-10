@@ -105,8 +105,7 @@ export function chooseAgent(agents, request = {}) {
     }
     if (selected.quotaSnapshot?.state === "Exhausted") throw schedulingError("EXECUTOR_QUOTA_UNAVAILABLE", `Agent ${request.targetAgentId} account quota is exhausted`, "quota_exhausted", request.targetAgentId);
     const required = Array.isArray(request.requiredCapabilities) ? request.requiredCapabilities.map(String) : [];
-    const agentCapabilities = new Set(selected.capabilities ?? []);
-    if (!required.every((item) => agentCapabilities.has(item) || selected.models?.some((model) => model.capabilities?.includes(item)))) {
+    if (!required.every((item) => supportsAgentCapability(selected, item))) {
       throw schedulingError("EXECUTOR_UNAVAILABLE", `Agent ${request.targetAgentId} does not satisfy required capabilities`, "capability_mismatch", request.targetAgentId);
     }
     let model;
@@ -130,8 +129,7 @@ export function chooseAgent(agents, request = {}) {
     if (Number(agent.activeTaskCount ?? 0) >= Number(agent.maxConcurrency ?? 1)) return false;
     if (agent.quotaSnapshot?.state === "Exhausted") return false;
     if (role && (request.requireDeclaredRole ? !agent.roles?.includes(role) : agent.roles?.length && !agent.roles.includes(role))) return false;
-    const capabilities = new Set(agent.capabilities ?? []);
-    if (!required.every((item) => capabilities.has(item) || agent.models?.some((model) => model.capabilities?.includes(item)))) return false;
+    if (!required.every((item) => supportsAgentCapability(agent, item))) return false;
     return Boolean(chooseModel(agent, request, false));
   });
   if (!candidates.length) throw schedulingError("NO_ELIGIBLE_AGENT", `No online agent matches role ${role ?? "any"}`, "no_candidate");
@@ -140,10 +138,26 @@ export function chooseAgent(agents, request = {}) {
   return { agent, model: chooseModel(agent, request) };
 }
 
+function supportsAgentCapability(agent, capability) {
+  return Boolean(
+    agent.capabilities?.includes(capability)
+      || agent.models?.some((model) => model.capabilities?.includes(capability))
+      || supportsProtocolCapability(agent, capability),
+  );
+}
+
+function supportsProtocolCapability(agent, capability) {
+  const requiredProtocolFeature = {
+    "artifact-upload": "artifact-transfer-v1",
+    "artifact-download": "artifact-transfer-v1",
+  }[capability];
+  return Boolean(requiredProtocolFeature && agent.protocolFeatures?.includes(requiredProtocolFeature));
+}
+
 export function buildRolePrompt(role, input, payload = {}) {
   if (!ROLE_SET.has(role)) return String(input ?? "");
   const contract = role === "planner"
-    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"]}],"needsHuman":false,"humanQuestion":null}. Do not execute or review the work. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
+    ? `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"]}],"needsHuman":false,"humanQuestion":null}. Do not execute or review the work. Assignments create Executor tasks only. The Hub automatically creates a Reviewer task after each Executor task and a Planner summary after review; do not create separate Reviewer or Planner assignments. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. For artifact transfer, requiredCapabilities may include artifact-upload or artifact-download. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`
     : role === "executor"
       ? `Return JSON only: {"brief":"short task brief","fullResult":"complete result","upstreamIssue":null}. If an upstream result is wrong, set upstreamIssue to {"summary":"...","evidence":["..."],"impact":"...","recommendation":"..."}; do not silently correct upstream work.`
       : `Return JSON only: {"verdict":"approved|rejected|upstream_confirmed|upstream_denied","brief":"review summary","issues":[],"correctionBrief":null}. Review only the submitted full result against the acceptance criteria.`;
@@ -207,7 +221,11 @@ function chooseModel(agent, request, strict = true) {
   const models = configuredModels.filter((model) => {
     if (model.enabled === false || model.quota?.state === "Exhausted") return false;
     const modelCapabilities = new Set(model.capabilities ?? []);
-    return requiredCapabilities.every((capability) => agentCapabilities.has(capability) || modelCapabilities.has(capability));
+    return requiredCapabilities.every((capability) => (
+      agentCapabilities.has(capability)
+        || modelCapabilities.has(capability)
+        || supportsProtocolCapability(agent, capability)
+    ));
   });
   const requested = request.model ?? request.modelPreference;
   if (requested) {

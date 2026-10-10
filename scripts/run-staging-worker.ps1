@@ -2,7 +2,8 @@
 param(
   [Parameter(Mandatory = $true)][string]$ConfigPath,
   [Parameter(Mandatory = $true)][string]$Label,
-  [Parameter(Mandatory = $true)][string]$TokenEnvironment
+  [Parameter(Mandatory = $true)][string]$TokenEnvironment,
+  [string]$NodePath = 'node'
 )
 
 Set-StrictMode -Version Latest
@@ -34,7 +35,7 @@ Write-Host ''
 
 Push-Location $HubRoot
 try {
-  & node 'src/worker-cli.mjs' --config $resolvedConfig
+  & $NodePath 'src/worker-cli.mjs' --config $resolvedConfig
   if ($LASTEXITCODE -ne 0) {
     throw "Worker exited with code $LASTEXITCODE."
   }

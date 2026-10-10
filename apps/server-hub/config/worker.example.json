@@ -9,7 +9,7 @@
   "workspace": "../workspaces/worker-01",
   "artifacts": {
     "centralStore": true,
-    "apiUrl": "https://hub.example.com",
+    "apiUrl": "https://hub.example.com/api",
     "maxFileBytes": 104857600
   },
   "capabilityProbe": {

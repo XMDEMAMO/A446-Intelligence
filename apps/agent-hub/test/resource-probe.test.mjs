@@ -3,10 +3,46 @@ import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { probeConfiguredModels, probeLocalCapabilities, schedulingCapabilities } from "../src/capability-probe.mjs";
+import { CodexAdapter } from "../src/adapters/codex.mjs";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
 import { delay } from "../src/common.mjs";
+
+test("Codex runs through a resolved Node entrypoint and capability probes use its argument prefix", async () => {
+  const fixture = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
+  const config = {
+    adapter: { type: "codex", command: process.execPath, globalArgs: [fixture] },
+  };
+  const observed = probeLocalCapabilities(config);
+  assert.equal(observed.adapter.available, true);
+  assert.equal(observed.adapter.ready, true);
+  assert.match(observed.adapter.version, /codex-cli v1\.2\.3/);
+  assert.match(observed.adapter.readiness.detail, /Logged in using test account/);
+
+  const adapter = new CodexAdapter(config.adapter, { agentId: "codex-fixture", workspace: os.tmpdir() });
+  const result = await adapter.run("smoke objective", { signal: new AbortController().signal });
+  assert.equal(result.output, "received: smoke objective");
+  assert.equal(result.sessionId, "fixture-session");
+});
+
+test("Codex keeps its workspace sandbox when continuing a session with exec resume", async () => {
+  const fixture = fileURLToPath(new URL("./fixtures/fake-codex.mjs", import.meta.url));
+  const adapter = new CodexAdapter({
+    command: process.execPath,
+    globalArgs: [fixture, "--require-workspace-sandbox"],
+    sandbox: "workspace-write",
+    approvalPolicy: "never",
+  }, { agentId: "codex-resume-fixture", workspace: os.tmpdir() });
+  const first = await adapter.run("first task", { signal: new AbortController().signal });
+  const resumed = await adapter.run("continued task", {
+    sessionId: first.sessionId,
+    signal: new AbortController().signal,
+  });
+  assert.equal(resumed.sessionId, first.sessionId);
+  assert.equal(resumed.output, "received: continued task");
+});
 
 test("resource probes retain the last trusted value as stale and preserve scheduling metadata", async () => {
   const tempRoot = await mkdtemp(path.join(os.tmpdir(), "a446-resource-probe-"));

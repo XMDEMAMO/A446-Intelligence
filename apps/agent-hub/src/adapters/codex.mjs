@@ -28,7 +28,10 @@ export class CodexAdapter {
     }
     const reasoningEffort = context.reasoningEffort ?? this.config.reasoningEffort;
     if (reasoningEffort) execArgs.push("-c", `model_reasoning_effort="${reasoningEffort}"`);
-    if (this.config.sandbox && !execArgs.includes("--sandbox")) execArgs.push("--sandbox", this.config.sandbox);
+    if (this.config.sandbox && !execArgs.includes("--sandbox")) {
+      // `exec resume` accepts configuration overrides, but has no --sandbox option.
+      execArgs.push("-c", `sandbox_mode=${JSON.stringify(String(this.config.sandbox))}`);
+    }
     if (this.config.approvalPolicy) execArgs.push("-c", `approval_policy="${this.config.approvalPolicy}"`);
     const args = context.sessionId
       ? [...globalArgs, "exec", "resume", "--json", "--skip-git-repo-check", ...execArgs, context.sessionId, "-"]

@@ -5,7 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { AgentHub } from "../src/hub.mjs";
 import { AgentWorker } from "../src/worker.mjs";
-import { addUsage, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
+import { addUsage, buildRolePrompt, chooseAgent, normalizeUsage, parseRoleSubmission } from "../src/collaboration.mjs";
 import { delay } from "../src/common.mjs";
 
 test("usage normalization and scheduler keep account, role, model, and quota separate", () => {
@@ -32,6 +32,34 @@ test("usage normalization and scheduler keep account, role, model, and quota sep
   const selected = chooseAgent(agents, { role: "executor", requiredCapabilities: ["coding"] });
   assert.equal(selected.agent.agentId, "ready");
   assert.equal(selected.model.id, "large");
+});
+
+test("artifact protocol satisfies artifact upload and download capability requirements", () => {
+  const executor = agent("artifact-executor", "executor");
+  executor.protocolFeatures = ["attempt-lease-v1", "artifact-transfer-v1"];
+  const agents = new Map([[executor.agentId, executor]]);
+
+  for (const capability of ["artifact-upload", "artifact-download"]) {
+    const selected = chooseAgent(agents, {
+      role: "executor",
+      requireDeclaredRole: true,
+      requiredCapabilities: [capability],
+    });
+    assert.equal(selected.agent.agentId, executor.agentId);
+  }
+
+  executor.protocolFeatures = ["attempt-lease-v1"];
+  assert.throws(
+    () => chooseAgent(agents, { role: "executor", requireDeclaredRole: true, requiredCapabilities: ["artifact-upload"] }),
+    (error) => error.code === "NO_ELIGIBLE_AGENT",
+  );
+});
+
+test("planner delegates executor work only and leaves review to the workflow", () => {
+  const prompt = buildRolePrompt("planner", "Create and verify an artifact");
+  assert.match(prompt, /Assignments create Executor tasks only/);
+  assert.match(prompt, /Hub automatically creates a Reviewer task/);
+  assert.match(prompt, /do not create separate Reviewer or Planner assignments/);
 });
 
 test("a named executor is a hard scheduling constraint with stable failure codes", () => {

@@ -196,6 +196,8 @@ Keep `requireTaskSpec=false` only while interoperating with an older server. Set
 
 Never place the Hub bearer token in JSON. Read it from the environment variable named by `authTokenEnv`.
 
+The Windows dual-device test bundle uses `scripts/start-staging-workers.ps1` with separate Codex and Antigravity entrypoints. It checks official readiness, optionally installs a SHA-256-verified portable Node.js 24 LTS runtime, installs locked dependencies, and passes each Worker only its own credential. Production-shaped test configurations require Task Specs and use the public reverse proxy's `/api` prefix for Artifact HTTP requests. Codex can use its local CLI default model unless the owner explicitly sets `A446_CODEX_MODEL`; do not invent a discovered model ID.
+
 ## 7 Task acceptance algorithm
 
 For every `task.assign` message:
@@ -387,6 +389,8 @@ restart recovery:  --conversation <conversation_id>
 If the scheduler selects a different Antigravity model or reasoning effort, the Adapter restarts the stream process with `--model`/`--effort` and resumes the same locally owned conversation when supported.
 
 Never share a session ID between two Agents. Never send a local third-party session credential to another Worker for identity migration.
+
+Codex `exec resume` has no `--sandbox` option. Apply the configured sandbox through `-c sandbox_mode="workspace-write"` for both new and resumed executions; never remove the sandbox to make continuation work.
 
 ## 13 Server interoperability
 

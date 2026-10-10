@@ -368,7 +368,13 @@ function probeAdapter(spec, probeConfig = {}) {
 
 function adapterProbe(adapter = {}) {
   if (adapter.type === "codex") {
-    return { name: "codex", command: adapter.command ?? "codex", args: ["--version"], readinessArgs: ["login", "status"] };
+    const globalArgs = Array.isArray(adapter.globalArgs) ? adapter.globalArgs.map(String) : [];
+    return {
+      name: "codex",
+      command: adapter.command ?? "codex",
+      args: [...globalArgs, "--version"],
+      readinessArgs: [...globalArgs, "login", "status"],
+    };
   }
   if (adapter.type === "antigravity") {
     return { name: "antigravity", command: adapter.command ?? "agy", args: ["--version"], readinessArgs: ["models"] };

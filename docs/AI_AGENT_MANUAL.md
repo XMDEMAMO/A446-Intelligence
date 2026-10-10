@@ -88,6 +88,9 @@ scripts/
   stop-prototype.ps1     清理演示进程
   smoke-e2e.ps1          组合式端到端验收
   check-all.ps1          全部自动检查
+  start-staging-workers.ps1  Windows 真实 Worker 检查、独立配置与启动
+  bootstrap-worker-node.ps1  校验官方下载的便携 Node 环境
+  build-windows-worker-bundle.ps1  只包含源码的双设备验收包
 
 docs/
   USER_MANUAL.md         人类用户手册
@@ -426,6 +429,8 @@ npm.cmd run test:postgres
 阶段 F 的人工介入同样依赖 PostgreSQL 条件更新；只运行 Memory Store 测试时，不得宣布人工介入持久化阶段已验收。
 
 ## 13. 真实 Adapter 检查
+
+Windows 双设备验收可以先使用 `docs/WINDOWS_DUAL_DEVICE_QUICKSTART.md`：Codex 设备双击“启动规划执行Worker.cmd”，另一台 Antigravity 设备双击“启动审核Worker.cmd”。仅启动 Worker 不执行模型任务；创建真实任务后才消耗产品额度。不要把配置检查或同机双 Worker 记作真实双设备通过。
 
 只有人类明确授权真实模型测试时，才可以执行可能消耗额度的调用。
 
