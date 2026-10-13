@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath } from "node:url";
 import { UpdaterCore, createHealthChecker } from "../lib/core.mjs";
 import { layoutPaths, resolveCurrentTarget } from "../lib/layout.mjs";
 import { UpdaterError } from "../lib/util.mjs";
@@ -92,7 +93,7 @@ function overrides(ctx) {
  * simulate power-loss style termination via A446_UPDATER_FAULTS).
  */
 async function runCli(ctx, { faults } = {}) {
-  const entry = path.resolve(path.dirname(new URL(import.meta.url).pathname.replace(/^\/([A-Za-z]:)/, "$1")), "..", "a446-updater.mjs");
+  const entry = fileURLToPath(new URL("../a446-updater.mjs", import.meta.url));
   const { stdout } = await execFileAsync(
     process.execPath,
     [entry, "update", "--api-base", ctx.releaseServer.url, "--allow-http", "--process-controller", "mock",

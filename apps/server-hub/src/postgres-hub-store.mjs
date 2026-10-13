@@ -73,6 +73,9 @@ export class PostgresHubStore {
       const inbound = await client.query("SELECT document FROM inbound_messages ORDER BY received_at, message_id");
       const events = await client.query("SELECT document FROM audit_events ORDER BY sequence");
       const metadataRows = await client.query("SELECT key, value FROM hub_metadata");
+      const updateJobs = await client.query("SELECT document FROM device_update_jobs ORDER BY job_id");
+      const lifecycles = await client.query("SELECT document FROM conversation_lifecycles ORDER BY root_task_id");
+      const tombstones = await client.query("SELECT document FROM conversation_tombstones ORDER BY root_task_id");
       await client.query("COMMIT");
       return {
         tasks: tasks.rows.map((row) => row.document),
@@ -84,6 +87,9 @@ export class PostgresHubStore {
         deliveries: deliveries.rows.map((row) => row.document),
         inboundMessages: inbound.rows.map((row) => row.document),
         auditEvents: events.rows.map((row) => row.document),
+        updateJobs: updateJobs.rows.map((row) => row.document),
+        lifecycles: lifecycles.rows.map((row) => row.document),
+        tombstones: tombstones.rows.map((row) => row.document),
         metadata: Object.fromEntries(metadataRows.rows.map((row) => [row.key, row.value])),
       };
     } catch (error) {
@@ -112,6 +118,10 @@ export class PostgresHubStore {
       }
       for (const message of changes.inboundMessages ?? []) await upsertInboundMessage(client, message);
       for (const event of changes.auditEvents ?? []) await upsertAuditEvent(client, event);
+      for (const job of changes.updateJobs ?? []) await upsertDocument(client, "device_update_jobs", "job_id", job.jobId, job);
+      for (const record of changes.lifecycles ?? []) await upsertDocument(client, "conversation_lifecycles", "root_task_id", record.rootTaskId, record);
+      for (const stone of changes.tombstones ?? []) await upsertDocument(client, "conversation_tombstones", "root_task_id", stone.rootTaskId, stone);
+      await applyRemovals(client, changes.removals ?? {});
       for (const [key, value] of Object.entries(changes.metadata ?? {})) {
         await client.query(`
           INSERT INTO hub_metadata (key, value, updated_at)
@@ -130,6 +140,41 @@ export class PostgresHubStore {
 
   async close() {
     if (this.ownsPool) await this.pool.end();
+  }
+
+  async collectMessageIdsByRoot(rootTaskId) {
+    const result = await this.pool.query("SELECT message_id FROM task_messages WHERE root_task_id = $1", [rootTaskId]);
+    return result.rows.map((row) => row.message_id);
+  }
+}
+
+async function upsertDocument(client, table, keyColumn, key, document) {
+  // Table and column names come only from the fixed internal call sites above.
+  await client.query(`
+    INSERT INTO ${table} (${keyColumn}, document) VALUES ($1, $2::jsonb)
+    ON CONFLICT (${keyColumn}) DO UPDATE SET document = EXCLUDED.document, updated_at = now()
+  `, [key, JSON.stringify(document)]);
+}
+
+async function applyRemovals(client, removals) {
+  const collections = [
+    ["messages", "task_messages", "message_id"],
+    ["artifacts", "artifacts", "artifact_id"],
+    ["interventions", "human_interventions", "intervention_id"],
+    ["attempts", "task_attempts", "attempt_id"],
+    ["lifecycles", "conversation_lifecycles", "root_task_id"],
+    ["tasks", "tasks", "task_id"],
+  ];
+  for (const [collection, table, column] of collections) {
+    const ids = removals[collection] ?? [];
+    if (ids.length) await client.query(`DELETE FROM ${table} WHERE ${column} = ANY($1)`, [ids]);
+  }
+  for (const key of removals.deliveries ?? []) {
+    const separator = key.lastIndexOf(":");
+    await client.query("DELETE FROM outbound_deliveries WHERE agent_id = $1 AND message_id = $2", [key.slice(0, separator), key.slice(separator + 1)]);
+  }
+  if (removals.tasks?.length) {
+    await client.query("DELETE FROM inbound_messages WHERE task_id = ANY($1::uuid[])", [removals.tasks]);
   }
 }
 

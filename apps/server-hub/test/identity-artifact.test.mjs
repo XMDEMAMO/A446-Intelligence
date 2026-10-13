@@ -271,6 +271,7 @@ async function waitUntil(predicate, timeoutMs = 10000) {
 async function resetDatabase(pool) {
   await pool.query(`
     TRUNCATE TABLE
+      device_update_jobs, conversation_lifecycles, conversation_tombstones,
       web_auth_events,
       web_login_throttles,
       web_sessions,

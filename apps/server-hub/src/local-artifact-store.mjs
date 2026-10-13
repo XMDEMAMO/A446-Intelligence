@@ -70,6 +70,11 @@ export class LocalArtifactStore {
     return { stream: createReadStream(file), size: info.size };
   }
 
+  async remove(artifact) {
+    const file = this.resolveStorageKey(artifact?.storageKey);
+    await rm(file, { force: true, maxRetries: 5, retryDelay: 100 });
+  }
+
   resolveStorageKey(storageKey) {
     if (typeof storageKey !== "string" || !/^objects\/[a-f0-9]{2}\/[a-f0-9]{32}$/.test(storageKey)) {
       throw new Error("Invalid server storage key");

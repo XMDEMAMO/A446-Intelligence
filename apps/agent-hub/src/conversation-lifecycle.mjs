@@ -327,7 +327,7 @@ export class ConversationLifecycleManager {
       artifacts: exclusiveArtifacts.length,
     };
     const messageIds = this.hub.store.collectMessageIdsByRoot
-      ? this.hub.store.collectMessageIdsByRoot(rootTaskId)
+      ? await this.hub.store.collectMessageIdsByRoot(rootTaskId)
       : this.hub.messages.filter((message) => message.rootTaskId === rootTaskId).map((message) => message.messageId);
     counts.messages = messageIds.length;
     const attemptIds = [...this.hub.attempts.values()].filter((attempt) => taskIds.has(attempt.taskId)).map((attempt) => attempt.attemptId);

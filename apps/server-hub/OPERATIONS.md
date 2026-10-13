@@ -2,6 +2,8 @@
 
 本指南对应单进程 PostgreSQL Server Hub alpha。它提供持久调度、独立 Worker/Web 身份、中央 Artifact Store 和人工介入恢复，但不是多副本高可用或多租户部署方案。正式上线前仍需完成阶段 G 的真实多机验证；不要把本指南理解为绕过该门槛的替代品。
 
+整合 LAN 工作流后，migration `005_workflow_lifecycle_and_updates.sql` 持久保存设备更新任务、会话归档/回收站状态和清理记录。永久清理仅删除该会话独占的 Artifact；其他工作流仍引用的文件及其元数据保留。数据库与 Artifact 仍必须作为同一恢复单元备份；回退到不支持该 schema 的版本时使用升级前的成对备份。
+
 ## 1. 部署前提与安全边界
 
 - Node.js 20+、PostgreSQL 和 TLS 反向代理由服务器管理员维护。

@@ -15,6 +15,7 @@ const required = [
   "migrations/002_artifacts_and_identity.sql",
   "migrations/003_resource_and_interventions.sql",
   "migrations/004_identity_hardening.sql",
+  "migrations/005_workflow_lifecycle_and_updates.sql",
   "config/server.example.json",
   "config/worker.example.json",
   ".env.example",

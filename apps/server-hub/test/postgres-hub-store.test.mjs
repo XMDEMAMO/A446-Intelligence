@@ -4,12 +4,15 @@ import { mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { createHash, randomUUID } from "node:crypto";
+import { Readable } from "node:stream";
 import pg from "pg";
 import { WebSocket, WebSocketServer } from "ws";
 import { AgentHub } from "../../agent-hub/src/hub.mjs";
 import { AgentWorker } from "../../agent-hub/src/worker.mjs";
 import { delay } from "../../agent-hub/src/common.mjs";
 import { PostgresHubStore } from "../src/postgres-hub-store.mjs";
+import { LocalArtifactStore } from "../src/local-artifact-store.mjs";
 
 const { Pool } = pg;
 const webSocketModule = { WebSocket, WebSocketServer };
@@ -155,9 +158,88 @@ function testHubConfig(port = 0) {
   };
 }
 
+test("PostgreSQL preserves archive and update state and purges a conversation without deleting shared artifacts", async () => {
+  assert.ok(connectionString, "A446_TEST_DATABASE_URL is required");
+  const pool = new Pool({ connectionString, max: 2 });
+  const tempRoot = await mkdtemp(path.join(os.tmpdir(), "a446-postgres-lifecycle-"));
+  const artifactStore = new LocalArtifactStore({ rootDirectory: path.join(tempRoot, "artifacts") });
+  await artifactStore.init();
+  let hub;
+  try {
+    const store = new PostgresHubStore({ connectionString, migrationsDirectory });
+    await store.init();
+    await resetDatabase(pool);
+    hub = new AgentHub(testHubConfig(), { store, artifactStore, webSocketModule });
+    await hub.start();
+    const root = hub.createTask({ input: "completed conversation" });
+    root.status = "completed";
+    hub.markTask(root);
+    const retained = hub.createTask({ input: "other conversation" });
+    retained.status = "completed";
+    const artifacts = [];
+    for (const filename of ["exclusive.txt", "shared.txt"]) {
+      const contents = Buffer.from(filename);
+      const artifact = {
+        artifactId: randomUUID(), taskId: root.taskId, rootTaskId: root.taskId,
+        status: "ready", path: filename, originalName: filename, size: contents.length,
+        sha256: createHash("sha256").update(contents).digest("hex"),
+        storageKey: artifactStore.createStorageKey(), createdAt: new Date().toISOString(),
+      };
+      await artifactStore.receive(Readable.from([contents]), artifact);
+      hub.artifacts.set(artifact.artifactId, artifact);
+      hub.markArtifact(artifact);
+      artifacts.push(artifact);
+    }
+    retained.contextBundle = { artifactReferences: [artifacts[1]] };
+    hub.markTask(retained);
+    const job = { jobId: "persisted-update-job", deviceId: "test-device", status: "completed", reports: [] };
+    hub.markUpdateJob(job);
+    const actor = { kind: "web", id: "test-admin", role: "admin" };
+    await hub.lifecycle.archive(root.taskId, actor);
+    const persistedMessageIds = await store.collectMessageIdsByRoot(root.taskId);
+    assert.ok(persistedMessageIds.length > 0);
+    await hub.stop();
+
+    const recoveryStore = new PostgresHubStore({ connectionString, migrationsDirectory });
+    hub = new AgentHub(testHubConfig(), { store: recoveryStore, artifactStore, webSocketModule });
+    await hub.start();
+    assert.equal(hub.lifecycle.stateOf(root.taskId), "archived");
+    assert.equal(hub.updates.listJobs().find((item) => item.jobId === job.jobId)?.status, "completed");
+    await hub.lifecycle.trash(root.taskId, actor);
+    hub.messages = []; // Purge must collect all persisted messages, even outside the memory window.
+    await hub.lifecycle.purge(root.taskId, actor);
+    await assert.rejects(() => artifactStore.open(artifacts[0]), { code: "ENOENT" });
+    const sharedFile = await artifactStore.open(artifacts[1]);
+    sharedFile.stream.destroy();
+    await assert.rejects(() => artifactStore.remove({ storageKey: "../outside" }), /Invalid server storage key/);
+    const state = await recoveryStore.load();
+    assert.equal(state.tasks.some((item) => item.taskId === root.taskId), false);
+    assert.equal(state.messages.some((item) => item.rootTaskId === root.taskId), false);
+    assert.equal(state.artifacts.some((item) => item.artifactId === artifacts[0].artifactId), false);
+    assert.equal(state.artifacts.some((item) => item.artifactId === artifacts[1].artifactId), true);
+    assert.equal(state.lifecycles.some((item) => item.rootTaskId === root.taskId), false);
+    assert.equal(state.tombstones.some((item) => item.rootTaskId === root.taskId), true);
+    assert.equal(state.tasks.some((item) => item.taskId === retained.taskId), true);
+    await hub.stop();
+    hub = new AgentHub(testHubConfig(), {
+      store: new PostgresHubStore({ connectionString, migrationsDirectory }), artifactStore, webSocketModule,
+    });
+    await hub.start();
+    assert.equal(hub.lifecycle.stateOf(root.taskId), "purged");
+    assert.equal(hub.tasks.has(root.taskId), false);
+    assert.equal(hub.artifacts.has(artifacts[1].artifactId), true);
+  } finally {
+    if (hub) await hub.stop();
+    await resetDatabase(pool);
+    await pool.end();
+    await rm(tempRoot, { recursive: true, force: true });
+  }
+});
+
 async function resetDatabase(pool) {
   await pool.query(`
     TRUNCATE TABLE
+      device_update_jobs, conversation_lifecycles, conversation_tombstones,
       web_auth_events,
       web_login_throttles,
       web_sessions,

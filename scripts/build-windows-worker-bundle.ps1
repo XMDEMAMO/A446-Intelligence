@@ -44,6 +44,7 @@ try {
     'scripts\start-staging-workers.ps1', 'scripts\run-staging-worker.ps1', 'scripts\bootstrap-worker-node.ps1',
     'apps\agent-hub\package.json', 'apps\agent-hub\package-lock.json',
     'apps\agent-hub\scripts\check-env.mjs',
+    'apps\agent-hub\scripts\prepare-lan-device.mjs', 'apps\agent-hub\scripts\provider-probe.mjs',
     'apps\agent-hub\config\worker.codex.example.json', 'apps\agent-hub\config\worker.antigravity.example.json',
     'apps\agent-hub\docs\protocol-v1.md', 'apps\agent-hub\AI_IMPLEMENTATION_GUIDE.md'
   )) { Copy-BundleFile -RelativeSource $relative }
