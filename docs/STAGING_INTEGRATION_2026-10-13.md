@@ -29,8 +29,17 @@
 
 公网 `https://staging.a446intelligence.party` 健康检查、未认证 API/Worker 拒绝、安全头和静态缓存检查通过。用户提供的 `154.219.103.237` 对应此站点。
 
-**尚未部署本次整合候选**：SSH 在认证前关闭连接，直连、域名和本机现有代理均未收到 SSH 握手。用户提供的 VNC 截图显示 CPU soft lockup、RCU stall、`sshd` 卡顿及网络配置启动失败，需先恢复服务器并确认日志；截图不足以确定故障根因。没有读取密码或私钥内容，没有修改目标服务器。旧报告的八项通过证据属于旧候选，不自动作为新候选的验收证据。
+**本次候选已部署**：2026-10-13 04:59 UTC，通过用户授权的云厂商 VNC root 控制台执行固定版本入口，运行提交为 `a762204e0ab3f2404e4862de04f066a9074b6173`。入口下载的 SHA-256 与本地审核版本一致：`282aea10340db679a6a0fc666c026512c82040ab43da0c64c0cc4dcdcfbc2c63`。
 
-SSH 恢复后，应按固定完整提交 SHA 执行 `scripts/deploy/upgrade-staging-v05.sh <SHA> codex/staging-integration-20261010 https://staging.a446intelligence.party`。脚本先准备不可变 release、配置备份和数据库/Artifact 成对备份，再应用迁移与切换；部署后必须复核运行 SHA、公网端点和 FLOW-001。
+升级脚本完成依赖安装、Web 构建、数据库与 Artifact 成对备份、迁移、release 切换和服务恢复。服务器输出 `VERIFIED RELEASE` 与上述完整 SHA 一致，Server Hub 与 Caddy 均为 active。本机另行执行公网验证通过：健康 200、未认证 API/Worker 401、安全响应头、HTML no-store、静态资源 immutable。网页已使用新资源 `index-BrHAFuRn.js`。
 
-两台真实设备使用同一份新 Worker 包，操作及 FLOW-001 复测步骤见 [Windows 双设备教程](WINDOWS_DUAL_DEVICE_QUICKSTART.md)。真实验收通过前，不把本次整合标为正式上线完成。
+恢复记录：
+
+- 当前 release：`/srv/a446/releases/a762204e0ab3f2404e4862de04f066a9074b6173`。
+- 前一 release：`/srv/a446/releases/ef397b69b23a68b2e7d139b6e0518325578c2666`。
+- 配置备份：`/var/backups/a446/config-20261013T045859Z`。
+- 数据库与 Artifact 成对备份：`/var/backups/a446/a446-20261013T045923Z`，已确认 `COMPLETE` 标志及 Artifact 快照，数据库校验 `a446.dump: OK`。
+
+此前 SSH 在认证前关闭连接的问题尚未修复。最新 VNC 输出确认 SSH active、22 端口监听、UFW 放行；早期内核截图不能单独确定本次断连根因。本次没有读取密码或私钥，也没有修改 SSH、TLS 或防火墙策略。旧报告的八项通过证据仍属于旧候选，不自动作为新候选的验收证据。
+
+两台真实设备使用同一份新 Worker 包，操作及 FLOW-001 复测步骤见 [Windows 双设备教程](WINDOWS_DUAL_DEVICE_QUICKSTART.md)。用户确认室友稍后才能配合，真实双设备和 FLOW-001 复测尚未执行；可以开始预发布调试，正式上线验收仍未完成。

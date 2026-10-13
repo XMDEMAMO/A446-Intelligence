@@ -9,3 +9,7 @@
 执行时保持 VNC 页面打开。看到 `VERIFIED RELEASE: a762204e0ab3f2404e4862de04f066a9074b6173` 才表示脚本完成。中途出错先保留输出和备份目录，不删除 release 目录或盲目重复升级。再次执行时，已经运行同一版本会只验证端点；存在未激活的同名 release 会停止，供人工检查。
 
 部署脚本不调用真实模型，不创建管理员或 Worker 凭据。部署后按 `docs/WINDOWS_DUAL_DEVICE_QUICKSTART.md` 完成 FLOW-001 与真实双设备闭环；这一步尚未验收。
+
+## 本次执行结果
+
+2026-10-13 04:59 UTC 已通过用户授权的 VNC 控制台完成部署，服务器打印固定候选的 `VERIFIED RELEASE`。Server Hub 与 Caddy 为 active，服务器及本机两次公网核验均通过，新网页资源为 `index-BrHAFuRn.js`。配置备份为 `/var/backups/a446/config-20261013T045859Z`，成对数据备份为 `/var/backups/a446/a446-20261013T045923Z`。详见 [整合记录](STAGING_INTEGRATION_2026-10-13.md)。室友稍后才能配合，真实双设备验收尚未执行。
