@@ -976,6 +976,12 @@ export class AgentHub {
     if (input.executorAgentId != null && (typeof input.executorAgentId !== "string" || !input.executorAgentId.trim() || input.executorAgentId !== input.executorAgentId.trim())) {
       throw httpError(400, "executorAgentId must be a non-empty Agent ID or null", "VALIDATION_ERROR");
     }
+    if (input.planDiscussion != null && typeof input.planDiscussion !== "boolean") {
+      throw httpError(400, "planDiscussion must be a boolean", "VALIDATION_ERROR");
+    }
+    if (input.planDiscussion && input.plannerAgentId && input.plannerAgentId === input.reviewerAgentId) {
+      throw httpError(400, "Plan discussion requires a reviewer different from the planner", "VALIDATION_ERROR");
+    }
     const executorAgentId = input.executorAgentId ?? null;
     if (executorAgentId) {
       const executor = this.agents.get(executorAgentId);
@@ -1019,6 +1025,7 @@ export class AgentHub {
       intakeReasoningEffort: normalizedStages.intake.reasoningEffort,
       stageModels: normalizedStages,
       fastPath: Boolean(input.fastPath),
+      planDiscussion: Boolean(input.planDiscussion),
     };
 
     const initialArtifacts = [];
@@ -1130,11 +1137,26 @@ export class AgentHub {
     } else if (task.artifacts?.files?.length) {
       attachments.push({ type: "artifacts", label: "成果附件", taskId: task.taskId, artifacts: task.artifacts });
     }
+    if (task.role === "planner" && task.workflow?.planDiscussion &&
+      ["planning", "replan", "plan_refinement"].includes(task.stage) && submission.assignments?.length) {
+      attachments.push({
+        type: "plan",
+        label: task.stage === "plan_refinement" ? "修订后的执行方案" : "待讨论的执行方案",
+        taskId: task.taskId,
+        content: JSON.stringify(submission.assignments, null, 2),
+      });
+    }
+    const discussionIssues = task.stage === "plan_discussion" ? (submission.issues ?? []) : [];
+    const discussionText = discussionIssues.length
+      ? `${submission.brief ?? "方案讨论"}\n${discussionIssues.map((issue) => `• ${issue}`).join("\n")}${submission.recommendation ? `\n建议：${submission.recommendation}` : ""}`
+      : submission.brief ?? task.output ?? "任务已完成";
     this.addMessage(task, {
       senderId: task.targetAgentId,
       senderRole: task.role ?? "executor",
-      kind: task.role === "reviewer" ? "review_decision" : "task_brief",
-      text: submission.brief ?? task.output ?? "任务已完成",
+      kind: task.stage === "plan_discussion" || task.stage === "plan_refinement"
+        ? task.stage
+        : task.role === "reviewer" ? "review_decision" : "task_brief",
+      text: discussionText,
       mentions: task.role === "reviewer" && task.parentTaskId ? [this.tasks.get(task.parentTaskId)?.targetAgentId].filter(Boolean) : [],
       attachments,
     });
@@ -1220,7 +1242,7 @@ export class AgentHub {
         return;
       }
 
-      // stage === "planning" or "replan"
+      // Planning and replanning can request one independent critique before dispatch.
       if (submission.needsHuman) {
         this.requireHuman(task, submission.humanQuestion || submission.brief || "规划 Agent 请求人工介入");
         return;
@@ -1228,6 +1250,10 @@ export class AgentHub {
       const assignments = submission.assignments ?? [];
       if (assignments.length === 0) {
         this.requireHuman(task, "规划 Agent 未生成任何有效子任务，需要人工确认或补充规划。");
+        return;
+      }
+      if (root.workflow?.planDiscussion && (task.stage === "planning" || task.stage === "replan")) {
+        await this.startPlanDiscussion(task);
         return;
       }
       await this.dispatchAssignments(task, assignments);
@@ -1344,6 +1370,10 @@ export class AgentHub {
     }
 
     if (task.role !== "reviewer") return;
+    if (task.stage === "plan_discussion") {
+      await this.createPlanRefinement(task);
+      return;
+    }
     const reviewed = this.tasks.get(task.parentTaskId);
     if (!reviewed || reviewed.superseded) return;
     const verdict = submission.verdict;
@@ -1662,6 +1692,148 @@ export class AgentHub {
       correctionBrief: feedback.correctionBrief ?? null,
       reviewCycle: nextCycle,
     });
+  }
+
+  async startPlanDiscussion(plannerTask) {
+    const root = this.getCanonicalRootTask(plannerTask.rootTaskId) ?? plannerTask;
+    const retryDiscussion = {
+      continuation: {
+        type: "workflow_followup",
+        targetAgentId: plannerTask.targetAgentId,
+        role: "planner",
+        stage: "replan",
+        sessionScopeId: plannerTask.sessionScopeId,
+      },
+    };
+    const preferredReviewer = root.workflow?.reviewerAgentId === plannerTask.targetAgentId
+      ? null
+      : root.workflow?.reviewerAgentId ?? null;
+    const reviewerModel = root.workflow?.reviewerModelPreference ?? null;
+    const reviewerReasoning = root.workflow?.reviewerReasoningEffort ?? null;
+    const candidates = new Map([...this.agents.entries()].filter(([id, agent]) => (
+      id !== plannerTask.targetAgentId &&
+      (!this.leasesEnabled() || agent.protocolFeatures?.includes(LEASE_PROTOCOL_FEATURE))
+    )));
+    this.refreshAccountLoads();
+    let reviewerAgentId;
+    try {
+      reviewerAgentId = chooseAgent(candidates, {
+        targetAgentId: preferredReviewer,
+        role: "reviewer",
+        modelPreference: reviewerModel,
+        reasoningEffort: reviewerReasoning,
+        requireDeclaredRole: false,
+      }).agent.agentId;
+    } catch {
+      // The planner still holds its account slot while this result is being
+      // processed. A compatible reviewer on the same account can wait in the
+      // normal queue until that slot is released.
+      reviewerAgentId = [...candidates.values()]
+        .filter((agent) => (
+          agent.status === "online" && !agent.paused &&
+          (!preferredReviewer || agent.agentId === preferredReviewer) &&
+          (!agent.roles?.length || agent.roles.includes("reviewer")) &&
+          chooseModel(agent, { role: "reviewer", modelPreference: reviewerModel, reasoningEffort: reviewerReasoning }, false)
+        ))
+        .sort((left, right) => left.agentId.localeCompare(right.agentId))[0]?.agentId;
+      if (!reviewerAgentId) {
+        this.requireHuman(plannerTask, "当前没有可用的独立 Agent 参与方案讨论。请安排审核 Agent 后继续。", retryDiscussion);
+        return;
+      }
+    }
+    const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
+    if (!reservation.ok) {
+      this.requireHuman(plannerTask, `工作流累计任务调用已达上限（50次），无法进行方案讨论：${reservation.error}`, retryDiscussion);
+      return;
+    }
+    const discussion = this.createTask({
+      targetAgentId: reviewerAgentId,
+      input: "质疑并讨论规划 Agent 的执行方案。",
+      rootTaskId: root.taskId,
+      parentTaskId: plannerTask.taskId,
+      sourceAgentId: plannerTask.targetAgentId,
+      role: "reviewer",
+      stage: "plan_discussion",
+      quotaReserved: true,
+      workflow: root.workflow,
+      modelPreference: reviewerModel,
+      reasoningEffort: reviewerReasoning,
+      taskSpec: {
+        title: "方案讨论",
+        type: "plan_discussion",
+        priority: plannerTask.taskSpec?.priority ?? "P1",
+        inputs: [],
+        expected_outputs: [],
+        permissions_required: { project_workspace: true },
+        checkpoint_policy: { mode: "stage" },
+        acceptance: plannerTask.contextBundle?.acceptance ?? plannerTask.taskSpec?.acceptance ?? [],
+      },
+      contextBundle: {
+        objective: plannerTask.contextBundle?.objective ?? root.input,
+        acceptance: plannerTask.contextBundle?.acceptance ?? root.taskSpec?.acceptance ?? [],
+        proposedPlan: {
+          brief: plannerTask.submission?.brief,
+          assignments: plannerTask.submission?.assignments ?? [],
+        },
+      },
+    });
+    await this.queueOrDispatch(discussion);
+  }
+
+  async createPlanRefinement(discussionTask) {
+    const proposedBy = this.tasks.get(discussionTask.parentTaskId);
+    const root = this.getCanonicalRootTask(discussionTask.rootTaskId) ?? discussionTask;
+    const retryDiscussion = {
+      continuation: {
+        type: "workflow_followup",
+        targetAgentId: proposedBy?.targetAgentId ?? root.workflow?.plannerAgentId ?? null,
+        role: "planner",
+        stage: "replan",
+        sessionScopeId: proposedBy?.sessionScopeId ?? root.sessionScopeId ?? root.taskId,
+      },
+    };
+    if (!proposedBy || proposedBy.role !== "planner") {
+      this.requireHuman(discussionTask, "方案讨论找不到原规划任务，无法安全继续派发。", retryDiscussion);
+      return;
+    }
+    const reservation = this.reserveWorkflowInvocations(root.taskId, 1);
+    if (!reservation.ok) {
+      this.requireHuman(discussionTask, `工作流累计任务调用已达上限（50次），无法修订方案：${reservation.error}`, retryDiscussion);
+      return;
+    }
+    const refinement = this.createTask({
+      targetAgentId: proposedBy.targetAgentId,
+      input: "回应讨论意见并提交修订后的最终执行方案。",
+      rootTaskId: root.taskId,
+      parentTaskId: discussionTask.taskId,
+      sourceAgentId: discussionTask.targetAgentId,
+      role: "planner",
+      stage: "plan_refinement",
+      quotaReserved: true,
+      workflow: root.workflow,
+      sessionScopeId: proposedBy.sessionScopeId,
+      modelPreference: proposedBy.modelPreference ?? root.workflow?.plannerModelPreference ?? null,
+      reasoningEffort: proposedBy.reasoningEffort ?? root.workflow?.plannerReasoningEffort ?? null,
+      taskSpec: {
+        title: "讨论后修订方案",
+        type: "plan_refinement",
+        priority: proposedBy.taskSpec?.priority ?? "P1",
+        inputs: proposedBy.taskSpec?.inputs ?? [],
+        expected_outputs: [],
+        permissions_required: proposedBy.taskSpec?.permissions_required ?? { project_workspace: true },
+        checkpoint_policy: { mode: "stage" },
+        acceptance: proposedBy.taskSpec?.acceptance ?? [],
+      },
+      contextBundle: {
+        objective: proposedBy.contextBundle?.objective ?? root.input,
+        acceptance: proposedBy.contextBundle?.acceptance ?? root.taskSpec?.acceptance ?? [],
+        proposedPlan: proposedBy.submission,
+        discussionFeedback: discussionTask.submission,
+        schedulerCatalog: this.schedulerCatalog(),
+        artifactReferences: proposedBy.contextBundle?.artifactReferences ?? [],
+      },
+    });
+    await this.queueOrDispatch(refinement);
   }
 
   async dispatchAssignments(task, assignments) {

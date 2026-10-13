@@ -1,6 +1,6 @@
 {
   "name": "local-agent-hub",
-  "version": "0.5.0-alpha.4",
+  "version": "0.5.0-alpha.5",
   "private": true,
   "type": "module",
   "description": "Cross-platform local simulation of an outbound WebSocket Agent Hub with durable workers.",

@@ -4,6 +4,8 @@ export const ROLE_SET = new Set(["planner", "executor", "reviewer"]);
 export const STAGE_SET = new Set([
   "planning",
   "replan",
+  "plan_discussion",
+  "plan_refinement",
   "execution",
   "revision",
   "result_review",
@@ -211,6 +213,9 @@ export function buildRolePrompt(role, input, payload = {}) {
       contract = `Return JSON only: {"decision":"complete|continue|needs_human","brief":"short explanation","assignments":[],"humanQuestion":null}. When all required deliverables have been verified, output "decision":"complete" with "assignments":[]. If more work is required, output "decision":"continue" with up to 8 assignments in "assignments". If human decision/input is required, output "decision":"needs_human" with "humanQuestion". Do not execute or review the work yourself.`;
     } else {
       contract = `Return JSON only: {"brief":"short plan summary","assignments":[{"title":"...","instructions":"...","acceptance":["..."],"requiredCapabilities":[],"expectedOutputs":["relative/path"],"targetAgentId":null,"modelPreference":null,"reasoningEffort":null}],"needsHuman":false,"humanQuestion":null}. Use the schedulerCatalog when selecting an Agent, model, or reasoning effort; leave a field null when automatic scheduling is preferable. Do not execute or review the work. Assignments create Executor tasks only. The Hub automatically creates independent Reviewer tasks and a Planner summary; do not create separate Reviewer or Planner assignments. For artifact transfer, requiredCapabilities may include artifact-upload or artifact-download. You can assign at most 8 subtasks. Declare every file or directory deliverable in expectedOutputs using workspace-relative paths. Every assignment must have one clear owner and an independent, non-overlapping deliverable. If two assignments would modify the same result, keep them as one assignment.`;
+      if (stage === "plan_refinement") {
+        contract += ` Respond to every issue in the discussion feedback. Revise the proposed assignments where needed and explain your decisions in brief. The revised assignments are the only ones that may be dispatched.`;
+      }
     }
   } else if (role === "executor") {
     contract = `Return JSON only: {"brief":"short task brief","fullResult":"complete result","upstreamIssue":null}. If an upstream result is wrong, set upstreamIssue to {"summary":"...","evidence":["..."],"impact":"...","recommendation":"..."}; do not silently correct upstream work.`;
@@ -222,7 +227,9 @@ export function buildRolePrompt(role, input, payload = {}) {
       }
     }
   } else if (role === "reviewer") {
-    if (stage === "upstream_review") {
+    if (stage === "plan_discussion") {
+      contract = `Return JSON only: {"brief":"short critique summary","issues":["specific question or risk"],"recommendation":"suggested change"}. Challenge the proposed plan against the objective, acceptance criteria, ownership, and overlapping deliverables. Raise at least one concrete question or risk, even if the plan looks sound. Do not execute work, change files, or decide the final plan.`;
+    } else if (stage === "upstream_review") {
       contract = `Return JSON only: {"verdict":"upstream_confirmed|upstream_denied","brief":"review summary","correctionBrief":null}. Evaluate the upstream issue claim made by the executor.`;
     } else if (stage === "final_review") {
       contract = `Return JSON only: {"verdict":"approved|rejected","brief":"review summary","issues":[],"correctionBrief":null}. Independently verify that the final brief covers every approved branch and the acceptance criteria using only the approved briefs and artifact references. Do not claim to have inspected the full executor results.`;
@@ -605,6 +612,24 @@ export function validateRoleSubmission(role, stage, parsed) {
       return { ok: false, value: null, error: "Reviewer submission must contain a non-empty 'brief'" };
     }
     const rawVerdict = String(parsed.verdict ?? "").toLowerCase().trim();
+
+    if (stage === "plan_discussion") {
+      const issues = Array.isArray(parsed.issues)
+        ? parsed.issues.slice(0, 8).map((item) => cleanText(item, 1000)).filter(Boolean)
+        : [];
+      if (!issues.length) {
+        return { ok: false, value: null, error: "plan_discussion submission must contain at least one concrete issue or question" };
+      }
+      return {
+        ok: true,
+        value: {
+          brief,
+          issues,
+          recommendation: cleanText(parsed.recommendation, 2000) || null,
+          structured: true,
+        },
+      };
+    }
 
     if (stage === "upstream_review") {
       if (!["upstream_confirmed", "upstream_denied"].includes(rawVerdict)) {

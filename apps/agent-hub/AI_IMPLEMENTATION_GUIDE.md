@@ -363,6 +363,8 @@ executor  -> brief, fullResult, upstreamIssue
 reviewer  -> verdict, brief, issues, correctionBrief
 ```
 
+可选 `planDiscussion` 在每次初始规划或重新规划后插入一轮方案讨论：独立 Reviewer 以 `plan_discussion` 输出 `brief + issues + recommendation`，原 Planner 以 `plan_refinement` 回应并重新提交 assignments，然后才派发 Executor。讨论任务与成果审核是不同阶段；讨论不能代替后者。两步共享根任务群聊、计入 50 次调用上限，Planner 修订沿用原规划会话范围。无独立 Reviewer 时请求人工介入，不跳过讨论。
+
 Only the reviewer receives an executor's complete result. After approval, the planner receives only the executor brief, review brief, and Artifact references. An executor-reported upstream error must first go to the reviewer. If confirmed, the reviewer sends a correction brief to the planner for replanning; if denied, the executor continues the original assignment.
 
 Planner assignments must be independent and non-overlapping. Do not add file locks, merge orchestration, or shared-deliverable conflict resolution to compensate for a bad split; keep one owner for one deliverable.

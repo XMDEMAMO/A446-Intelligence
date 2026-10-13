@@ -58,7 +58,7 @@ test("artifact protocol satisfies artifact upload and download capability requir
 test("planner delegates executor work only and leaves review to the workflow", () => {
   const prompt = buildRolePrompt("planner", "Create and verify an artifact");
   assert.match(prompt, /Assignments create Executor tasks only/);
-  assert.match(prompt, /Hub automatically creates a Reviewer task/);
+  assert.match(prompt, /Hub automatically creates.*Reviewer/);
   assert.match(prompt, /do not create separate Reviewer or Planner assignments/);
 });
 

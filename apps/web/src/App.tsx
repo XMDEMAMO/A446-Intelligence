@@ -63,6 +63,7 @@ interface WorkflowDraft {
   modelPreference: string
   reasoningEffort: string
   maxReviewCycles: number
+  planDiscussion: boolean
   attachments: File[]
   fastPath: boolean
   plannerModelPreference: string
@@ -122,6 +123,7 @@ function emptyDraft(): WorkflowDraft {
     modelPreference: '',
     reasoningEffort: '',
     maxReviewCycles: 2,
+    planDiscussion: false,
     attachments: [],
     fastPath: false,
     plannerModelPreference: '',
@@ -498,6 +500,7 @@ function App() {
         modelPreference: draft.modelPreference || null,
         reasoningEffort: draft.reasoningEffort || null,
         maxReviewCycles: Math.min(5, Math.max(0, Number.isFinite(draft.maxReviewCycles) ? draft.maxReviewCycles : 2)),
+        planDiscussion: draft.planDiscussion,
         attachments: uploadedAttachments,
         fastPath: draft.fastPath,
         plannerModelPreference: draft.plannerModelPreference || draft.modelPreference || null,
@@ -865,9 +868,9 @@ function App() {
   }
 
   async function loadFullMessage(message: HubMessage) {
-    if (message.attachments.every((attachment) => attachment.type !== 'full_result' || attachment.content !== undefined)) return
+    if (message.attachments.every((attachment) => !['full_result', 'plan'].includes(attachment.type) || attachment.content !== undefined)) return
     if (connectionMode !== 'live' || loadingMessageIds.has(message.messageId)) {
-      if (connectionMode !== 'live') setNotice('恢复实时连接后才能加载完整成果。')
+      if (connectionMode !== 'live') setNotice('恢复实时连接后才能加载附件详情。')
       return
     }
     setLoadingMessageIds((current) => new Set(current).add(message.messageId))
@@ -876,7 +879,7 @@ function App() {
       setMessageDetails((current) => ({ ...current, [message.messageId]: full }))
     } catch (error) {
       if (error instanceof HubApiError && error.status === 401) handleUnauthorized()
-      else setNotice(formatApiError(error, '完整成果加载失败'))
+      else setNotice(formatApiError(error, '附件详情加载失败'))
     } finally {
       setLoadingMessageIds((current) => {
         const next = new Set(current)
@@ -1329,6 +1332,10 @@ function App() {
               }}><option value="">自动选择</option>{plannerModels.map((model) => <option key={model} value={model}>{model}</option>)}</select></label>
               <label>推理强度<select value={draft.reasoningEffort} onChange={(event) => setDraft({ ...draft, reasoningEffort: event.target.value })}><option value="">使用 Agent 默认值</option>{plannerReasoningOptions.map((effort) => <option key={effort} value={effort}>{effort}</option>)}</select></label>
               <label>审核重试次数<input type="number" min="0" max="5" value={draft.maxReviewCycles} onChange={(event) => setDraft({ ...draft, maxReviewCycles: Number(event.target.value) })} /></label>
+              <label style={{ gridColumn: 'span 2', display: 'flex', alignItems: 'center', gap: '0.5rem', cursor: 'pointer' }}>
+                <input type="checkbox" checked={draft.planDiscussion} onChange={(event) => setDraft({ ...draft, planDiscussion: event.target.checked })} />
+                <span>执行前方案讨论：独立质疑、回应并修订（增加两次 AI 调用）</span>
+              </label>
             </div>
             <details className="stage-models-accordion">
               <summary><strong>阶段模型策略与高级设置</strong><small>（自定义审核、结果接收模型与快速结案）</small></summary>

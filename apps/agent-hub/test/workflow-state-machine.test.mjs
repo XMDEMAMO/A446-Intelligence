@@ -3,6 +3,122 @@ import assert from "node:assert/strict";
 import { AgentHub } from "../src/hub.mjs";
 import { delay } from "../src/common.mjs";
 
+test("Optional plan discussion waits for an independent critique and planner response before execution", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+  hub.agents.set("reviewer-1", agent("reviewer-1", "reviewer"));
+  const workflow = { enabled: true, planDiscussion: true, plannerAgentId: "planner-1", reviewerAgentId: "reviewer-1" };
+  const root = hub.createTask({
+    input: "Build a LAN feature",
+    targetAgentId: "planner-1",
+    role: "planner",
+    stage: "planning",
+    workflow,
+    taskSpec: { title: "LAN feature", acceptance: ["verified result"] },
+    contextBundle: { objective: "Build a LAN feature", acceptance: ["verified result"] },
+  });
+  root.submission = {
+    brief: "Initial proposal",
+    assignments: [{ title: "First plan", instructions: "Do initial work", acceptance: ["verified result"], expectedOutputs: ["result.txt"] }],
+  };
+
+  await hub.advanceWorkflow(root);
+  const critique = [...hub.tasks.values()].find((task) => task.stage === "plan_discussion");
+  assert.ok(critique);
+  assert.equal(critique.targetAgentId, "reviewer-1");
+  assert.equal(critique.parentTaskId, root.taskId);
+  assert.equal(critique.contextBundle.proposedPlan.assignments[0].title, "First plan");
+  assert.equal([...hub.tasks.values()].some((task) => task.role === "executor"), false);
+
+  critique.submission = { brief: "The plan misses a check", issues: ["How is the result verified?"], recommendation: "Add validation" };
+  await hub.advanceWorkflow(critique);
+  const refinement = [...hub.tasks.values()].find((task) => task.stage === "plan_refinement");
+  assert.ok(refinement);
+  assert.equal(refinement.targetAgentId, "planner-1");
+  assert.equal(refinement.sessionScopeId, root.sessionScopeId);
+  assert.deepEqual(refinement.contextBundle.discussionFeedback.issues, critique.submission.issues);
+  assert.equal([...hub.tasks.values()].some((task) => task.role === "executor"), false);
+
+  refinement.submission = {
+    brief: "Added the requested validation",
+    assignments: [{ title: "Revised plan", instructions: "Implement and validate", acceptance: ["verified result"], expectedOutputs: ["result.txt"] }],
+  };
+  await hub.advanceWorkflow(refinement);
+  const executors = [...hub.tasks.values()].filter((task) => task.role === "executor");
+  assert.equal(executors.length, 1);
+  assert.equal(executors[0].taskSpec.title, "Revised plan");
+  assert.equal(executors[0].parentTaskId, refinement.taskId);
+});
+
+test("Plan discussion stops for human input when no independent reviewer exists", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  const root = hub.createTask({ input: "Plan alone", targetAgentId: "planner-1", role: "planner", stage: "planning", workflow: { enabled: true, planDiscussion: true } });
+  root.submission = { brief: "Proposal", assignments: [{ title: "Work", instructions: "Do it" }] };
+  await hub.advanceWorkflow(root);
+  assert.equal([...hub.tasks.values()].some((task) => task.role === "executor"), false);
+  assert.equal([...hub.tasks.values()].some((task) => task.stage === "plan_discussion"), false);
+  const intervention = [...hub.interventions.values()].find((item) => item.rootTaskId === root.taskId && item.status === "pending");
+  assert.ok(intervention);
+  assert.equal(intervention.continuation?.stage, "replan", "human follow-up must not silently skip the requested discussion");
+});
+
+test("Worker results publish the discussion in one conversation before dispatching the revised plan", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  hub.agents.set("planner-1", agent("planner-1", "planner"));
+  hub.agents.set("reviewer-1", agent("reviewer-1", "reviewer"));
+  hub.agents.set("executor-1", agent("executor-1", "executor"));
+  const root = await hub.createWorkflow({
+    title: "Discuss before executing",
+    objective: "Deliver a checked result",
+    planDiscussion: true,
+    plannerAgentId: "planner-1",
+    reviewerAgentId: "reviewer-1",
+  });
+  assert.equal(root.workflow.planDiscussion, true);
+  const original = { brief: "Initial proposal", assignments: [{ title: "Old assignment", instructions: "Write result", expectedOutputs: ["result.txt"] }] };
+  await hub.handleWorkerMessage("planner-1", { id: "discussion-plan-result", type: "task.result", taskId: root.taskId, payload: { output: JSON.stringify(original) } });
+  const critique = [...hub.tasks.values()].find((task) => task.stage === "plan_discussion");
+  assert.ok(critique);
+  assert.equal([...hub.tasks.values()].some((task) => task.role === "executor"), false);
+
+  await hub.handleWorkerMessage("reviewer-1", { id: "discussion-critique-result", type: "task.result", taskId: critique.taskId, payload: { output: JSON.stringify({ brief: "Need an explicit check", issues: ["Who checks result.txt?"], recommendation: "Add a check" }) } });
+  const refinement = [...hub.tasks.values()].find((task) => task.stage === "plan_refinement");
+  assert.ok(refinement);
+  assert.equal([...hub.tasks.values()].some((task) => task.role === "executor"), false);
+
+  const revised = { brief: "Added independent validation", assignments: [{ title: "Checked assignment", instructions: "Write and check result", expectedOutputs: ["result.txt"] }] };
+  await hub.handleWorkerMessage("planner-1", { id: "discussion-refinement-result", type: "task.result", taskId: refinement.taskId, payload: { output: JSON.stringify(revised) } });
+  assert.equal([...hub.tasks.values()].filter((task) => task.role === "executor").length, 1);
+  const conversationMessages = hub.messages.filter((message) => message.rootTaskId === root.taskId);
+  assert.ok(conversationMessages.some((message) => message.attachments.some((attachment) => attachment.type === "plan" && attachment.content.includes("Old assignment"))));
+  assert.ok(conversationMessages.some((message) => message.kind === "plan_discussion" && message.text.includes("Who checks result.txt?") && message.text.includes("Add a check")));
+  assert.ok(conversationMessages.some((message) => message.kind === "plan_refinement" && message.text.includes("Added independent validation")));
+});
+
+test("Plan discussion queues a reviewer sharing the planner account until the planner releases its slot", async () => {
+  const hub = new AgentHub({ logs: { includePayloads: true } });
+  const planner = agent("planner-1", "planner");
+  const reviewer = agent("reviewer-1", "reviewer");
+  planner.account = { id: "shared-account", provider: "openai", maxConcurrency: 1 };
+  reviewer.account = { id: "shared-account", provider: "openai", maxConcurrency: 1 };
+  hub.agents.set(planner.agentId, planner);
+  hub.agents.set(reviewer.agentId, reviewer);
+  const root = await hub.createWorkflow({ objective: "Plan with one account", planDiscussion: true, plannerAgentId: planner.agentId, reviewerAgentId: reviewer.agentId });
+  await hub.handleWorkerMessage(planner.agentId, {
+    id: "shared-account-plan-result",
+    type: "task.result",
+    taskId: root.taskId,
+    payload: { output: JSON.stringify({ brief: "Proposal", assignments: [{ title: "Work", instructions: "Deliver" }] }) },
+  });
+  const critique = [...hub.tasks.values()].find((task) => task.stage === "plan_discussion");
+  assert.ok(critique, "A compatible busy reviewer should be queued instead of prompting a human");
+  assert.equal(critique.targetAgentId, reviewer.agentId);
+  assert.equal(critique.status, "dispatched", "The normal queue retries after the planner releases the shared account slot");
+  assert.equal([...hub.interventions.values()].some((item) => item.status === "pending"), false);
+});
+
 test("Hub authoritative validation triggers automatic format retry once, then escalates to human intervention", async () => {
   const hub = new AgentHub({ logs: { includePayloads: true } });
   const executor = agent("executor-1", "executor");

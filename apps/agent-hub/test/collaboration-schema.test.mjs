@@ -44,6 +44,28 @@ test("extractDeterministicJson extracts JSON from raw text, code fences, and rej
   assert.match(r6.error, /Parsed JSON.*object/i);
 });
 
+test("Plan discussion uses a critique contract and plan refinement keeps planner assignment validation", () => {
+  const critiquePrompt = buildRolePrompt("reviewer", "Discuss proposal", { stage: "plan_discussion", contextBundle: { proposedPlan: { assignments: [] } } });
+  assert.match(critiquePrompt, /STAGE: plan_discussion/);
+  assert.match(critiquePrompt, /specific question or risk/);
+  const critique = parseRoleSubmission("reviewer", "plan_discussion", JSON.stringify({
+    brief: "Clarify validation",
+    issues: ["Who verifies the output?"],
+    recommendation: "Add an acceptance check",
+  }));
+  assert.equal(critique.ok, true);
+  assert.deepEqual(critique.value.issues, ["Who verifies the output?"]);
+  assert.equal(parseRoleSubmission("reviewer", "plan_discussion", JSON.stringify({ brief: "Looks fine", issues: [] })).ok, false);
+
+  const refinementPrompt = buildRolePrompt("planner", "Revise proposal", { stage: "plan_refinement" });
+  assert.match(refinementPrompt, /Respond to every issue/);
+  const refinement = parseRoleSubmission("planner", "plan_refinement", JSON.stringify({
+    brief: "Added validation",
+    assignments: [{ title: "Verify", instructions: "Check the result", expectedOutputs: ["result.txt"] }],
+  }));
+  assert.equal(refinement.ok, true);
+});
+
 test("pathsOverlap and isPathSafe properly detect cross-directory collisions and unsafe paths", () => {
   assert.equal(isPathSafe("outputs/file.txt"), true);
   assert.equal(isPathSafe("deep/nested/result.md"), true);
